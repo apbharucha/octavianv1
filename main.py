@@ -339,16 +339,23 @@ if selection == "Dashboard":
         ):
             with st.spinner("Analyzing markets for high-confidence setups..."):
                 try:
-                    from breaking_trades_generator import BreakingTradesGenerator
+                    # Use the singleton generator — creating a fresh
+                    # BreakingTradesGenerator per click leaked a 20-thread
+                    # ThreadPoolExecutor every time (thread exhaustion = the
+                    # "Python quit unexpectedly" crashes). The singleton also
+                    # avoids re-initializing the 9s quant ensemble.
+                    from breaking_trades_generator import get_breaking_trades_generator
+                    gen = get_breaking_trades_generator()
+                    gen.set_min_confidence(55.0)
 
-                    # Use the live multi-asset universe — never a preset list.
-                    # The universe self-expands and caches, so the watchlist always
-                    # reflects the currently supported instruments.
+                    # Analyze the FULL dynamic universe — never a preset list.
+                    # The universe self-expands daily (S&P 500, NASDAQ-100,
+                    # ETF-holdings expansion) and is cached, so the scan always
+                    # reflects every currently supported instrument.
                     from ticker_universe import get_ticker_universe
                     tu = get_ticker_universe()
-                    watchlist = tu.get_full_universe_sample(80)  # Diverse 80-ticker scan
+                    watchlist = tu.get_full_universe()
 
-                    gen = BreakingTradesGenerator(min_confidence=55.0)
                     breaking_trades = gen.generate_breaking_trades(
                         watchlist, max_trades=5
                     )

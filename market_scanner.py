@@ -17,7 +17,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from data_sources import get_futures_proxy, get_fx, get_stock
-from sector_scanner import SECTOR_MAP, scan_sectors
+from sector_scanner import scan_sectors
 
 try:
     from data_sources import get_latest_price

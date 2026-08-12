@@ -173,25 +173,56 @@ class UnbiasedMarketAnalyzer:
         }
     
     def _get_all_stocks(self) -> List[str]:
-        """Delegate to centralized ticker universe."""
+        """Delegate to centralized ticker universe (dynamic, self-expanding)."""
         if self._universe:
             return self._universe.get_all_stocks()
-        return [
-            'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'AVGO', 'JPM', 'V',
-            'UNH', 'LLY', 'JNJ', 'XOM', 'MA', 'PG', 'HD', 'MRK', 'ABBV', 'CVX',
-            'CRM', 'AMD', 'INTC', 'NFLX', 'ADBE', 'PEP', 'KO', 'COST', 'TMO', 'ABT',
-            'NKE', 'MCD', 'DIS', 'CMCSA', 'WMT', 'CAT', 'DE', 'BA', 'GE', 'RTX',
-            'SPY', 'QQQ', 'IWM', 'GLD', 'TLT',
-        ]
+        # Universe unavailable — derive from the comprehensive universe bridge
+        # instead of a frozen preset list.
+        try:
+            from comprehensive_ticker_universe import get_comprehensive_universe
+            return get_comprehensive_universe().get_stocks()
+        except Exception:
+            return []
 
     def _get_all_etfs(self) -> List[str]:
         if self._universe:
             return self._universe.get_etfs()
-        return ['SPY', 'QQQ', 'IWM', 'VTI', 'GLD', 'SLV', 'TLT']
+        try:
+            from comprehensive_ticker_universe import get_comprehensive_universe
+            return get_comprehensive_universe().get_etfs()
+        except Exception:
+            return []
 
     def _get_options_universe(self) -> List[str]:
-        """Get options-enabled symbols."""
-        return ['SPY', 'QQQ', 'IWM', 'AAPL', 'TSLA', 'NVDA', 'AMD', 'AMZN']
+        """Get options-enabled symbols dynamically from the live universe.
+
+        Options need liquid underlyings, so we take the large-cap core from the
+        dynamic universe's stocks plus the index ETFs — never a frozen preset
+        list. Falls back to the universe stock set if available.
+        """
+        try:
+            if self._universe is not None:
+                stocks = self._universe.get_all_stocks()
+                if stocks:
+                    # Liquid large-caps: prefer the first tranche of the dynamic
+                    # stock list (self-expands daily) + core index ETFs.
+                    core = [s for s in stocks[:40] if s not in ('SPY', 'QQQ', 'IWM')]
+                    return ['SPY', 'QQQ', 'IWM'] + core[:37]
+                etfs = self._universe.get_etfs()
+                return (['SPY', 'QQQ', 'IWM'] + list(etfs[:5]))[:40]
+        except Exception:
+            pass
+        # Only reached if the dynamic universe itself is unavailable — derive
+        # from the comprehensive universe rather than a hardcoded list.
+        try:
+            from comprehensive_ticker_universe import get_comprehensive_universe
+            u = get_comprehensive_universe()
+            stocks = u.get_stocks()
+            if stocks:
+                return ['SPY', 'QQQ', 'IWM'] + [s for s in stocks[:37] if s not in ('SPY', 'QQQ', 'IWM')]
+        except Exception:
+            pass
+        return []
     
     def _get_forex_universe(self) -> List[str]:
         if self._universe:

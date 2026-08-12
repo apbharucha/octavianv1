@@ -3,6 +3,7 @@ import pandas as pd
 import asyncio
 import concurrent.futures
 import re
+import threading
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -100,20 +101,71 @@ class BreakingTradesGenerator:
         """
         self.min_confidence = min_confidence
         self._vix_level: Optional[float] = None
+        self._threshold_ts: Optional[datetime] = None
         self._effective_min_confidence = self._compute_effective_threshold(min_confidence)
+        self._threshold_ts = datetime.now()
         self.quant = get_quant_ensemble()
         self.logger = logging.getLogger("BreakingTrades")
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=20)
+        # Lazy executor: threads are only spawned on first scan, never at
+        # construction. Creating a fresh generator per UI click used to leak a
+        # 20-thread pool every time (thread exhaustion → process death).
+        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._executor_max_workers = 20
+        self._executor_lock = threading.Lock()
         self._cache = {}
 
-    def _compute_effective_threshold(self, base: float) -> float:
+    def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """Create the shared thread pool on first use (lazy, thread-safe)."""
+        if self._executor is None:
+            with self._executor_lock:
+                if self._executor is None:
+                    self._executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=self._executor_max_workers
+                    )
+        return self._executor
+
+    def set_min_confidence(self, value: float) -> None:
+        """Reconfigure the confidence threshold on a shared singleton instance.
+
+        The regime-adjusted VIX fetch is cached for 5 minutes so repeated
+        clicks on the shared instance don't hit the network every time.
+        """
+        self.min_confidence = float(value)
+        now = datetime.now()
+        if (
+            self._threshold_ts is not None
+            and (now - self._threshold_ts).total_seconds() < 300
+        ):
+            self._effective_min_confidence = self._compute_effective_threshold(
+                float(value), use_cached_vix=True
+            )
+        else:
+            self._effective_min_confidence = self._compute_effective_threshold(float(value))
+            self._threshold_ts = now
+
+    def shutdown(self) -> None:
+        """Release the thread pool (idempotent; safe to call on app exit)."""
+        if self._executor is not None:
+            try:
+                self._executor.shutdown(wait=False)
+            except Exception:
+                pass
+            self._executor = None
+
+    def _compute_effective_threshold(self, base: float, use_cached_vix: bool = False) -> float:
         """Regime-adjusted confidence threshold.
 
         In a low-volatility regime (VIX < 15) setups tend to score lower, so the
         threshold is relaxed by 5 points to avoid missing legitimate setups.
         The VIX fetch is time-boxed so construction never blocks on the network.
+        When use_cached_vix is True and a level was already fetched, the cached
+        level is reused instead of hitting the network again.
         """
         threshold = float(base)
+        if use_cached_vix and self._vix_level is not None:
+            if self._vix_level < 15.0:
+                return max(20.0, base - 5.0)
+            return threshold
         try:
             import concurrent.futures as _cf
 
@@ -168,19 +220,43 @@ class BreakingTradesGenerator:
     async def generate_breaking_trades_async(self, symbols: List[str], max_trades: int = 8) -> List[BreakingTradeSetup]:
         """
         High-Velocity Asynchronous Scanning Pipeline leveraging OHVDE.
-        Scans entire universe in parallel and runs deep analysis on top candidates.
+        Scans the entire universe in parallel and runs deep analysis on top candidates.
+
+        Large universes (e.g. the full dynamic universe) are screened with the
+        rapid pulse screener first (cheap statistical pre-filter), then only the
+        statistically-hot candidates get full deep analysis — so "analyze every
+        asset" stays fast instead of brute-forcing thousands of symbols.
         """
         from octavian_discovery_engine import get_discovery_engine
         discovery = get_discovery_engine()
         
-        # 1. Tier 1: Rapid Pulse Scan (Market-wide)
-        # Finds high-potential candidates using vectorized statistical screening
-        pulse_results = await discovery.scan_market_pulse(symbols, deep_scan=False)
+        # Tier 1: Rapid Pulse Scan (Market-wide)
+        # For big universes, deep_scan=True engages the vectorized pulse screener
+        # to pre-filter to statistically-hot symbols; small lists are analyzed fully.
+        use_screener = len(symbols) > 250
+        pulse_results = await discovery.scan_market_pulse(symbols, deep_scan=use_screener)
+
+        # Candidate floor: if the pulse screener returned very few results (e.g.
+        # a quiet market where few symbols moved >1.5% in 5 days), broaden the
+        # deep-analysis pass so the scan never silently collapses to nothing.
+        if use_screener and len(pulse_results) < 15 and len(symbols) > 250:
+            try:
+                import random as _random
+                _top = [r['symbol'] for r in pulse_results]
+                _extra = [s for s in _random.sample(list(symbols), min(120, len(symbols))) if s not in _top]
+                _extra_results = await discovery.scan_market_pulse(_extra, deep_scan=False)
+                _seen = {r['symbol'] for r in pulse_results}
+                for r in _extra_results:
+                    if r['symbol'] not in _seen:
+                        pulse_results.append(r)
+            except Exception:
+                pass
         
-        # 2. Tier 2: Institutional Deep Analysis Nexus (Parallel)
+        # Tier 2: Institutional Deep Analysis Nexus (Parallel)
         # Runs full technical, ML, and risk logic on screened candidates
+        executor = self._get_executor()
         tasks = [
-            asyncio.get_event_loop().run_in_executor(self._executor, self._analyze_symbol, r['symbol'])
+            asyncio.get_event_loop().run_in_executor(executor, self._analyze_symbol, r['symbol'])
             for r in pulse_results
         ]
         

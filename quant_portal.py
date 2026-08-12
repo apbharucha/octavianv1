@@ -330,20 +330,32 @@ def render_quant_portal():
         else:
             symbols = []
         
-        # Quick select buttons
+        # Quick select buttons — dynamically sampled from the live universe
+        # (never frozen preset lists, so the buttons always reflect the market).
+        try:
+            from ticker_universe import get_ticker_universe
+            _tu = get_ticker_universe()
+            _all_stocks = _tu.get_all_stocks()
+            _futures = _tu.get_futures()
+            _fx = [f.replace("/", "") + "=X" if "/" in f and "=" not in f else f
+                   for f in _tu.get_forex()]
+            _crypto = _tu.get_crypto()
+        except Exception:
+            _all_stocks, _futures, _fx, _crypto = [], [], [], []
+
         col_q1, col_q2, col_q3, col_q4 = st.columns(4)
         with col_q1:
             if st.button("Stocks", width='stretch'):
-                symbols = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META"]
+                symbols = (_all_stocks or [])[:6]
         with col_q2:
             if st.button("Futures", width='stretch'):
-                symbols = ["ES=F", "NQ=F", "CL=F", "GC=F"]
+                symbols = (_futures or [])[:4]
         with col_q3:
             if st.button("FX", width='stretch'):
-                symbols = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X"]
+                symbols = (_fx or [])[:4]
         with col_q4:
             if st.button("Crypto", width='stretch'):
-                symbols = ["BTC-USD", "ETH-USD", "SOL-USD"]
+                symbols = (_crypto or [])[:3]
         
         if len(symbols) < 1:
             st.info("Enter at least 1 symbol to begin.")

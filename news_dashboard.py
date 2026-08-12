@@ -24,7 +24,7 @@ import time
 
 from news_analysis_engine import get_news_engine
 from database_manager import get_database_manager
-from sector_scanner import SECTOR_MAP
+
 from data_sources import get_stock
 
 def show_news_dashboard():
@@ -477,8 +477,17 @@ def show_sector_sentiment(news_engine):
         cutoff_24 = now - timedelta(hours=24)
         cutoff_48 = now - timedelta(hours=48)
 
+        # Dynamic sector composition from the self-expanding universe (never a
+        # frozen preset list) — sector news grouping always reflects current
+        # known constituents.
+        try:
+            from sector_scanner import get_dynamic_sector_map
+            _dyn_map = get_dynamic_sector_map()
+        except Exception:
+            _dyn_map = {}
+
         sector_data = []
-        for sector_name, tickers in SECTOR_MAP.items():
+        for sector_name, tickers in _dyn_map.items():
             # Broader matching: Check symbol mentions OR sector keywords in title/summary
             relevant = []
             for a in articles:
@@ -487,7 +496,12 @@ def show_sector_sentiment(news_engine):
                     relevant.append(a)
                     continue
                 
-                # Check keywords if no symbol match
+                # Check keywords if no symbol match. Short display names
+                # (e.g. "EV") are skipped to avoid substring false-positives
+                # ("ev" matching "every"/"never"); symbol matching above still
+                # covers those sectors accurately.
+                if len(sector_name) < 4:
+                    continue
                 text_content = (a.title + " " + a.summary).lower()
                 if sector_name.lower() in text_content:
                     relevant.append(a)

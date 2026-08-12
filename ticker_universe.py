@@ -2700,6 +2700,42 @@ class TickerUniverse:
         random.shuffle(all_t)
         return all_t[:n]
 
+    def get_full_universe(self) -> List[str]:
+        """Return the ENTIRE known universe (no sampling).
+
+        Includes every stock, ETF, crypto, FX pair and futures contract the
+        platform knows about — the union of the seed lists, the comprehensive
+        universe bridge, and everything added dynamically (S&P 500, NASDAQ-100
+        and ETF-holdings expansion). FX pairs are normalized to Yahoo "=X"
+        format so they flow through the standard data pipeline.
+
+        Used by scanners that must analyze ALL assets (e.g. Breaking Trades)
+        instead of a fixed or sampled subset.
+        """
+        self.refresh_if_needed()
+
+        def _yf_fx(pair: str) -> str:
+            p = str(pair).strip().upper()
+            if "/" in p and "=" not in p:
+                return p.replace("/", "") + "=X"
+            return p
+
+        combined = (
+            list(self._stocks)
+            + list(self._etfs)
+            + list(self._crypto)
+            + [_yf_fx(p) for p in self._forex]
+            + list(self._futures)
+        )
+        seen: set = set()
+        deduped = []
+        for t in combined:
+            t = str(t).strip().upper()
+            if t and t not in seen:
+                seen.add(t)
+                deduped.append(t)
+        return deduped
+
     def get_full_universe_sample(self, n: int = 200) -> List[str]:
         """Get a random sample across ALL asset classes: stocks, ETFs, crypto, FX, futures.
 

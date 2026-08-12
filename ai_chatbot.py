@@ -67,7 +67,7 @@ def _query_warrants_charts(query: str) -> bool:
                             "candlestick", "picture")):
         return True
     return not any(p.search(q) for p in _NO_CHART_PATTERNS)
-from sector_scanner import scan_sectors, SECTOR_MAP
+from sector_scanner import scan_sectors
 from ml_analysis import get_analyzer, MLMarketAnalyzer
 from indicators import add_indicators
 from regime import volatility_regime, risk_on_off

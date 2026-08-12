@@ -161,7 +161,11 @@ def test_news_dashboard_has_no_fake_dates():
 
 def test_main_breaking_trades_is_dynamic():
     src = _src("main.py")
-    assert "tu.get_full_universe_sample(80)" in src
+    # Breaking trades scans the FULL dynamic universe, not a fixed sample,
+    # and reuses the singleton generator (no per-click thread-pool leak).
+    assert "tu.get_full_universe()" in src
+    assert "get_breaking_trades_generator" in src
+    assert "BreakingTradesGenerator(" not in src
     # The old hardcoded equity/commodity/fx/crypto lists are gone.
     assert '"EURUSD=X", "USDJPY=X", "GBPUSD=X", "AUDUSD=X"' not in src
 
@@ -408,3 +412,52 @@ def test_pitchbook_builds_all_deck_types():
                             if r.font.name:
                                 fonts.add(r.font.name)
         assert fonts == {"Arial"}, f"{name} deck uses non-Arial fonts: {fonts}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DYNAMIC UNIVERSE (no preset ticker lists)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_breaking_trades_uses_singleton_no_thread_leak():
+    """main.py must reuse the singleton generator (no per-click 20-thread leak)."""
+    src = _src("main.py")
+    assert "get_breaking_trades_generator()" in src
+    assert "BreakingTradesGenerator(" not in src
+
+
+def test_generator_has_lazy_executor_and_shutdown():
+    """The generator must not spawn threads at construction, and must release
+    them via shutdown() (thread exhaustion was the 'Python quit unexpectedly'
+    crash)."""
+    src = _src("breaking_trades_generator.py")
+    assert "self._executor = None" in src
+    assert "def shutdown(self)" in src
+    assert "threading.Lock" in src
+
+
+def test_universe_exposes_full_dynamic_universe():
+    """get_full_universe() returns every known asset (no sampling) — the
+    Breaking Trades scan analyzes ALL tickers, never a preset list."""
+    src = _src("ticker_universe.py")
+    assert "def get_full_universe(self)" in src
+
+
+def test_sector_scanner_is_dynamic():
+    """sector_scanner must not ship a hardcoded SECTOR_MAP anymore."""
+    src = _src("sector_scanner.py")
+    assert "SECTOR_MAP = {" not in src
+    assert "def get_dynamic_sector_map" in src
+
+
+def test_no_stale_sector_map_imports():
+    """No consumer may import the removed hardcoded SECTOR_MAP."""
+    for f in ("ai_chatbot.py", "news_dashboard.py", "market_scanner.py"):
+        src = _src(f)
+        assert "from sector_scanner import SECTOR_MAP" not in src, f
+
+
+def test_discovery_batch_fetch_is_chunked():
+    """Full-universe scans must chunk yfinance downloads (single giant calls
+    fail/hang on thousands of symbols)."""
+    src = _src("octavian_discovery_engine.py")
+    assert "_CHUNK = 150" in src

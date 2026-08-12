@@ -84,48 +84,78 @@ class OctavianDiscoveryEngine:
         return await loop.run_in_executor(self._executor, self._fetch_batch_data_sync, symbols)
 
     def _fetch_batch_data_sync(self, symbols: List[str]) -> Dict[str, pd.DataFrame]:
-        """Synchronous batch fetcher for use in executor."""
+        """Synchronous batch fetcher for use in executor.
+
+        Downloads in chunks (150 symbols per yf.download call) so full-universe
+        scans of thousands of symbols don't fail or hang on a single giant
+        request. Each chunk is flattened, then merged into one data_map.
+        """
         data_map = {}
-        self.logger.info(f"Fetching batch data for {len(symbols)} symbols...")
-        try:
-            df_all = yf.download(symbols, period="3mo", interval="1d", group_by='ticker', threads=False, progress=False)
-            if df_all is None or df_all.empty:
-                raise ValueError("Empty download result")
-            
-            for s in symbols:
-                try:
-                    if len(symbols) == 1:
-                        sym_df = df_all.copy()
-                    else:
-                        if isinstance(df_all.columns, pd.MultiIndex):
-                            if s in df_all.columns.get_level_values(0):
-                                sym_df = df_all[s].copy()
+        symbols = [s for s in symbols if s]
+        self.logger.info(f"Fetching batch data for {len(symbols)} symbols (chunked)...")
+
+        def _extract_chunk(chunk: List[str]) -> Dict[str, pd.DataFrame]:
+            out = {}
+            try:
+                df_all = yf.download(chunk, period="3mo", interval="1d",
+                                     group_by='ticker', threads=False, progress=False)
+                if df_all is None or df_all.empty:
+                    return out
+                for s in chunk:
+                    try:
+                        if len(chunk) == 1:
+                            sym_df = df_all.copy()
+                        else:
+                            if isinstance(df_all.columns, pd.MultiIndex):
+                                if s in df_all.columns.get_level_values(0):
+                                    sym_df = df_all[s].copy()
+                                else:
+                                    continue
+                            elif s in df_all.columns:
+                                sym_df = df_all[[s]].copy()
                             else:
                                 continue
-                        elif s in df_all.columns:
-                            sym_df = df_all[[s]].copy()
-                        else:
-                            continue
-                    
-                    # Flatten any remaining MultiIndex columns
-                    if isinstance(sym_df.columns, pd.MultiIndex):
-                        sym_df.columns = sym_df.columns.get_level_values(-1)
-                    
-                    sym_df = sym_df.dropna(how='all')
-                    if not sym_df.empty and 'Close' in sym_df.columns:
-                        data_map[s] = sym_df
-                except Exception as e:
-                    self.logger.debug(f"Symbol {s} extraction failed: {e}")
-                    
-        except Exception as e:
-            self.logger.error(f"Batch fetch error: {e}")
-            # Individual fallback
-            for s in symbols:
+                        # Flatten any remaining MultiIndex columns
+                        if isinstance(sym_df.columns, pd.MultiIndex):
+                            sym_df.columns = sym_df.columns.get_level_values(-1)
+                        sym_df = sym_df.dropna(how='all')
+                        if not sym_df.empty and 'Close' in sym_df.columns:
+                            out[s] = sym_df
+                    except Exception as e:
+                        self.logger.debug(f"Symbol {s} extraction failed: {e}")
+            except Exception as e:
+                self.logger.error(f"Chunk fetch error: {e}")
+            return out
+
+        # Download chunks in parallel (bounded) so full-universe scans of
+        # thousands of symbols don't serialize into many slow sequential
+        # yfinance requests. _extract_chunk is thread-safe (pure per-chunk work).
+        _CHUNK = 150
+        _MAX_CONCURRENT = 5
+        chunks = [symbols[i:i + _CHUNK] for i in range(0, len(symbols), _CHUNK)]
+        if len(chunks) <= 1:
+            for chunk in chunks:
+                data_map.update(_extract_chunk(chunk))
+        else:
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=_MAX_CONCURRENT) as pool:
+                futures = {pool.submit(_extract_chunk, c): c for c in chunks}
+                for fut in _cf.as_completed(futures, timeout=180):
+                    try:
+                        data_map.update(fut.result(timeout=60))
+                    except Exception:
+                        continue
+
+        # Individual fallback for symbols that chunked download missed
+        if len(data_map) < len(symbols):
+            missing = [s for s in symbols if s not in data_map]
+            for s in missing[:50]:  # cap fallback to avoid pathological slowness
                 try:
                     df = get_stock(s, period="3mo")
                     if df is not None and not df.empty:
                         data_map[s] = df
-                except: pass
+                except Exception:
+                    pass
         return data_map
 
     @staticmethod
