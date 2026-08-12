@@ -54,9 +54,11 @@
   "dark_pool_alerts": true,
   "options_greeks": true,
   "ai_commentary_style": "aggressive",
+  "adaptive_mode": false,
+  "learned_persona": {},
   "created_at": "2026-02-16T13:04:28.709132",
-  "updated_at": "2026-02-21T10:05:23.213161",
-  "interaction_count": 18,
+  "updated_at": "2026-07-18T12:13:00.054674",
+  "interaction_count": 44,
   "queries_history": [
     {
       "query": "Is AAPL trending bearish?",
@@ -129,6 +131,110 @@
     {
       "query": "what way is USD/JPY trending and craft a possible trade scenario that would be optimal for USD/JPY",
       "timestamp": "2026-02-21T10:05:23.213144"
+    },
+    {
+      "query": "what is the reason for IBM stock price tank today?",
+      "timestamp": "2026-02-23T21:20:32.578515"
+    },
+    {
+      "query": "why did IBM stock tank today?",
+      "timestamp": "2026-02-23T21:44:28.741544"
+    },
+    {
+      "query": " why did IBM stock tank today?",
+      "timestamp": "2026-02-23T21:54:07.855856"
+    },
+    {
+      "query": "what are some bearish stocks today?",
+      "timestamp": "2026-02-25T17:55:32.850273"
+    },
+    {
+      "query": "what are some bearish stocks today?",
+      "timestamp": "2026-02-25T18:06:07.772539"
+    },
+    {
+      "query": "what is happening around the wolrd that may affect the market",
+      "timestamp": "2026-03-03T08:33:11.683791"
+    },
+    {
+      "query": "what is happening to oil prices right now",
+      "timestamp": "2026-03-03T08:49:33.806717"
+    },
+    {
+      "query": " what is happening to oil prices right now\n\n",
+      "timestamp": "2026-03-03T09:01:16.514839"
+    },
+    {
+      "query": "what is happening to the oil prices right now",
+      "timestamp": "2026-03-03T09:45:33.389209"
+    },
+    {
+      "query": "Query #2: what is happening to the oil prices right now",
+      "timestamp": "2026-03-03T10:20:10.896127"
+    },
+    {
+      "query": "how is AAPL trending",
+      "timestamp": "2026-03-04T16:59:19.645983"
+    },
+    {
+      "query": "where do you think AAPL is trending",
+      "timestamp": "2026-03-04T17:17:12.470223"
+    },
+    {
+      "query": "where do you think AAPL is trending",
+      "timestamp": "2026-03-04T17:22:05.223721"
+    },
+    {
+      "query": "where do you think AAPL is trending",
+      "timestamp": "2026-03-04T17:24:04.320975"
+    },
+    {
+      "query": "where is AAPL trending in the next 3 months?",
+      "timestamp": "2026-03-04T17:32:18.363538"
+    },
+    {
+      "query": "where do you think NVDA is heading  in the next 3 months",
+      "timestamp": "2026-03-05T09:35:25.671470"
+    },
+    {
+      "query": "Show risk analysis for NVDA",
+      "timestamp": "2026-03-05T09:35:55.260830"
+    },
+    {
+      "query": "what stocks are sneakily bullish",
+      "timestamp": "2026-03-15T12:55:09.670238"
+    },
+    {
+      "query": "what stocks are sneakily bullish",
+      "timestamp": "2026-03-15T13:01:51.614058"
+    },
+    {
+      "query": "what stocks are sneakily bullish",
+      "timestamp": "2026-03-15T13:59:17.697067"
+    },
+    {
+      "query": "Analyze AAPL",
+      "timestamp": "2026-07-08T15:39:06.070396"
+    },
+    {
+      "query": "Analyze AAPL",
+      "timestamp": "2026-07-08T15:42:39.047543"
+    },
+    {
+      "query": "Analyze AAPL",
+      "timestamp": "2026-07-08T15:45:21.985982"
+    },
+    {
+      "query": "Analyze AAPL",
+      "timestamp": "2026-07-08T15:47:38.171782"
+    },
+    {
+      "query": "Analyze AAPL",
+      "timestamp": "2026-07-08T15:49:48.945984"
+    },
+    {
+      "query": "Analyze AAPL",
+      "timestamp": "2026-07-18T12:13:00.054658"
     }
   ]
 }

@@ -26,9 +26,9 @@ from typing import Dict, List, Optional, Tuple
 logger = logging.getLogger("CounterTrendAnalyzer")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # DATA STRUCTURES
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 
 @dataclass
@@ -64,9 +64,9 @@ class CounterTrendSignal:
     position_size_pct: float  # suggested % of portfolio
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # NARRATIVE REGISTRY
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 # Each narrative has:
 #   consensus_score   → how universally the market believes it (0–100)
@@ -282,9 +282,9 @@ _DEFAULT_NARRATIVES: List[Dict] = [
 ]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # CORE ANALYZER
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 
 class CounterTrendAnalyzer:
@@ -306,7 +306,7 @@ class CounterTrendAnalyzer:
         self._raw_narratives = raw
         self._build_narratives(raw)
 
-    # ── Build ─────────────────────────────────────────────────────────────────
+    #  Build 
 
     def _build_narratives(self, raw: List[Dict]) -> None:
         self._narratives = []
@@ -326,7 +326,7 @@ class CounterTrendAnalyzer:
                 )
             )
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    #  Public API 
 
     def get_all_narratives(self) -> List[NarrativeStrength]:
         """Return all tracked narratives sorted by divergence (most mispriced first)."""
@@ -469,7 +469,7 @@ class CounterTrendAnalyzer:
 
         return "\n".join(lines)
 
-    # ── Internal Signal Builder ───────────────────────────────────────────────
+    #  Internal Signal Builder 
 
     def _build_signal(
         self,
@@ -586,9 +586,9 @@ class CounterTrendAnalyzer:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # NARRATIVE SCORING UTILITIES
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 
 def score_narrative_strength(
@@ -722,9 +722,9 @@ def identify_macro_contradictions(
     return contradictions
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # SINGLETON
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
 _analyzer_instance: Optional[CounterTrendAnalyzer] = None
 

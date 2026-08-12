@@ -28,6 +28,8 @@ from dataclasses import dataclass, asdict
 from collections import defaultdict
 import hashlib
 
+from news_analysis_engine import SentimentScore # NEW IMPORT
+
 # NLP and sentiment analysis
 NLTK_AVAILABLE = False
 try:
@@ -98,6 +100,7 @@ except ImportError:
 
 from database_manager import get_database_manager
 from config import ALPHA_VANTAGE_KEY
+from api_rate_limiter import get_api_handler
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -116,7 +119,7 @@ class ProcessedArticle:
     sectors_mentioned: List[str]
     countries_mentioned: List[str]
     sentiment_score: float
-    sentiment_category: str
+    sentiment_category: SentimentScore
     market_impact_score: float
     relevance_score: float
     cross_sector_implications: Dict[str, float]
@@ -143,6 +146,7 @@ class AdvancedNewsProcessor:
     def __init__(self):
         _lazy_ensure_nltk()
         self.db_manager = get_database_manager()
+        self.api_handler = get_api_handler()
         
         # Enhanced news sources with RSS feeds and APIs
         self.news_sources = {
@@ -1160,6 +1164,120 @@ class AdvancedNewsProcessor:
             return 'BEARISH'
         else:
             return 'VERY_BEARISH'
+
+    def analyze_symbol_sentiment(self, symbol: str, timeout: int = 10) -> Optional[Dict]:
+        """
+        Perform per-asset sentiment analysis for a specific symbol.
+
+        Fetches news articles, filters to those explicitly mentioning the symbol,
+        and computes a weighted aggregate sentiment score using SourceCredibilityEngine
+        credibility scores.
+
+        Args:
+            symbol: The ticker symbol to analyze (e.g. "AAPL", "BTC-USD").
+            timeout: Maximum seconds to wait before returning None (default 10).
+
+        Returns:
+            Dict with keys:
+                score (float): Weighted aggregate sentiment in [-1.0, 1.0]
+                label (str): VERY_BEARISH / BEARISH / NEUTRAL / BULLISH / VERY_BULLISH
+                article_count (int): Number of articles that mentioned the symbol
+                top_headlines (List[str]): Up to 3 most impactful headlines
+            Returns None if the timeout is exceeded.
+
+        Requirements: 2.1, 2.2, 2.5, 2.6
+        """
+        from source_credibility_engine import SourceCredibilityEngine
+
+        result_container: Dict = {}
+        exception_container: Dict = {}
+
+        def _run():
+            try:
+                # Run the async fetch in a fresh event loop inside this thread
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    articles = loop.run_until_complete(
+                        self.process_news_comprehensive(max_articles=300)
+                    )
+                finally:
+                    loop.close()
+
+                # Filter to articles that explicitly mention the symbol (Requirement 2.1)
+                symbol_upper = symbol.upper()
+                # Also build a clean base ticker for matching (strip suffixes like =F, =X, -USD)
+                base_ticker = re.sub(r'[=\-][A-Z0-9]+$', '', symbol_upper)
+
+                relevant: List[ProcessedArticle] = []
+                for article in articles:
+                    text_upper = (article.title + ' ' + article.content).upper()
+                    # Match exact ticker or base ticker as a whole word
+                    if (re.search(r'\b' + re.escape(symbol_upper) + r'\b', text_upper) or
+                            (base_ticker and re.search(r'\b' + re.escape(base_ticker) + r'\b', text_upper)) or
+                            symbol_upper in article.symbols_mentioned):
+                        relevant.append(article)
+
+                if not relevant:
+                    result_container['result'] = {
+                        'score': 0.0,
+                        'label': SentimentScore.NEUTRAL,
+                        'article_count': 0,
+                        'top_headlines': []
+                    }
+                    return
+
+                # Compute weighted aggregate sentiment (Requirement 2.6)
+                credibility_engine = SourceCredibilityEngine()
+                weighted_sum = 0.0
+                total_weight = 0.0
+
+                for article in relevant:
+                    source_cred = credibility_engine.get_source_credibility(article.source)
+                    weight = source_cred.final_weight
+                    weighted_sum += article.sentiment_score * weight
+                    total_weight += weight
+
+                if total_weight > 0:
+                    raw_score = weighted_sum / total_weight
+                else:
+                    raw_score = float(np.mean([a.sentiment_score for a in relevant]))
+
+                # Clamp to [-1.0, 1.0] (Requirement 2.2)
+                score = float(max(-1.0, min(1.0, raw_score)))
+
+                # Determine label (Requirement 2.2)
+                label = self._score_to_sentiment_category(score)
+
+                # Top 3 headlines by market impact score (Requirement 2.3)
+                sorted_articles = sorted(relevant, key=lambda a: a.market_impact_score, reverse=True)
+                top_headlines = [a.title for a in sorted_articles[:3] if a.title]
+
+                result_container['result'] = {
+                    'score': score,
+                    'label': label,
+                    'article_count': len(relevant),
+                    'top_headlines': top_headlines
+                }
+
+            except Exception as exc:
+                exception_container['error'] = exc
+                logger.error(f"Error in analyze_symbol_sentiment thread: {exc}")
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(timeout=timeout)
+
+        if thread.is_alive():
+            # Timeout exceeded (Requirement 2.5)
+            logger.warning(f"analyze_symbol_sentiment timed out after {timeout}s for {symbol}")
+            return None
+
+        if 'error' in exception_container:
+            logger.error(f"analyze_symbol_sentiment error for {symbol}: {exception_container['error']}")
+            return None
+
+        return result_container.get('result')
 
 # Global instance
 _advanced_news_processor = None

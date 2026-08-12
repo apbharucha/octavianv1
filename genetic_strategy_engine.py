@@ -33,13 +33,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Gene Definitions
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 # Each gene is a float in [0, 1] that maps to a discrete parameter value
 GENE_SCHEMA: dict[str, dict] = {
-    # ── Entry Signals ─────────────────────────────────────────────────────────
+    #  Entry Signals 
     "rsi_period": {"min": 7, "max": 28, "type": "int"},
     "rsi_oversold": {"min": 20, "max": 45, "type": "int"},
     "rsi_overbought": {"min": 55, "max": 80, "type": "int"},
@@ -51,7 +51,7 @@ GENE_SCHEMA: dict[str, dict] = {
     "bb_period": {"min": 10, "max": 30, "type": "int"},
     "bb_std": {"min": 1.0, "max": 3.0, "type": "float"},
     "atr_period": {"min": 7, "max": 21, "type": "int"},
-    # ── Entry Logic ───────────────────────────────────────────────────────────
+    #  Entry Logic 
     "use_rsi": {"min": 0, "max": 1, "type": "binary"},
     "use_ma_cross": {"min": 0, "max": 1, "type": "binary"},
     "use_momentum": {"min": 0, "max": 1, "type": "binary"},
@@ -59,7 +59,7 @@ GENE_SCHEMA: dict[str, dict] = {
     "use_vol_filter": {"min": 0, "max": 1, "type": "binary"},
     "entry_mode": {"min": 0, "max": 2, "type": "int"},  # 0=AND, 1=OR, 2=weighted
     "signal_threshold": {"min": 0.3, "max": 0.8, "type": "float"},  # for weighted mode
-    # ── Exit Rules ────────────────────────────────────────────────────────────
+    #  Exit Rules 
     "stop_loss_pct": {"min": 0.5, "max": 8.0, "type": "float"},
     "take_profit_pct": {"min": 1.0, "max": 20.0, "type": "float"},
     "trailing_stop_pct": {"min": 0.5, "max": 6.0, "type": "float"},
@@ -67,7 +67,7 @@ GENE_SCHEMA: dict[str, dict] = {
     "time_stop_days": {"min": 2, "max": 30, "type": "int"},
     "use_time_stop": {"min": 0, "max": 1, "type": "binary"},
     "exit_on_signal_flip": {"min": 0, "max": 1, "type": "binary"},
-    # ── Position Sizing ───────────────────────────────────────────────────────
+    #  Position Sizing 
     "position_pct": {"min": 2.0, "max": 25.0, "type": "float"},
     "sizing_mode": {
         "min": 0,
@@ -76,7 +76,7 @@ GENE_SCHEMA: dict[str, dict] = {
     },  # 0=fixed, 1=vol-scaled, 2=Kelly
     "max_positions": {"min": 1, "max": 5, "type": "int"},
     "kelly_fraction": {"min": 0.1, "max": 0.5, "type": "float"},
-    # ── Regime Filter ─────────────────────────────────────────────────────────
+    #  Regime Filter 
     "regime_filter": {
         "min": 0,
         "max": 3,
@@ -84,7 +84,7 @@ GENE_SCHEMA: dict[str, dict] = {
     },  # 0=none, 1=trend, 2=mean-rev, 3=low-vol
     "trend_ma_period": {"min": 50, "max": 200, "type": "int"},
     "vol_regime_threshold": {"min": 10.0, "max": 35.0, "type": "float"},
-    # ── Direction ─────────────────────────────────────────────────────────────
+    #  Direction 
     "direction_bias": {"min": 0, "max": 2, "type": "int"},  # 0=long, 1=short, 2=both
 }
 
@@ -112,9 +112,9 @@ def decode_dna(dna: np.ndarray) -> dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Data Structures
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 @dataclass
@@ -165,9 +165,9 @@ class EvolutionResult:
     final_population: list[Strategy]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Fitness / Backtesting Engine
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 class FastBacktester:
@@ -184,7 +184,7 @@ class FastBacktester:
         self.warmup = warmup
         self._cache: dict[str, np.ndarray] = {}
 
-    # ── Pre-computed indicator cache ──────────────────────────────────────────
+    #  Pre-computed indicator cache 
 
     def _returns(self) -> np.ndarray:
         if "returns" not in self._cache:
@@ -263,7 +263,7 @@ class FastBacktester:
             self._cache[key] = vol
         return self._cache[key]
 
-    # ── Signal Generation ─────────────────────────────────────────────────────
+    #  Signal Generation 
 
     def _compute_entry_signal(self, params: dict, i: int) -> float:
         """
@@ -379,7 +379,7 @@ class FastBacktester:
             return vol < vol_thresh
         return True
 
-    # ── Core Backtest ─────────────────────────────────────────────────────────
+    #  Core Backtest 
 
     def run(self, params: dict, capital: float = 100_000.0) -> dict:
         """Run a full backtest for the given strategy parameters."""
@@ -405,7 +405,7 @@ class FastBacktester:
             p = prices[i]
             current_equity = cash + position * p
 
-            # ── Exit Logic ────────────────────────────────────────────────────
+            #  Exit Logic 
             if in_position:
                 # Stop loss
                 pnl_pct = (p - entry_price) / entry_price * direction * 100
@@ -476,7 +476,7 @@ class FastBacktester:
                     in_position = False
                     direction = 0
 
-            # ── Entry Logic ───────────────────────────────────────────────────
+            #  Entry Logic 
             if not in_position:
                 sig = self._compute_entry_signal(params, i)
                 dir_bias = params["direction_bias"]  # 0=long, 1=short, 2=both
@@ -525,7 +525,7 @@ class FastBacktester:
 
             equity[i] = cash + position * p
 
-        # ── Close open position at end ────────────────────────────────────────
+        #  Close open position at end 
         if in_position and position != 0:
             final_p = prices[-1]
             pnl = position * (final_p - entry_price)
@@ -546,7 +546,7 @@ class FastBacktester:
 
         equity[-1] = cash
 
-        # ── Compute Metrics ───────────────────────────────────────────────────
+        #  Compute Metrics 
         eq = equity
         eq[eq <= 0] = 1.0
         returns = np.diff(eq) / eq[:-1]
@@ -602,9 +602,9 @@ class FastBacktester:
         }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Fitness Function
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 def compute_fitness(metrics: dict, params: dict) -> float:
@@ -661,9 +661,9 @@ def compute_fitness(metrics: dict, params: dict) -> float:
     return float(np.clip(fitness, -1.0, 1.0))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Genetic Operators
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 def random_dna(rng: np.random.Generator) -> np.ndarray:
@@ -701,9 +701,9 @@ def tournament_select(
     return max(candidates, key=lambda s: s.fitness)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Main Evolution Engine
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 class GeneticStrategyEngine:
@@ -750,12 +750,12 @@ class GeneticStrategyEngine:
         self.oos_split = oos_split
         self.rng = np.random.default_rng(seed)
 
-    # ── Population Initialisation ─────────────────────────────────────────────
+    #  Population Initialisation 
 
     def _init_population(self) -> list[Strategy]:
         return [Strategy(dna=random_dna(self.rng)) for _ in range(self.population_size)]
 
-    # ── Strategy Evaluation ───────────────────────────────────────────────────
+    #  Strategy Evaluation 
 
     def _evaluate(self, strategy: Strategy, backtester: FastBacktester) -> Strategy:
         try:
@@ -781,7 +781,7 @@ class GeneticStrategyEngine:
         except Exception:
             return -1.0
 
-    # ── Generation Step ───────────────────────────────────────────────────────
+    #  Generation Step 
 
     def _next_generation(
         self,
@@ -835,7 +835,7 @@ class GeneticStrategyEngine:
 
         return new_population, mutations, crossovers
 
-    # ── Main Evolution Loop ───────────────────────────────────────────────────
+    #  Main Evolution Loop 
 
     def evolve(
         self,
@@ -915,7 +915,7 @@ class GeneticStrategyEngine:
                 generation_results[-1].mutations = mut_count
                 generation_results[-1].crossovers = cross_count
 
-        # ── Out-of-Sample Evaluation ──────────────────────────────────────────
+        #  Out-of-Sample Evaluation 
         top_strategies = sorted(population, key=lambda s: s.fitness, reverse=True)[:10]
         for strat in top_strategies:
             strat.oos_sharpe = self._evaluate_oos(strat, oos_backtester)
@@ -923,7 +923,7 @@ class GeneticStrategyEngine:
         if global_best is not None:
             global_best.oos_sharpe = self._evaluate_oos(global_best, oos_backtester)
 
-        # ── Overfitting Assessment ────────────────────────────────────────────
+        #  Overfitting Assessment 
         overfitting_risk = (
             self._assess_overfitting(global_best, top_strategies)
             if global_best
@@ -936,7 +936,7 @@ class GeneticStrategyEngine:
             else 0.0
         )
 
-        # ── Discovered Alpha ──────────────────────────────────────────────────
+        #  Discovered Alpha 
         discovered_alpha = self._extract_alpha_signals(top_strategies)
 
         return EvolutionResult(
@@ -949,7 +949,7 @@ class GeneticStrategyEngine:
             final_population=sorted(population, key=lambda s: s.fitness, reverse=True),
         )
 
-    # ── Overfitting Detection ─────────────────────────────────────────────────
+    #  Overfitting Detection 
 
     def _assess_overfitting(self, best: Strategy, top_n: list[Strategy]) -> str:
         is_sharpe = best.sharpe
@@ -1010,7 +1010,7 @@ class GeneticStrategyEngine:
         except Exception:
             return 0.5
 
-    # ── Alpha Signal Extraction ───────────────────────────────────────────────
+    #  Alpha Signal Extraction 
 
     def _extract_alpha_signals(self, top_strategies: list[Strategy]) -> list[dict]:
         """
@@ -1111,7 +1111,7 @@ class GeneticStrategyEngine:
 
         return alpha_signals
 
-    # ── Strategy Summary ──────────────────────────────────────────────────────
+    #  Strategy Summary 
 
     @staticmethod
     def describe_strategy(strategy: Strategy) -> str:
@@ -1187,9 +1187,9 @@ class GeneticStrategyEngine:
         return "\n".join(lines)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Singleton accessor
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 _engine_instance: GeneticStrategyEngine | None = None
 

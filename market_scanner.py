@@ -4,6 +4,7 @@ Multi-asset real-time scanning with heatmaps, signals, and momentum analysis.
 Author: APB - Octavian Team
 """
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -37,38 +38,35 @@ except ImportError:
 # ASSET UNIVERSES
 #
 
-_WATCHLIST = {
-    "Mega Cap": ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK-B"],
-    "Tech Growth": ["CRM", "ADBE", "AMD", "AVGO", "QCOM", "NOW", "PLTR", "SNOW"],
-    "Financials": ["JPM", "GS", "BAC", "MS", "BLK", "SCHW", "V", "MA"],
-    "Healthcare": ["LLY", "UNH", "JNJ", "MRK", "ABBV", "PFE", "TMO", "AMGN"],
-    "Energy": ["XOM", "CVX", "COP", "SLB", "OXY", "HAL", "DVN", "EOG"],
-    "Consumer": ["WMT", "COST", "MCD", "SBUX", "NKE", "HD", "TGT", "LOW"],
-    "Industrials": ["CAT", "DE", "HON", "GE", "RTX", "LMT", "BA", "UPS"],
-    "Small Cap Momentum": [
-        "SOFI",
-        "HOOD",
-        "RIVN",
-        "IONQ",
-        "AFRM",
-        "UPST",
-        "DKNG",
-        "COIN",
-    ],
-}
+def _get_watchlist_groups() -> Dict[str, List[str]]:
+    """Stock scanner groups built dynamically from the ticker universe's sectors.
 
-_CRYPTO = [
-    "BTC-USD",
-    "ETH-USD",
-    "SOL-USD",
-    "XRP-USD",
-    "ADA-USD",
-    "DOGE-USD",
-    "AVAX-USD",
-    "LINK-USD",
-    "DOT-USD",
-    "MATIC-USD",
-]
+    Every group is populated live from the current universe (a deterministic
+    spread of each sector's constituents) — no hardcoded ticker lists.
+    """
+    groups: Dict[str, List[str]] = {}
+    try:
+        from ticker_universe import get_ticker_universe
+        u = get_ticker_universe()
+        sectors = u.get_all_sectors()
+        for sector, tickers in sorted(sectors.items()):
+            chosen = sorted(tickers)[:8]
+            if chosen:
+                groups[sector.replace("_", " ").title()] = chosen
+        if not groups:
+            groups["Stocks"] = sorted(u.get_all_stocks())[:8]
+    except Exception:
+        pass
+    return groups
+
+
+def _get_crypto_list() -> List[str]:
+    """Crypto scan list drawn live from the ticker universe."""
+    try:
+        from ticker_universe import get_ticker_universe
+        return list(get_ticker_universe().get_crypto())
+    except Exception:
+        return []
 
 _ETF_SECTORS = {
     "S&P 500": "SPY",
@@ -172,13 +170,13 @@ def _fetch_df_for_symbol(symbol: str, period: str = "3mo") -> Optional[pd.DataFr
     """Fetch clean dataframe for a single symbol with multiple fallbacks.
 
     For FX pairs the provider order is:
-      1. get_fx()  — Stooq-backed, free, no API key required (most reliable)
-      2. get_fresh_quote() — Yahoo Finance via yfinance
-      3. yf.Ticker().history() — direct Yahoo Finance
+      1. get_fx()   Stooq-backed, free, no API key required (most reliable)
+      2. get_fresh_quote()  Yahoo Finance via yfinance
+      3. yf.Ticker().history()  direct Yahoo Finance
     For all other asset classes:
-      1. get_fresh_quote() — Yahoo Finance
-      2. yf.Ticker().history() — direct Yahoo Finance
-      3. get_stock() / get_futures_proxy() — data_sources fallback chain
+      1. get_fresh_quote()  Yahoo Finance
+      2. yf.Ticker().history()  direct Yahoo Finance
+      3. get_stock() / get_futures_proxy()  data_sources fallback chain
     """
 
     # Detect FX: slash-separated "EUR/USD", Yahoo-format "EURUSD=X", bare 6-char "EURUSD"
@@ -195,7 +193,7 @@ def _fetch_df_for_symbol(symbol: str, period: str = "3mo") -> Optional[pd.DataFr
     if "/" in sym_upper and "=" not in sym_upper:
         yf_sym = sym_upper.replace("/", "") + "=X"
 
-    # ── FX: try Stooq-backed get_fx FIRST ─────────────────────────────────────
+    #  FX: try Stooq-backed get_fx FIRST 
     if is_fx:
         try:
             # get_fx accepts slash, bare-6, or =X formats
@@ -215,7 +213,7 @@ def _fetch_df_for_symbol(symbol: str, period: str = "3mo") -> Optional[pd.DataFr
         except Exception:
             pass
 
-    # ── Yahoo Finance via get_fresh_quote ─────────────────────────────────────
+    #  Yahoo Finance via get_fresh_quote 
     if HAS_FRESH_QUOTE:
         try:
             df = get_fresh_quote(yf_sym, period=period)
@@ -224,7 +222,7 @@ def _fetch_df_for_symbol(symbol: str, period: str = "3mo") -> Optional[pd.DataFr
         except Exception:
             pass
 
-    # ── Direct yfinance Ticker ────────────────────────────────────────────────
+    #  Direct yfinance Ticker 
     try:
         import yfinance as yf
 
@@ -240,7 +238,7 @@ def _fetch_df_for_symbol(symbol: str, period: str = "3mo") -> Optional[pd.DataFr
     except Exception:
         pass
 
-    # ── data_sources fallback chain ───────────────────────────────────────────
+    #  data_sources fallback chain 
     try:
         if is_fx:
             # Already tried get_fx above; try get_stock which also has Stooq fallback
@@ -436,28 +434,53 @@ def _fetch_and_score(
         return None
 
 
-def _scan_universe(
-    items: Dict[str, str], period: str = "3mo", max_workers: int = 8
-) -> pd.DataFrame:
-    """Scan a dict of {label: symbol} in parallel and return a scored DataFrame."""
+async def _scan_universe_async(items: Dict[str, str], period: str = "3mo") -> pd.DataFrame:
+    """High-velocity scan using OHVDE backbone."""
+    from octavian_discovery_engine import get_discovery_engine
+    discovery = get_discovery_engine()
+    
+    symbols = list(items.values())
+    labels = list(items.keys())
+    
+    # Run market pulse scan (Statistical Tier)
+    pulse_results = await discovery.scan_market_pulse(symbols, deep_scan=False)
+    
+    # Map results back to scanner format
     results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futs = {
-            pool.submit(_fetch_and_score, sym, label, period): label
-            for label, sym in items.items()
-        }
-        for f in as_completed(futs):
-            try:
-                r = f.result()
-                if r:
-                    results.append(r)
-            except Exception:
-                pass
-    if not results:
-        return pd.DataFrame()
+    label_map = {v: k for k, v in items.items()}
+    
+    for r in pulse_results:
+        sym = r['symbol']
+        label = label_map.get(sym, sym)
+        
+        # Scoring logic for scanner (matching original behavior)
+        score = r['score']
+        signal = "[GOOD] Strong Buy" if score > 40 else "[NOTE] Buy" if score > 15 else " Neutral" if score > -15 else "[SELL] Sell" if score > -40 else "[ALERT] Strong Sell"
+        
+        results.append({
+            "symbol": sym,
+            "label": label,
+            "price": r['price'],
+            "1D%": round(r['change_1d'], 2),
+            "5D%": round(r['indicators'].get('momentum_10d', 0) / 2, 2), # Approximation
+            "1M%": round(r['indicators'].get('momentum_10d', 0), 2),
+            "RSI": round(r['indicators'].get('rsi', 50), 1),
+            "Vol%": round(r['indicators'].get('volatility_20d', 0.0), 1),
+            "Score": round(score, 1),
+            "Signal": signal,
+            "Above SMA20": r['indicators'].get('above_sma50'),
+            "last_bar": datetime.now().strftime("%Y-%m-%d"),
+            "price_source": "DiscoveryEngine"
+        })
+    
+    if not results: return pd.DataFrame()
     df = pd.DataFrame(results)
     df.sort_values("Score", ascending=False, inplace=True)
     return df.reset_index(drop=True)
+
+def _scan_universe(items: Dict[str, str], period: str = "3mo", max_workers: int = 8) -> pd.DataFrame:
+    """Synchronous wrapper for OHVDE scan."""
+    return asyncio.run(_scan_universe_async(items, period))
 
 
 def _scan_list(
@@ -477,7 +500,7 @@ def _scan_list(
 def _fmt_ret(val):
     """Format a return value with color emoji prefix for plain dataframe display."""
     if pd.isna(val):
-        return "—"
+        return ""
     return f"{val:+.2f}%"
 
 
@@ -516,13 +539,13 @@ def _render_heatmap(
         margin=dict(l=0, r=0, t=40, b=0),
         title=title,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 def _fmt_price(val):
-    """Format price — always show exact cents, never round off decimals."""
+    """Format price  always show exact cents, never round off decimals."""
     if pd.isna(val):
-        return "—"
+        return ""
     if val >= 1000:
         return f"{val:,.2f}"
     elif val >= 1:
@@ -563,13 +586,13 @@ def _render_signal_table(df: pd.DataFrame, show_cols: List[str] = None):
     fmt_df = show_df.copy()
     for c in fmt_df.columns:
         if c == "Price":
-            fmt_df[c] = fmt_df[c].apply(lambda x: _fmt_price(x) if pd.notna(x) else "—")
+            fmt_df[c] = fmt_df[c].apply(lambda x: _fmt_price(x) if pd.notna(x) else "")
         elif c in ("1D%", "5D%", "1M%", "3M%", "Ann.Vol%"):
-            fmt_df[c] = fmt_df[c].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else "—")
+            fmt_df[c] = fmt_df[c].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else "")
         elif c == "RSI":
-            fmt_df[c] = fmt_df[c].apply(lambda x: f"{x:.0f}" if pd.notna(x) else "—")
+            fmt_df[c] = fmt_df[c].apply(lambda x: f"{x:.0f}" if pd.notna(x) else "")
         elif c == "Score":
-            fmt_df[c] = fmt_df[c].apply(lambda x: f"{x:+.0f}" if pd.notna(x) else "—")
+            fmt_df[c] = fmt_df[c].apply(lambda x: f"{x:+.0f}" if pd.notna(x) else "")
 
     # Use column_config for colored display
     col_config = {}
@@ -583,7 +606,7 @@ def _render_signal_table(df: pd.DataFrame, show_cols: List[str] = None):
 
     st.dataframe(
         fmt_df,
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         height=min(35 * len(fmt_df) + 38, 600),
         column_config=col_config,
@@ -614,7 +637,7 @@ def _render_momentum_bars(df: pd.DataFrame, title: str, col: str = "Score"):
         xaxis_title="Momentum Score",
         margin=dict(l=0, r=0, t=35, b=0),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 def _render_rsi_chart(df: pd.DataFrame):
@@ -648,7 +671,7 @@ def _render_rsi_chart(df: pd.DataFrame):
         yaxis_range=[0, 100],
         margin=dict(l=0, r=0, t=35, b=0),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 #
@@ -716,14 +739,14 @@ def show_market_scanner():
                     delta_str = f"{row['1D%']:+.2f}%"
                     st.metric(row["label"], f"{row['price']:,.2f}", delta_str)
 
-            _render_heatmap(overview_df, "Market Overview — 1D Change", "1D%")
+            _render_heatmap(overview_df, "Market Overview  1D Change", "1D%")
 
         # Sector snapshot using ETF proxies (these ARE ETFs, labeled correctly)
         st.markdown("### Sector ETF Momentum")
         with st.spinner("Scanning sectors..."):
             sector_df = _scan_universe(_ETF_SECTORS, period=scan_period)
         if not sector_df.empty:
-            _render_heatmap(sector_df, "Sector ETFs — 1D Performance", "1D%")
+            _render_heatmap(sector_df, "Sector ETFs  1D Performance", "1D%")
             _render_signal_table(sector_df)
 
     #  TAB 1: Sector ETFs
@@ -738,7 +761,7 @@ def show_market_scanner():
             )
             col_a, col_b = st.columns(2)
             with col_a:
-                _render_heatmap(sector_full, "Sector Heatmap — 1M Return", "1M%")
+                _render_heatmap(sector_full, "Sector Heatmap  1M Return", "1M%")
             with col_b:
                 _render_momentum_bars(sector_full, "Sector Momentum")
             _render_signal_table(
@@ -760,16 +783,17 @@ def show_market_scanner():
     #  TAB 2: Stocks
     with tabs[2]:
         st.subheader("[CHART] Stock Scanner")
+        _watchlist_groups = _get_watchlist_groups() or {"All Stocks": []}
         stock_group = st.selectbox(
-            "Stock Group", list(_WATCHLIST.keys()), key="stock_group_sel"
+            "Stock Group", list(_watchlist_groups.keys()), key="stock_group_sel"
         )
         with st.spinner(f"Scanning {stock_group}..."):
-            stock_df = _scan_list(_WATCHLIST[stock_group], period=scan_period)
+            stock_df = _scan_list(_watchlist_groups[stock_group], period=scan_period)
         if not stock_df.empty:
             stock_df = stock_df[stock_df["Score"] >= min_score].sort_values(
                 sort_by, ascending=(sort_by in ("Vol%", "RSI"))
             )
-            _render_heatmap(stock_df, f"{stock_group} — 1D Change", "1D%")
+            _render_heatmap(stock_df, f"{stock_group}  1D Change", "1D%")
 
             col_s1, col_s2 = st.columns(2)
             with col_s1:
@@ -793,7 +817,7 @@ def show_market_scanner():
             )
 
             # Volume spike alerts
-            spikes = stock_df[stock_df["Vol Spike"] == True]
+            spikes = stock_df[stock_df["Vol Spike"] == True] if "Vol Spike" in stock_df.columns else pd.DataFrame()
             if not spikes.empty:
                 st.warning(
                     f" **Volume Spike Alert:** {', '.join(spikes['label'].tolist())}"
@@ -803,7 +827,7 @@ def show_market_scanner():
     with tabs[3]:
         st.subheader("[COIN] Crypto Scanner")
         with st.spinner("Scanning crypto..."):
-            crypto_df = _scan_list(_CRYPTO, period=scan_period)
+            crypto_df = _scan_list(_get_crypto_list(), period=scan_period)
         if not crypto_df.empty:
             crypto_df = crypto_df[crypto_df["Score"] >= min_score].sort_values(
                 sort_by, ascending=(sort_by in ("Vol%", "RSI"))
@@ -818,7 +842,7 @@ def show_market_scanner():
                         f"{row['1D%']:+.2f}%",
                     )
 
-            _render_heatmap(crypto_df, "Crypto Heatmap — 1D", "1D%")
+            _render_heatmap(crypto_df, "Crypto Heatmap  1D", "1D%")
             _render_momentum_bars(crypto_df, "Crypto Momentum")
             _render_signal_table(crypto_df)
         else:
@@ -835,7 +859,7 @@ def show_market_scanner():
             )
             col_cm1, col_cm2 = st.columns(2)
             with col_cm1:
-                _render_heatmap(comm_df, "Commodities — 1M Return", "1M%")
+                _render_heatmap(comm_df, "Commodities  1M Return", "1M%")
             with col_cm2:
                 _render_momentum_bars(comm_df, "Commodity Momentum")
             _render_signal_table(comm_df)
@@ -851,7 +875,7 @@ def show_market_scanner():
             fx_df = fx_df[fx_df["Score"] >= min_score].sort_values(
                 sort_by, ascending=(sort_by in ("Vol%", "RSI"))
             )
-            _render_heatmap(fx_df, "Forex — 1D Change", "1D%")
+            _render_heatmap(fx_df, "Forex  1D Change", "1D%")
             _render_signal_table(fx_df)
         else:
             st.info("Could not fetch forex data.")
@@ -865,7 +889,7 @@ def show_market_scanner():
             bond_df = bond_df[bond_df["Score"] >= min_score].sort_values(
                 sort_by, ascending=(sort_by in ("Vol%", "RSI"))
             )
-            _render_heatmap(bond_df, "Bonds — 1M Return", "1M%")
+            _render_heatmap(bond_df, "Bonds  1M Return", "1M%")
             _render_signal_table(bond_df)
         else:
             st.info("Could not fetch bond data.")
@@ -875,14 +899,14 @@ def show_market_scanner():
         st.subheader(" Top Movers & Losers (Cross-Asset)")
         with st.spinner("Aggregating all assets..."):
             all_frames = []
-            for name, syms in _WATCHLIST.items():
+            for name, syms in (_get_watchlist_groups() or {"Stocks": []}).items():
                 adf = _scan_list(syms, period=scan_period, max_workers=10)
                 if not adf.empty:
                     adf["category"] = name
                     all_frames.append(adf)
 
             for cat_name, cat_items in [
-                ("Crypto", {s: s for s in _CRYPTO}),
+                ("Crypto", {s: s for s in _get_crypto_list()}),
                 ("Commodities", _COMMODITIES),
                 ("Forex", _FOREX_PAIRS),
                 ("Sector ETFs", _ETF_SECTORS),
@@ -972,7 +996,7 @@ def show_market_scanner():
                 st.info("No assets currently overbought (RSI > 70).")
 
             # Volume spikes across all assets
-            all_spikes = all_df[all_df["Vol Spike"] == True]
+            all_spikes = all_df[all_df["Vol Spike"] == True] if "Vol Spike" in all_df.columns else pd.DataFrame()
             if not all_spikes.empty:
                 st.markdown("###  Volume Spike Alerts")
                 _render_signal_table(

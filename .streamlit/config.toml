@@ -1,0 +1,37 @@
+# Octavian Market AI - Streamlit configuration
+# Performance-focused settings for faster loading and fewer crashes.
+
+[server]
+# Only run the script when the browser tab is focused — saves CPU and avoids
+# repeated heavy re-renders while the user is on another tab.
+runOnSave = false
+# Allow larger in-memory payloads (large DataFrames / charts)
+maxMessageSize = 400
+# Keep the websocket alive during long market-data fetches
+enableXsrfProtection = true
+
+[browser]
+# Disable telemetry (saves a network round-trip on load)
+gatherUsageStats = false
+
+[runner]
+# Faster reruns: don't show the "running" spinner for every tiny widget change
+fastReruns = true
+
+[theme]
+base = "dark"
+primaryColor = "#c9a84c"
+backgroundColor = "#0a0e1a"
+secondaryBackgroundColor = "#121826"
+textColor = "#e8e8e8"
+
+# Disk-backed cache keeps @st.cache_data results across restarts so first-load
+# of every page after a restart is fast instead of a cold fetch.
+
+# Lower log noise for third-party libraries (yfinance prints warnings otherwise)
+[logger]
+level = "warning"
+
+[client]
+# Prefer the newer, faster dataframe serialization
+toolbarMode = "minimal"

@@ -145,6 +145,7 @@ class AdvancedBacktester:
             vw = volumes[max(0, i - lookback_window):i + 1] if volumes is not None and len(volumes) > i else None
 
             # Track unrealized P&L and check stops
+            unr = 0.0
             if position != 0:
                 if position > 0:
                     unr = (cp - entry_price) / entry_price
@@ -158,11 +159,12 @@ class AdvancedBacktester:
                     if position > 0:
                         ep = cp * (1 - self.slippage_pct)
                         pnl_p = (ep - entry_price) / entry_price
+                        capital += position * ep * (1 - self.commission_pct)
                     else:
                         ep = cp * (1 + self.slippage_pct)
                         pnl_p = (entry_price - ep) / entry_price
+                        capital -= abs(position) * ep * (1 + self.commission_pct)
                     pnl_d = pnl_p * abs(position) * entry_price
-                    capital += pnl_d - abs(position) * ep * self.commission_pct
                     trades.append(BacktestTrade(entry_time, timestamps[i], symbol,
                         "LONG" if position > 0 else "SHORT", entry_price, ep,
                         abs(position), pnl_p, pnl_d, entry_conf, entry_dir,
@@ -170,20 +172,30 @@ class AdvancedBacktester:
                     position = 0.0; max_fav = 0.0; max_adv = 0.0
                 
                 # Take profit
-                if use_take_profit and position != 0 and unr >= 0.04:
+                elif use_take_profit and unr >= 0.04:
                     if position > 0:
                         ep = cp * (1 - self.slippage_pct)
                         pnl_p = (ep - entry_price) / entry_price
+                        capital += position * ep * (1 - self.commission_pct)
                     else:
                         ep = cp * (1 + self.slippage_pct)
                         pnl_p = (entry_price - ep) / entry_price
+                        capital -= abs(position) * ep * (1 + self.commission_pct)
                     pnl_d = pnl_p * abs(position) * entry_price
-                    capital += pnl_d - abs(position) * ep * self.commission_pct
                     trades.append(BacktestTrade(entry_time, timestamps[i], symbol,
                         "LONG" if position > 0 else "SHORT", entry_price, ep,
                         abs(position), pnl_p, pnl_d, entry_conf, entry_dir,
                         i - entry_idx, "TAKE_PROFIT", max_fav, max_adv))
                     position = 0.0; max_fav = 0.0; max_adv = 0.0
+
+            # Calculate current equity for position sizing
+            if position > 0:
+                cur_eq = capital + position * cp
+            elif position < 0:
+                cur_eq = capital - abs(position) * cp
+            else:
+                cur_eq = capital
+            cur_eq = max(cur_eq, 0.01)
 
             # Generate signals on rebalance bars
             if i % rebalance_every == 0 and len(pw) >= 20:
@@ -192,60 +204,58 @@ class AdvancedBacktester:
                 except Exception:
                     signal = None
                     
-                if signal is None:
-                    pass
-                elif position == 0:
-                    #  ENTRY LOGIC 
-                    # Use fixed position sizing when Kelly is too small
-                    kelly_size = signal.optimal_position_size
-                    # Floor: at least 5% of capital if signal is strong enough
-                    effective_size = max(kelly_size * 2, 0.05) if signal.confidence > 0.15 else kelly_size * 2
-                    effective_size = min(effective_size, self.max_position_pct)
-                    
-                    if signal.direction == "BULLISH" and signal.confidence > 0.15:
-                        pv = capital * effective_size
-                        if pv > 50:
-                            ap = cp * (1 + self.slippage_pct)
-                            qty = pv / ap
-                            position = qty; entry_price = ap; entry_time = timestamps[i]
-                            entry_idx = i; entry_conf = signal.confidence; entry_dir = signal.direction
-                            capital -= qty * ap * self.commission_pct; max_fav = 0.0; max_adv = 0.0
-                    elif signal.direction == "BEARISH" and signal.confidence > 0.20:
-                        pv = capital * effective_size * 0.7
-                        if pv > 50:
-                            ap = cp * (1 - self.slippage_pct)
-                            qty = pv / ap
-                            position = -qty; entry_price = ap; entry_time = timestamps[i]
-                            entry_idx = i; entry_conf = signal.confidence; entry_dir = signal.direction
-                            capital -= qty * ap * self.commission_pct; max_fav = 0.0; max_adv = 0.0
-                            
-                elif position > 0 and signal.direction == "BEARISH" and signal.confidence > 0.25:
-                    # Exit long on bearish reversal
-                    ep = cp * (1 - self.slippage_pct)
-                    pnl_p = (ep - entry_price) / entry_price
-                    pnl_d = pnl_p * position * entry_price
-                    capital += position * ep - position * ep * self.commission_pct
-                    trades.append(BacktestTrade(entry_time, timestamps[i], symbol, "LONG",
-                        entry_price, ep, position, pnl_p, pnl_d, entry_conf, entry_dir,
-                        i - entry_idx, "SIGNAL_REVERSAL", max_fav, max_adv))
-                    position = 0.0; max_fav = 0.0; max_adv = 0.0
-                    
-                elif position < 0 and signal.direction == "BULLISH" and signal.confidence > 0.25:
-                    # Exit short on bullish reversal
-                    ep = cp * (1 + self.slippage_pct)
-                    pnl_p = (entry_price - ep) / entry_price
-                    pnl_d = pnl_p * abs(position) * entry_price
-                    capital += abs(position) * entry_price + pnl_d - abs(position) * ep * self.commission_pct
-                    trades.append(BacktestTrade(entry_time, timestamps[i], symbol, "SHORT",
-                        entry_price, ep, abs(position), pnl_p, pnl_d, entry_conf, entry_dir,
-                        i - entry_idx, "SIGNAL_REVERSAL", max_fav, max_adv))
-                    position = 0.0; max_fav = 0.0; max_adv = 0.0
+                if signal is not None:
+                    if position == 0:
+                        # ENTRY LOGIC
+                        kelly_size = signal.optimal_position_size
+                        effective_size = max(kelly_size * 2, 0.05) if signal.confidence > 0.15 else kelly_size * 2
+                        effective_size = min(effective_size, self.max_position_pct)
+                        
+                        if signal.direction == "BULLISH" and signal.confidence > 0.15:
+                            pv = cur_eq * effective_size
+                            if pv > 50:
+                                ap = cp * (1 + self.slippage_pct)
+                                qty = pv / ap
+                                position = qty; entry_price = ap; entry_time = timestamps[i]
+                                entry_idx = i; entry_conf = signal.confidence; entry_dir = signal.direction
+                                capital -= qty * ap * (1 + self.commission_pct); max_fav = 0.0; max_adv = 0.0
+                        
+                        elif signal.direction == "BEARISH" and signal.confidence > 0.20:
+                            pv = cur_eq * effective_size * 0.7
+                            if pv > 50:
+                                ap = cp * (1 - self.slippage_pct)
+                                qty = pv / ap
+                                position = -qty; entry_price = ap; entry_time = timestamps[i]
+                                entry_idx = i; entry_conf = signal.confidence; entry_dir = signal.direction
+                                capital += qty * ap * (1 - self.commission_pct); max_fav = 0.0; max_adv = 0.0
+                                
+                    elif position > 0 and signal.direction == "BEARISH" and signal.confidence > 0.25:
+                        # Exit long on bearish reversal
+                        ep = cp * (1 - self.slippage_pct)
+                        pnl_p = (ep - entry_price) / entry_price
+                        pnl_d = pnl_p * position * entry_price
+                        capital += position * ep * (1 - self.commission_pct)
+                        trades.append(BacktestTrade(entry_time, timestamps[i], symbol, "LONG",
+                            entry_price, ep, position, pnl_p, pnl_d, entry_conf, entry_dir,
+                            i - entry_idx, "SIGNAL_REVERSAL", max_fav, max_adv))
+                        position = 0.0; max_fav = 0.0; max_adv = 0.0
+                        
+                    elif position < 0 and signal.direction == "BULLISH" and signal.confidence > 0.25:
+                        # Exit short on bullish reversal
+                        ep = cp * (1 + self.slippage_pct)
+                        pnl_p = (entry_price - ep) / entry_price
+                        pnl_d = pnl_p * abs(position) * entry_price
+                        capital -= abs(position) * ep * (1 + self.commission_pct)
+                        trades.append(BacktestTrade(entry_time, timestamps[i], symbol, "SHORT",
+                            entry_price, ep, abs(position), pnl_p, pnl_d, entry_conf, entry_dir,
+                            i - entry_idx, "SIGNAL_REVERSAL", max_fav, max_adv))
+                        position = 0.0; max_fav = 0.0; max_adv = 0.0
 
-            # Update equity
+            # Re-update equity for the bar recording
             if position > 0:
                 cur_eq = capital + position * cp
             elif position < 0:
-                cur_eq = capital + abs(position) * (2 * entry_price - cp)
+                cur_eq = capital - abs(position) * cp
             else:
                 cur_eq = capital
             
@@ -260,15 +270,18 @@ class AdvancedBacktester:
             fp = prices[-1]
             if position > 0:
                 pnl_p = (fp - entry_price) / entry_price
+                capital += position * fp * (1 - self.commission_pct)
             else:
                 pnl_p = (entry_price - fp) / entry_price
+                capital -= abs(position) * fp * (1 + self.commission_pct)
             pnl_d = pnl_p * abs(position) * entry_price
-            capital += pnl_d
+            
             trades.append(BacktestTrade(entry_time, timestamps[-1], symbol,
                 "LONG" if position > 0 else "SHORT", entry_price, fp,
                 abs(position), pnl_p, pnl_d, entry_conf, entry_dir, 
                 n - 1 - entry_idx,
                 "END_OF_PERIOD", max_fav, max_adv))
+            position = 0.0
 
         final_capital = capital if position == 0 else capital
         # Recalculate final from last equity point

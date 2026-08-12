@@ -23,6 +23,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import re
+import json
 import time
 import uuid
 from typing import Dict, List, Optional, Tuple, Any
@@ -31,6 +32,41 @@ from concurrent.futures import ThreadPoolExecutor
 import asyncio
 
 from data_sources import get_stock, get_fx, get_futures_proxy
+
+
+# Queries that would NOT benefit from a price chart — knowledge / definitional
+# asks where a candlestick adds nothing and costs latency. Any query that
+# explicitly requests a visual always warrants charts. Patterns are precise
+# (regex-anchored) so "what does COST do?" is excluded while "what does the
+# price of oil affect..." / "what is the probability X reaches Y" still chart.
+_NO_CHART_PATTERNS = (
+    re.compile(r"\btell me about\b"),
+    re.compile(r"\bwho are\b"),
+    re.compile(r"\bwho is\b"),
+    re.compile(r"\bwhat sector is\b"),
+    re.compile(r"\bbusiness model\b"),
+    re.compile(r"\bmain competitors\b"),
+    re.compile(r"\bcompetitors\b"),
+    re.compile(r"\bpay a dividend\b"),
+    re.compile(r"\bdividend yield\b"),
+    re.compile(r"\bincome stock\b"),
+    re.compile(r"\bgrowing its dividend\b"),
+    re.compile(r"\bwhat happened to\b"),
+    re.compile(r"\bwhy did\b"),
+    re.compile(r"\bdoes it pay\b"),
+    re.compile(r"\bwhat does [a-z0-9.^-]{1,8} do\b"),
+    re.compile(r"\bwhat is [a-z0-9.^-]{1,8} the company\b"),
+    re.compile(r"\bwhat is 's\b"),
+)
+
+
+def _query_warrants_charts(query: str) -> bool:
+    """True when a query should receive price-chart visuals."""
+    q = (query or "").lower()
+    if any(w in q for w in ("chart", "graph", "plot", "show me", "visual",
+                            "candlestick", "picture")):
+        return True
+    return not any(p.search(q) for p in _NO_CHART_PATTERNS)
 from sector_scanner import scan_sectors, SECTOR_MAP
 from ml_analysis import get_analyzer, MLMarketAnalyzer
 from indicators import add_indicators
@@ -53,6 +89,24 @@ from trader_profile import (
 # Import unbiased analyzer and simulation engine
 from unbiased_market_analyzer import UnbiasedMarketAnalyzer
 from market_simulation_engine import MarketSimulationEngine
+from response_formatter import get_response_formatter, FormattedResponse
+
+# Import dynamic intent detection engine
+from intent_detection_engine import (
+    get_intent_detection_engine, 
+    IntentAnalysis, 
+    IntentCategory, 
+    ResponseFormat, 
+    DetailLevel,
+    Urgency  # Add missing import
+)
+
+# Dynamic ticker universe — single source of truth for all tickers
+try:
+    from ticker_universe import get_ticker_universe
+    _HAS_TICKER_UNIVERSE = True
+except ImportError:
+    _HAS_TICKER_UNIVERSE = False
 
 class OctavianEnhancedChatbot:
     """Enhanced AI chatbot with complete market coverage, zero bias, and pure profit focus."""
@@ -60,6 +114,7 @@ class OctavianEnhancedChatbot:
     def __init__(self):
         # Lazy initialization for heavy components
         self._analyzer = None
+        self._llm_agent = None
         self._db_manager = None
         self._news_engine = None
         self._multi_asset_analyzer = None
@@ -71,10 +126,17 @@ class OctavianEnhancedChatbot:
         self._unbiased_analyzer = None
         self._simulation_engine = None
         self._simulation_thread = None
+        self._response_formatter = None
         
         self.session_id = str(uuid.uuid4())
         self.conversation_context = {}
         self.user_preferences = {}
+
+        # Local-LLM (LM Studio) structured-intent interpreter state. The flag is
+        # lazily probed on first use (see _call_lm_studio_interpreter); callers may
+        # also set it explicitly to force enable/disable.
+        self.lm_studio_online = None  # None = unknown, probed on first call
+        self._lm_studio_narrative = ""
         
         # REMOVED ALL BIAS - Enhanced intent patterns for complete market coverage
         self.intent_patterns = {
@@ -100,6 +162,15 @@ class OctavianEnhancedChatbot:
                 r'(rsi|macd|ema|sma|bollinger|stochastic)',
                 r'(overbought|oversold|neutral)',
                 r'(breakout|breakdown|reversal)',
+            ],
+            'risk': [
+                r'(risk|risks|risky|risk.analysis)',
+                r'(volatility|vol|variance|std.dev)',
+                r'(downside|drawdown|max.loss)',
+                r'(sharpe|sortino|risk.adjusted)',
+                r'(beta|correlation|covariance)',
+                r'(var|value.at.risk|cvar)',
+                r'(risk.management|risk.metrics)',
             ],
             'unbiased_scan': [
                 r'(scan|screen|find|discover|search)',
@@ -137,6 +208,75 @@ class OctavianEnhancedChatbot:
             ]
         }
         
+    def _call_lm_studio_interpreter(self, prompt: str) -> Optional[Dict[str, Any]]:
+        """Query the local LM Studio instance and parse its structured JSON reply.
+
+        Returns a dict with ``intent``, ``symbols``, ``timeframe`` and
+        ``analysis_type`` keys, or ``None`` when the local LLM is offline,
+        unreachable, returns nothing, or emits no parseable structured intent.
+        The raw narrative is always stored on ``self._lm_studio_narrative``.
+        """
+        # Auto-probe connectivity on first use when not explicitly set.
+        if self.lm_studio_online is None:
+            try:
+                from financial_llm_engine import check_llm_connectivity
+                self.lm_studio_online = bool(check_llm_connectivity())
+            except Exception:
+                self.lm_studio_online = False
+
+        if not self.lm_studio_online:
+            return None
+
+        raw = None
+        try:
+            from financial_llm_engine import _call_llm
+            raw = _call_llm(prompt)
+        except Exception:
+            return None
+
+        if raw is None:
+            return None
+        raw_str = str(raw)
+        self._lm_studio_narrative = raw_str
+        if not raw_str.strip():
+            return None
+
+        parsed = None
+        # 1) Direct parse
+        try:
+            parsed = json.loads(raw_str)
+        except Exception:
+            parsed = None
+
+        # 2) Regex fallback: pull the first balanced JSON object (handles
+        #    markdown code fences, leading prose, trailing commentary).
+        if not isinstance(parsed, dict):
+            try:
+                match = re.search(r'\{.*\}', raw_str, re.DOTALL)
+                if match:
+                    candidate = match.group(0)
+                    parsed = json.loads(candidate)
+            except Exception:
+                parsed = None
+
+        if not isinstance(parsed, dict):
+            return None
+
+        intent = parsed.get('intent')
+        if not intent:
+            return None
+
+        symbols = parsed.get('symbols', [])
+        if not isinstance(symbols, list):
+            symbols = []
+
+        return {
+            'intent': str(intent),
+            'symbols': [str(s) for s in symbols if s],
+            'timeframe': str(parsed.get('timeframe', '') or ''),
+            'analysis_type': str(parsed.get('analysis_type', '') or ''),
+        }
+
     @property
     def analyzer(self):
         if self._analyzer is None:
@@ -190,6 +330,14 @@ class OctavianEnhancedChatbot:
         if self._timeframe_engine is None:
             self._timeframe_engine = TimeframeAnalysisEngine()
         return self._timeframe_engine
+    
+    @property
+    def intent_engine(self):
+        """Get dynamic intent detection engine."""
+        return get_intent_detection_engine()
+        if self._timeframe_engine is None:
+            self._timeframe_engine = TimeframeAnalysisEngine()
+        return self._timeframe_engine
 
     @property
     def unbiased_analyzer(self):
@@ -205,23 +353,91 @@ class OctavianEnhancedChatbot:
             self._simulation_thread = self._simulation_engine.start_simulation_engine()
         return self._simulation_engine
 
-    def _generate_octavian_guidance(self, query: str, intents: List[str], timeframe_scope: TimeframeScope) -> str:
-        """Generate guidance when the user asks a broad question without explicit symbols."""
-        timeframe_label = timeframe_scope.value.replace('_', ' ').title()
-        text = "#  Octvavision Terminal\n\n"
-        text += f"I can answer broad market questions in plain English, and I can also run deep analysis when you name specific symbols.\n\n"
-        text += f"##  What I understood\n- **Request:** {query.strip()}\n- **Timeframe context:** **{timeframe_label}**\n\n"
+    @property
+    def response_formatter(self):
+        if self._response_formatter is None:
+            self._response_formatter = get_response_formatter()
+        return self._response_formatter
 
-        if 'sector' in intents:
-            text += "##  Try\n- `Show me the most bearish sectors and short candidates`\n- `Which sector is weakest and which tickers inside it look weak?`\n\n"
-        elif 'news_sentiment' in intents:
-            text += "##  Try\n- `Summarize today’s market sentiment and key catalysts`\n- `What is the sentiment around Big Tech vs Energy?`\n\n"
-        else:
-            text += "##  Try\n- `Analyze the current market regime (risk-on vs risk-off)`\n- `Where are the best short opportunities right now?`\n- `Is USDJPY bullish or bearish?`\n\n"
+    def _get_asset_examples(self, per_asset: int = 4) -> Dict[str, List[str]]:
+        """Dynamically source example tickers from the live multi-asset universe.
 
-        text += "##  For precision (optional)\n"
-        text += "If you include a symbol (e.g., `AAPL`, `XLF`, `USDJPY=X`, `ES=F`), I can attach exact levels, signals, and risk parameters.\n"
-        return text
+        Never hardcodes symbols — the examples always mirror the currently
+        supported universe (equities, ETFs, crypto, forex, futures).
+        """
+        examples: Dict[str, List[str]] = {
+            'Stocks': [], 'ETFs': [], 'Crypto': [], 'Forex': [], 'Futures': [],
+        }
+        try:
+            from ticker_universe import get_ticker_universe
+            u = get_ticker_universe()
+            stocks = u.get_all_stocks() or []
+            etfs = u.get_etfs() or []
+            crypto = u.get_crypto() or []
+            fx = u.get_forex() or []
+            fut = u.get_futures() or []
+            examples['Stocks'] = [s for s in stocks if len(s) <= 6][:per_asset]
+            examples['ETFs'] = etfs[:per_asset]
+            examples['Crypto'] = crypto[:per_asset]
+            examples['Forex'] = [f.replace('-', '/') for f in fx[:per_asset]]
+            examples['Futures'] = fut[:per_asset]
+        except Exception:
+            pass
+        # Guarantee every category is non-empty so the UI guidance is always useful.
+        fallback = {
+            'Stocks': ['AAPL', 'MSFT', 'NVDA'],
+            'ETFs': ['SPY', 'QQQ', 'IWM'],
+            'Crypto': ['BTC-USD', 'ETH-USD', 'SOL-USD'],
+            'Forex': ['EUR/USD', 'GBP/USD', 'USD/JPY'],
+            'Futures': ['ES=F', 'NQ=F', 'CL=F'],
+        }
+        for k, v in examples.items():
+            if not v:
+                examples[k] = fallback.get(k, [])[:per_asset]
+        return examples
+
+    def _fallback_analysis_summary(self, symbol_analyses: Dict[str, Any]) -> Dict[str, Any]:
+        """Fallback when _create_enhanced_analysis_summary is not available."""
+        summary = {
+            'total_symbols': len(symbol_analyses),
+            'bullish_count': 0,
+            'bearish_count': 0,
+            'neutral_count': 0,
+            'avg_confidence': 0,
+            'high_confidence_signals': [],
+            'credibility_insights': {},
+            'timeframe_insights': {}
+        }
+        confidences = []
+        for symbol, analysis in symbol_analyses.items():
+            prediction = analysis.get('prediction', {})
+            signal = prediction.get('signal', 'NEUTRAL')
+            confidence = prediction.get('confidence', 0.5)
+            confidences.append(confidence)
+            if signal == 'BULLISH':
+                summary['bullish_count'] += 1
+            elif signal == 'BEARISH':
+                summary['bearish_count'] += 1
+            else:
+                summary['neutral_count'] += 1
+            if confidence > 0.7:
+                summary['high_confidence_signals'].append({'symbol': symbol, 'signal': signal, 'confidence': confidence})
+        if confidences:
+            summary['avg_confidence'] = float(np.mean(confidences))
+        return summary
+
+    def _fallback_suggestions(self, symbol_analyses: Dict[str, Any]) -> List[str]:
+        """Fallback when _generate_enhanced_suggestions is not available."""
+        suggestions = []
+        for symbol in list(symbol_analyses.keys())[:5]:
+            suggestions.append(f"Show risk analysis for {symbol}")
+            suggestions.append(f"Compare {symbol} with sector")
+        suggestions.extend([
+            "Overall market sentiment",
+            "Cross-sector correlation",
+            "Volatility regime",
+        ])
+        return suggestions[:8]
     
     def _detect_intent_and_timeframe(self, query: str) -> Tuple[List[str], Optional[TimeframeScope]]:
         """Detect user intent and preferred timeframe from query."""
@@ -262,23 +478,40 @@ class OctavianEnhancedChatbot:
         # Basic English stopwords to avoid treating normal words as tickers
         english_stopwords = {
             "THE", "AND", "OR", "BUT", "IF", "THEN", "ELSE", "WHEN", "WHAT", "WHY", "HOW",
-            "IS", "ARE", "AM", "WAS", "WERE", "BE", "BEEN", "BEING",
+            "IS", "ARE", "AM", "WAS", "WERE", "BE", "BEEN", "BEING", "DO", "DID", "DOES",
             "I", "YOU", "HE", "SHE", "IT", "WE", "THEY", "ME", "HIM", "HER", "US", "THEM",
             "THIS", "THAT", "THESE", "THOSE",
             "IN", "ON", "AT", "BY", "FOR", "WITH", "ABOUT", "AGAINST", "BETWEEN", "INTO",
             "THROUGH", "DURING", "BEFORE", "AFTER", "ABOVE", "BELOW", "FROM", "UP", "DOWN",
-            "OUT", "OVER", "UNDER", "AGAIN", "FURTHER", "ONCE",
+            "OUT", "OVER", "UNDER", "AGAIN", "FURTHER", "ONCE", "TO", "A", "AN", "AS",
             "SECTOR", "SECTORS", "SHORT", "LONG", "LOOK", "RIGHT", "NOW", "BEAR", "BEARISH",
             "BULL", "BULLISH", "EXTREME", "EXTREMELY", "POTENTIAL", "CANDIDATE", "CANDIDATES",
             "TICKER", "TICKERS", "THROUGHOUT", "SEEM", "SEEMS", "VERY", "MOST", "WORST", "BEST",
-            "FOR", "POSITION",
+            "FOR", "POSITION", "PRICES", "PRICE", "TREND", "TRENDS", "MARKET", "MARKETS"
+        }
+        
+        # Word to ticker mapping for common commodities and indices
+        word_to_ticker = {
+            "OIL": "CL=F",
+            "GOLD": "GC=F",
+            "SILVER": "SI=F",
+            "COPPER": "HG=F",
+            "BITCOIN": "BTC-USD",
+            "ETHEREUM": "ETH-USD",
+            "SPX": "SPY",
+            "NASDAQ": "QQQ",
+            "DOW": "DIA",
+            "VIX": "^VIX",
         }
         
         # NO BIAS - Extract ALL potential symbols equally, but avoid obvious English words
-        potential_symbols = re.findall(r'\b[A-Z]{1,5}\b', query_upper)
+        potential_symbols = re.findall(r'\b[A-Z]{1,6}\b', query_upper)
         
         for symbol in potential_symbols:
             if symbol in english_stopwords:
+                continue
+            if symbol in word_to_ticker:
+                symbols.append(word_to_ticker[symbol])
                 continue
             # Allow typical ticker patterns: at least 2 chars or includes a digit
             if len(symbol) >= 2 or any(ch.isdigit() for ch in symbol):
@@ -330,123 +563,48 @@ class OctavianEnhancedChatbot:
         # NO BIAS - Return ALL symbols found, don't prioritize "well-known" ones
         return symbols[:10]  # Reasonable limit for performance
     
-    async def process_unbiased_query(self, query: str, user_id: str = None) -> Dict[str, Any]:
-        """Process user query with COMPLETELY UNBIASED analysis focused on PURE PROFIT MAXIMIZATION."""
-        start_time = time.time()
-        
-        # Learn from user interaction
-        learn_from_user_interaction(query, query)
-        
-        # Get trader profile context
-        trader_context = get_timeframe_context_for_analysis()
-        recommendation_style = get_recommendation_style()
-        
-        # Detect intent and timeframe
-        intents, detected_timeframe = self._detect_intent_and_timeframe(query)
-        
-        # Determine analysis timeframe
-        analysis_timeframe = detected_timeframe or trader_context.get('primary_timeframe', TimeframeScope.SWING)
-        
-        # Extract symbols - NO BIAS
-        symbols = self._extract_symbols(query)
-        
-        # UNBIASED MARKET SCANNING - If no specific symbols, scan entire market for opportunities
-        if not symbols or 'unbiased_scan' in intents or 'profit_maximization' in intents:
-            return await self._perform_unbiased_market_scan(query, intents, analysis_timeframe, trader_context, start_time)
-        
-        response = {
-            'text': '',
-            'charts': [],
-            'intents': intents,
-            'symbols': symbols,
-            'timeframe_context': analysis_timeframe.value,
-            'trader_profile': recommendation_style,
-            'analysis_summary': {},
-            'market_context': {},
-            'unbiased_insights': {},
-            'profit_opportunities': {},
-            'simulation_learnings': {},
-            'suggestions': [],
-            'response_time_ms': 0
-        }
-        
-        # Get market regime context
+    def _generate_opportunity_charts(self, opportunities: list) -> list:
+        """Generate summary charts from scan opportunities.
+
+        Since UnbiasedAnalysis structs carry no raw price data, we generate
+        a simple Plotly bar chart showing profit probability, expected return,
+        and confidence for the top opportunities.
+        """
+        if not opportunities:
+            return []
+        charts = []
         try:
-            vol_regime = volatility_regime()
-            risk_mode = risk_on_off()
-            response['market_context'] = {
-                'volatility_regime': vol_regime,
-                'risk_mode': risk_mode,
-                'analysis_timeframe': analysis_timeframe.value,
-                'timestamp': datetime.now().isoformat()
-            }
+            top = opportunities[:15]
+            labels = [o.symbol for o in top]
+            probs = [o.profit_probability * 100 for o in top]
+            rets = [o.expected_return * 100 for o in top]
+            confs = [o.confidence_score * 100 for o in top]
+
+            fig = make_subplots(
+                rows=3, cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.06,
+                subplot_titles=("Profit Probability (%)", "Expected Return (%)", "Confidence Score (%)"),
+                row_heights=[0.34, 0.33, 0.33],
+            )
+            fig.add_trace(go.Bar(x=labels, y=probs, marker_color="green", name="Profit Prob"), row=1, col=1)
+            fig.add_trace(go.Bar(x=labels, y=rets, marker_color="royalblue", name="Exp Return"), row=2, col=1)
+            fig.add_trace(go.Bar(x=labels, y=confs, marker_color="orange", name="Confidence"), row=3, col=1)
+            fig.update_layout(
+                height=500,
+                title_text="Top Scan Opportunities",
+                template="plotly_dark",
+                showlegend=False,
+            )
+            charts.append({
+                "type": "opportunity_summary",
+                "title": "Top Scan Opportunities",
+                "figure": fig,
+            })
         except Exception as e:
-            print(f"Error getting market context: {e}")
-        
-        # Process symbols with UNBIASED analysis
-        symbol_analyses = {}
-        
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_symbol = {}
-            
-            for symbol in symbols[:5]:  # Analyze up to 5 symbols
-                future = executor.submit(
-                    self._analyze_symbol_unbiased, 
-                    symbol, intents, analysis_timeframe, trader_context
-                )
-                future_to_symbol[future] = symbol
-            
-            for future in future_to_symbol:
-                symbol = future_to_symbol[future]
-                try:
-                    analysis = future.result(timeout=60)
-                    if analysis:
-                        symbol_analyses[symbol] = analysis
-                except Exception as e:
-                    print(f"Error analyzing {symbol}: {e}")
-                    response['text'] += f"\n Unable to analyze {symbol}: {str(e)}\n"
-        
-        # Generate UNBIASED response focused on PROFIT MAXIMIZATION
-        if symbol_analyses:
-            response['text'] = await self._generate_unbiased_profit_response(
-                query, symbol_analyses, intents, analysis_timeframe, 
-                response['market_context'], trader_context
-            )
-            response['analysis_summary'] = self._create_unbiased_analysis_summary(symbol_analyses)
-            response['unbiased_insights'] = self._extract_unbiased_insights(symbol_analyses)
-            response['profit_opportunities'] = self._extract_profit_opportunities(symbol_analyses)
-            
-            # Get simulation learnings
-            response['simulation_learnings'] = await self._get_simulation_learnings(symbols)
-            
-            # Generate charts
-            response['charts'] = self._generate_unbiased_charts(symbol_analyses, intents, analysis_timeframe)
-            
-            # Generate profit-focused suggestions
-            response['suggestions'] = self._generate_profit_suggestions(
-                symbol_analyses, intents, analysis_timeframe, trader_context
-            )
-        
-        # Calculate response time
-        response_time_ms = int((time.time() - start_time) * 1000)
-        response['response_time_ms'] = response_time_ms
-        
-        # Store conversation with enhanced metadata
-        try:
-            conversation_id = self.db_manager.store_conversation(
-                self.session_id, query, response, user_id, response_time_ms
-            )
-            
-            # Store unbiased analytics
-            self.db_manager.log_system_metric('unbiased_response_time_ms', response_time_ms)
-            self.db_manager.log_system_metric('profit_opportunities_found', len(response.get('profit_opportunities', {})))
-            self.db_manager.log_system_metric('unbiased_analysis_count', len(symbol_analyses))
-            
-        except Exception as e:
-            print(f"Error storing unbiased conversation: {e}")
-        
-        return response
-    
+            print(f"Error generating opportunity charts: {e}")
+        return charts
+
     async def _perform_unbiased_market_scan(self, query: str, intents: List[str], 
                                           analysis_timeframe: TimeframeScope,
                                           trader_context: Dict[str, Any], 
@@ -467,8 +625,17 @@ class OctavianEnhancedChatbot:
         # Get top opportunities
         top_opportunities = market_opportunities[:20]
         
+        # Use response formatter for clean user text
+        formatted = self.response_formatter.format_scan_response(
+            opportunities=top_opportunities,
+            timeframe=analysis_timeframe.value
+        )
+        
         response = {
-            'text': await self._generate_market_scan_response(query, top_opportunities, analysis_timeframe),
+            'text': formatted.user_text,
+            'raw_analysis': formatted.raw_analysis,
+            'show_reasoning_available': formatted.show_reasoning_available,
+            'response_metadata': formatted.response_metadata,
             'charts': self._generate_opportunity_charts(top_opportunities),
             'intents': intents,
             'symbols': [opp.symbol for opp in top_opportunities[:10]],
@@ -483,226 +650,130 @@ class OctavianEnhancedChatbot:
         
         return response
     
-    async def process_enhanced_query(self, query: str, user_id: str = None) -> Dict[str, Any]:
-        """Process user query with enhanced AI analysis including source credibility and timeframe context."""
+    @property
+    def llm_agent(self):
+        return None
+
+    async def process_enhanced_query(self, query: str, user_id: str = None) -> dict:
+        import time
+        from financial_llm_engine import generate_financial_analysis, expand_query_intents
         start_time = time.time()
-        
-        # Learn from user interaction
-        learn_from_user_interaction(query, query)
-        
-        # Get trader profile context
-        trader_context = get_timeframe_context_for_analysis()
-        recommendation_style = get_recommendation_style()
-        
-        # Detect intent and timeframe
-        intents, detected_timeframe = self._detect_intent_and_timeframe(query)
-        
-        # Determine analysis timeframe (user specified or profile-based)
-        analysis_timeframe = detected_timeframe or trader_context.get('primary_timeframe', TimeframeScope.SWING)
-        
-        # Extract symbols
-        symbols = self._extract_symbols(query)
 
-        query_lower = query.lower()
-        if (('news_sentiment' in intents) or ('comprehensive' in intents)) and not symbols:
-            text = self._generate_market_wide_brief(analysis_timeframe)
-            return {
-                'text': text,
-                'charts': [],
-                'intents': intents,
-                'symbols': [],
-                'timeframe_context': analysis_timeframe.value,
-                'trader_profile': recommendation_style,
-                'suggestions': [],
-                'response_time_ms': int((time.time() - start_time) * 1000)
-            }
+        # Extract intents, tickers, and sectors for metadata
+        intents, tickers, sectors = expand_query_intents(query)
 
-        if (('sector' in intents) or ('sector' in query_lower) or ('sectors' in query_lower)) and not symbols:
-            sector_df = scan_sectors()
-            if sector_df is None or sector_df.empty:
-                return {
-                    'text': "Unable to load sector data right now. Please try again.",
-                    'charts': [],
-                    'intents': intents,
-                    'symbols': [],
-                    'timeframe_context': analysis_timeframe.value,
-                    'trader_profile': recommendation_style,
-                    'suggestions': [],
-                    'response_time_ms': int((time.time() - start_time) * 1000)
-                }
+        # Optionally pull heartbeat context for richer grounding
+        heartbeat_ctx = None
+        try:
+            from market_heartbeat_system import fetch_heartbeat_data, generate_market_heartbeat
+            g, u = fetch_heartbeat_data()
+            if g and u:
+                hb = generate_market_heartbeat(g, u)
+                heartbeat_ctx = f"Market State: {hb.get('env_class', ('Unknown',''))[0]} | VIX regime: {hb.get('vol', ('Unknown',''))[0]}"
+        except Exception:
+            pass
 
-            bearish = sector_df.nsmallest(min(3, len(sector_df)), 'TrendScore')
-            bullish = sector_df.nlargest(min(3, len(sector_df)), 'TrendScore')
+        # Generate the deep financial analysis with live data grounding
+        response_text = generate_financial_analysis(query, context_data=heartbeat_ctx)
 
-            lookback = 21
-            text = "#  Octvavision Sector Short Candidates\n\n"
-            text += "##  Most Bearish Sectors (21D Momentum)\n"
+        # Build detected intent labels
+        active_intents = [k for k, v in intents.items() if v]
+        if sectors:
+            active_intents.extend([s.replace("_", " ").title() for s in sectors])
 
-            for _, row in bearish.iterrows():
-                sector_name = row.get('Sector')
-                score = float(row.get('TrendScore'))
-                assets_used = row.get('AssetsUsed')
-                tickers = SECTOR_MAP.get(sector_name, [])
+        # Generate charts from live price data for the analyzed symbols — but
+        # ONLY when the query actually warrants visuals. Knowledge/definitional
+        # queries ("tell me about COST", "who are X's competitors", "does X pay
+        # a dividend") get no charts: a price chart adds nothing there and costs
+        # latency. Fetches are parallelized across symbols to keep latency low.
+        charts = []
+        if _query_warrants_charts(query):
+            try:
+                from data_sources import get_stock
 
-                text += f"### {sector_name} ({score:.2f}%)\n"
-                text += f"- Assets used: {assets_used}\n"
-
-                # Rank constituents by lookback return (weakest first)
-                candidate_rows = []
-                for t in tickers:
-                    df = get_stock(t)
-                    if df is None or df.empty or len(df) < lookback:
-                        continue
+                def _fetch_and_chart(sym):
                     try:
-                        close_col = df["Close"]
-                        if isinstance(close_col, pd.DataFrame):
-                            close_col = close_col.iloc[:, 0]
-                        current = float(close_col.iloc[-1])
-                        prev = float(close_col.iloc[-lookback])
-                        ret = ((current / prev) - 1) * 100 if prev > 0 else 0
-                        candidate_rows.append((t, ret))
-                    except Exception:
-                        continue
+                        df = get_stock(sym, period='6mo', interval='1d')
+                        if df is not None and not df.empty and 'Close' in df.columns:
+                            fig = self._create_advanced_price_chart(df, sym, True, 'standard')
+                            if fig is not None:
+                                return {
+                                    'type': 'price_analysis',
+                                    'symbol': sym,
+                                    'figure': fig,
+                                    'title': f'{sym} — Price Analysis (6M)',
+                                }
+                    except Exception as e:
+                        print(f"Chart error for {sym}: {e}")
+                    return None
 
-                if candidate_rows:
-                    candidate_rows.sort(key=lambda x: x[1])
-                    weakest = candidate_rows[:3]
-                    text += "- Weakest tickers:\n"
-                    for t, r in weakest:
-                        text += f"  - `{t}`: {r:.2f}%\n"
-                else:
-                    if tickers:
-                        text += "- Constituents: " + ", ".join([f"`{t}`" for t in tickers]) + "\n"
+                with ThreadPoolExecutor(max_workers=min(6, len(tickers))) as pool:
+                    results = list(pool.map(_fetch_and_chart, tickers[:6]))
+                charts = [r for r in results if r is not None]
+            except Exception as e:
+                print(f"Chart generation error: {e}")
 
-                text += "\n"
-
-            text += "##  Strongest Sectors (For Pairing / Hedge)\n"
-            for _, row in bullish.iterrows():
-                sector_name = row.get('Sector')
-                score = float(row.get('TrendScore'))
-                text += f"- **{sector_name}**: {score:.2f}%\n"
-
-            text += "\n##  Execution Checklist\n"
-            text += "- Prefer short entries after a failed bounce (lower high) or a breakdown below prior support.\n"
-            text += "- Invalidate above the last swing high; size risk so a stop-out is acceptable.\n"
-            text += "- Consider pairing: short weakest sector vs long strongest sector to reduce market beta.\n"
-
-            return {
-                'text': text,
-                'charts': [],
-                'intents': intents,
-                'symbols': [],
-                'timeframe_context': analysis_timeframe.value,
-                'trader_profile': recommendation_style,
-                'suggestions': [],
-                'response_time_ms': int((time.time() - start_time) * 1000)
-            }
-        
-        # If no symbols found, provide guidance
-        if not symbols:
-            return {
-                'text': self._generate_octavian_guidance(query, intents, analysis_timeframe),
-                'charts': [],
-                'intents': intents,
-                'symbols': [],
-                'timeframe_context': analysis_timeframe.value,
-                'trader_profile': recommendation_style,
-                'suggestions': self._get_contextual_suggestions(analysis_timeframe),
-                'response_time_ms': int((time.time() - start_time) * 1000)
-            }
-
-        response = {
-            'text': '',
-            'charts': [],
-            'intents': intents,
-            'symbols': symbols,
-            'timeframe_context': analysis_timeframe.value,
-            'trader_profile': recommendation_style,
-            'analysis_summary': {},
-            'market_context': {},
-            'credibility_weighted_insights': {},
-            'suggestions': [],
-            'response_time_ms': 0
+        return {
+            'text': response_text,
+            'charts': charts,
+            'intents': active_intents if active_intents else ['general_analysis'],
+            'symbols': tickers[:10],
+            'timeframe_context': 'swing',
+            'trader_profile': 'neutral',
+            'suggestions': self._generate_followup_suggestions(query, tickers, sectors),
+            'response_time_ms': int((time.time() - start_time) * 1000),
         }
-        
-        # Get market regime context
+
+    def _generate_followup_suggestions(self, query, tickers, sectors):
+        """Generate contextual follow-up suggestions based on the query."""
+        suggestions = []
+        if tickers:
+            suggestions.append(f"Deep dive on {tickers[0]}")
+            suggestions.append(f"Risk analysis for {tickers[0]}")
+        if sectors:
+            s = sectors[0].replace("_", " ").title()
+            suggestions.append(f"Bearish outlook for {s}")
+            suggestions.append(f"Top dividend stocks in {s}")
+        if not tickers and not sectors:
+            suggestions.extend(["Current macro regime analysis", "Best sectors this week", "VIX and volatility outlook"])
+        return suggestions[:4]
+
+    async def process_unbiased_query(self, query: str, user_id: str = None) -> dict:
+        """Second process_unbiased_query that delegates to enhanced for LLM-rich path
+        BUT also dispatches to the first process_unbiased_query when scan intents detected."""
+        from financial_llm_engine import expand_query_intents
+
+        # Portfolio-aware routing: questions about the user's own holdings are
+        # answered from their actual paper/manual portfolio data.
         try:
-            vol_regime = volatility_regime()
-            risk_mode = risk_on_off()
-            response['market_context'] = {
-                'volatility_regime': vol_regime,
-                'risk_mode': risk_mode,
-                'analysis_timeframe': analysis_timeframe.value,
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            print(f"Error getting market context: {e}")
-        
-        # Process symbols with enhanced analysis
-        symbol_analyses = {}
-        
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            future_to_symbol = {}
-            
-            for symbol in symbols[:3]:
-                future = executor.submit(
-                    self._analyze_symbol_enhanced, 
-                    symbol, intents, analysis_timeframe, trader_context
-                )
-                future_to_symbol[future] = symbol
-            
-            for future in future_to_symbol:
-                symbol = future_to_symbol[future]
-                try:
-                    analysis = future.result(timeout=45)
-                    if analysis:
-                        symbol_analyses[symbol] = analysis
-                except Exception as e:
-                    print(f"Error analyzing {symbol}: {e}")
-                    response['text'] += f"\n Unable to analyze {symbol}: {str(e)}\n"
-        
-        # Generate enhanced response
-        if symbol_analyses:
-            response['text'] = await self._generate_octavian_response(
-                query, symbol_analyses, intents, analysis_timeframe, 
-                response['market_context'], trader_context
+            from portfolio_chatbot_context import (
+                detect_portfolio_intent, handle_portfolio_query,
+                load_all_portfolios, _get_all_holdings,
             )
-            response['analysis_summary'] = self._create_enhanced_analysis_summary(symbol_analyses)
-            response['credibility_weighted_insights'] = self._extract_credibility_insights(symbol_analyses)
-            
-            # Generate charts
-            response['charts'] = self._generate_enhanced_charts(symbol_analyses, intents, analysis_timeframe)
-            
-            # Generate contextual suggestions
-            response['suggestions'] = self._generate_enhanced_suggestions(
-                symbol_analyses, intents, analysis_timeframe, trader_context
+            pf_intent = detect_portfolio_intent(query)
+            if pf_intent:
+                ctx = load_all_portfolios(user_id)
+                holdings = _get_all_holdings(ctx) if ctx.get('has_data') else []
+                res = handle_portfolio_query(query, pf_intent, user_id)
+                if asyncio.iscoroutine(res):
+                    res = await res
+                return {
+                    'text': res if isinstance(res, str) else str(res),
+                    'charts': [],
+                    'intents': [pf_intent],
+                    'symbols': [h.get('symbol') for h in holdings if h.get('symbol')],
+                    'suggestions': [],
+                    'response_time_ms': 0,
+                }
+        except Exception:
+            pass
+
+        _, tickers, sectors = expand_query_intents(query)
+        if not tickers and 'scan' in query.lower():
+            return await self._perform_unbiased_market_scan(
+                query, ['unbiased_scan'], TimeframeScope.SWING, {}, time.time()
             )
-        
-        # Calculate response time
-        response_time_ms = int((time.time() - start_time) * 1000)
-        response['response_time_ms'] = response_time_ms
-        
-        # Store conversation with enhanced metadata
-        try:
-            conversation_id = self.db_manager.store_conversation(
-                self.session_id, query, response, user_id, response_time_ms
-            )
-            
-            # Store enhanced analytics
-            self.db_manager.log_system_metric('enhanced_response_time_ms', response_time_ms)
-            self.db_manager.log_system_metric('timeframe_analysis', analysis_timeframe.value)
-            behavior_patterns = trader_context.get('behavior_patterns') if hasattr(trader_context, 'get') else None
-            learning_confidence = 0
-            if isinstance(behavior_patterns, dict):
-                learning_confidence = behavior_patterns.get('learning_confidence', 0)
-            elif behavior_patterns is not None:
-                learning_confidence = getattr(behavior_patterns, 'learning_confidence', 0)
-            self.db_manager.log_system_metric('trader_profile_confidence', learning_confidence)
-            
-        except Exception as e:
-            print(f"Error storing enhanced conversation: {e}")
-        
-        return response
+        return await self.process_enhanced_query(query, user_id)
 
     def _generate_market_wide_brief(self, analysis_timeframe: TimeframeScope) -> str:
         try:
@@ -827,6 +898,7 @@ class OctavianEnhancedChatbot:
             analysis = {
                 'symbol': symbol,
                 'unbiased_analysis': unbiased_analysis,
+                'data': getattr(self.unbiased_analyzer, '_last_fetched_data', None),
                 'profit_probability': unbiased_analysis.profit_probability,
                 'expected_return': unbiased_analysis.expected_return,
                 'risk_adjusted_return': unbiased_analysis.risk_adjusted_return,
@@ -871,10 +943,126 @@ class OctavianEnhancedChatbot:
                                trader_context: Dict[str, Any]) -> Dict[str, Any]:
         """Enhanced symbol analysis used by process_enhanced_query.
 
-        For now, this reuses the unbiased analysis pipeline so the enhanced path
-        has a stable, data-backed result structure to work with.
+        Delegates to the unbiased analysis pipeline AND maps the result into
+        the data structure that _generate_enhanced_symbol_analysis expects,
+        including 'prediction', 'metrics', 'technical', and 'asset_type'.
         """
-        return self._analyze_symbol_unbiased(symbol, intents, timeframe_scope, trader_context)
+        # Get the raw unbiased analysis
+        raw_result = self._analyze_symbol_unbiased(symbol, intents, timeframe_scope, trader_context)
+        if raw_result is None:
+            return None
+
+        # Pull out the UnbiasedAnalysis object
+        ua = raw_result.get('unbiased_analysis')
+        if ua is None:
+            return None
+
+        # --- Fetch live price data for real metrics ---
+        # Try using the DataFrame already fetched by the unbiased analyzer
+        # to avoid a second expensive network call
+        current_price = 0.0
+        daily_change = 0.0
+        asset_type = 'Stock'
+        price_df = raw_result.get('data')  # DataFrame from unbiased analysis
+        try:
+            if price_df is None or (hasattr(price_df, 'empty') and price_df.empty):
+                # Fallback: fetch only if unbiased analyzer didn't provide data
+                price_df, asset_type = self._get_real_time_data(symbol, period='3mo')
+            else:
+                # Determine asset type from symbol
+                if '/' in symbol or '=X' in symbol:
+                    asset_type = 'Forex'
+                elif '=F' in symbol:
+                    asset_type = 'Futures'
+                elif symbol.endswith('-USD'):
+                    asset_type = 'Crypto'
+                else:
+                    # Dynamically check against the ticker universe ETF list
+                    _is_etf = False
+                    if _HAS_TICKER_UNIVERSE:
+                        try:
+                            _is_etf = symbol in set(get_ticker_universe().get_etfs())
+                        except Exception:
+                            pass
+                    if _is_etf:
+                        asset_type = 'ETF'
+                    else:
+                        asset_type = 'Stock'
+            
+            if price_df is not None and not price_df.empty:
+                close = price_df['Close']
+                if isinstance(close, pd.DataFrame):
+                    close = close.iloc[:, 0]
+                close = close.dropna().astype(float)
+                if len(close) >= 2:
+                    current_price = float(close.iloc[-1])
+                    prev_price = float(close.iloc[-2])
+                    daily_change = ((current_price / prev_price) - 1) * 100 if prev_price > 0 else 0.0
+                elif len(close) == 1:
+                    current_price = float(close.iloc[-1])
+        except Exception as e:
+            print(f"Price fetch for enhanced analysis of {symbol}: {e}")
+
+        # --- Determine signal direction ---
+        signal_direction = getattr(ua, 'signal_direction', 'NEUTRAL')
+        profit_prob = ua.profit_probability
+        confidence = ua.confidence_score
+
+        # --- Build 'prediction' dict ---
+        prediction = {
+            'signal': signal_direction,
+            'confidence': confidence,
+            'bullish_prob': profit_prob,
+            'expected_return': ua.expected_return,
+            'risk_adjusted_return': ua.risk_adjusted_return,
+        }
+
+        # --- Build 'metrics' dict ---
+        metrics = {
+            'current_price': current_price,
+            'daily_change': daily_change,
+        }
+
+        # --- Build 'technical' dict from entry/exit signals and reasoning ---
+        trend = signal_direction  # Use overall direction
+        primary_signals = ua.entry_signals[:3] if ua.entry_signals else []
+        secondary_signals = ua.exit_signals[:2] if ua.exit_signals else []
+
+        technical = {
+            'trend': trend,
+            'primary_signals': primary_signals,
+            'secondary_signals': secondary_signals,
+        }
+
+        # --- Assemble the full result expected by the response generators ---
+        result = {
+            'symbol': symbol,
+            'asset_type': asset_type,
+            'prediction': prediction,
+            'metrics': metrics,
+            'technical': technical,
+            'data': price_df,  # DataFrame for chart generation
+            'entry_signals': ua.entry_signals,
+            'exit_signals': ua.exit_signals,
+            'risk_factors': ua.risk_factors,
+            'profit_catalysts': ua.profit_catalysts,
+            'model_reasoning': ua.model_reasoning,
+            'raw_data_insights': ua.raw_data_insights,
+            'unbiased_analysis': ua,
+            'profit_probability': profit_prob,
+            'expected_return': ua.expected_return,
+            'risk_adjusted_return': ua.risk_adjusted_return,
+            'confidence_score': confidence,
+            'timeframe_scope': timeframe_scope.value,
+            'timestamp': datetime.now().isoformat(),
+        }
+
+        # Copy optional enrichments from _analyze_symbol_unbiased
+        for enrichment_key in ('timeframe_analysis', 'credibility_weighted_news'):
+            if enrichment_key in raw_result:
+                result[enrichment_key] = raw_result[enrichment_key]
+
+        return result
     
     async def _generate_unbiased_profit_response(self, query: str, symbol_analyses: Dict[str, Any], 
                                                intents: List[str], timeframe_scope: TimeframeScope,
@@ -884,13 +1072,16 @@ class OctavianEnhancedChatbot:
         
         # Get trader profile info
         recommendation_style = get_recommendation_style()
-        should_specify_timeframe = recommendation_style.get('should_specify_timeframe', True)
+        should_specify_timeframe = recommendation_style.get('should_specify_timeframe', True) if hasattr(recommendation_style, 'get') else True
         
         # Start with Octavian branding - UNBIASED PROFIT FOCUS
         response = f"""#  **OCTAVIAN** by APB - Unbiased Profit Intelligence
 *Pure Mathematical Analysis • Zero Bias • Maximum Profit Focus*
 
 """
+        
+        # Add INTENT-SPECIFIC header to make responses unique
+        response += self._generate_intent_specific_header(query, intents, timeframe_scope)
         
         # Add timeframe context if needed
         if should_specify_timeframe:
@@ -908,7 +1099,7 @@ class OctavianEnhancedChatbot:
 - **Volatility Regime:** {vol_regime}
 - **Risk Sentiment:** {risk_mode}
 - **Assets Analyzed:** {len(symbol_analyses)} (selected without bias)
-- **Analysis Focus:** Pure profit maximization
+- **Analysis Focus:** {self._get_focus_from_intents(intents)}
 
 ---
 
@@ -917,7 +1108,7 @@ class OctavianEnhancedChatbot:
         # Analyze each symbol with UNBIASED insights
         for symbol, analysis in symbol_analyses.items():
             response += await self._generate_unbiased_symbol_analysis(
-                symbol, analysis, timeframe_scope, trader_context
+                symbol, analysis, timeframe_scope, trader_context, intents
             )
             response += "\n---\n\n"
         
@@ -934,10 +1125,123 @@ class OctavianEnhancedChatbot:
         
         return response
     
+    def _generate_intent_specific_header(self, query: str, intents: List[str], timeframe_scope: TimeframeScope) -> str:
+        """Generate unique header based on detected intents."""
+        if 'risk' in intents:
+            return f"""##  Risk Analysis Request
+*Query: "{query}"*
+*Focus: Comprehensive risk metrics, volatility analysis, and downside protection*
+
+"""
+        elif 'prediction' in intents:
+            return f"""##  Prediction & Forecast Request
+*Query: "{query}"*
+*Focus: Forward-looking analysis, price targets, and directional bias*
+
+"""
+        elif 'price_query' in intents:
+            return f"""##  Price Information Request
+*Query: "{query}"*
+*Focus: Current pricing, valuation levels, and market positioning*
+
+"""
+        elif 'news_sentiment' in intents:
+            return f"""##  News & Sentiment Analysis
+*Query: "{query}"*
+*Focus: Market sentiment, news impact, and catalyst analysis*
+
+"""
+        elif 'sector' in intents:
+            return f"""##  Sector Analysis Request
+*Query: "{query}"*
+*Focus: Sector performance, rotation signals, and relative strength*
+
+"""
+        elif 'comprehensive' in intents:
+            return f"""##  Comprehensive Analysis Request
+*Query: "{query}"*
+*Focus: Full-spectrum analysis across all dimensions*
+
+"""
+        else:
+            return f"""##  Analysis Request
+*Query: "{query}"*
+*Focus: Technical and fundamental analysis*
+
+"""
+    
+    def _get_focus_from_intents(self, intents: List[str]) -> str:
+        """Get analysis focus description from intents."""
+        if 'risk' in intents:
+            return "Risk metrics and volatility analysis"
+        elif 'prediction' in intents:
+            return "Predictive modeling and forecasting"
+        elif 'price_query' in intents:
+            return "Current pricing and valuation"
+        elif 'news_sentiment' in intents:
+            return "News sentiment and catalyst tracking"
+        elif 'sector' in intents:
+            return "Sector analysis and rotation"
+        else:
+            return "Pure profit maximization"
+    
+    def _generate_risk_analysis_section(self, symbol: str, analysis: Dict[str, Any]) -> str:
+        """Generate detailed risk analysis section when risk intent is detected."""
+        text = "###  RISK ANALYSIS (Requested)\n"
+        
+        # Get risk metrics from analysis
+        risk_data = analysis.get('risk', {})
+        technical_data = analysis.get('technical', {})
+        unbiased_analysis = analysis.get('unbiased_analysis')
+        
+        if risk_data:
+            # Volatility metrics
+            volatility = risk_data.get('volatility', 0)
+            beta = risk_data.get('beta', 0)
+            sharpe = risk_data.get('sharpe_ratio', 0)
+            max_drawdown = risk_data.get('max_drawdown', 0)
+            
+            text += f"- **Volatility (Annualized):** {volatility:.2%}\n"
+            text += f"- **Beta (Market Correlation):** {beta:.2f}\n"
+            text += f"- **Sharpe Ratio:** {sharpe:.2f}\n"
+            text += f"- **Maximum Drawdown:** {max_drawdown:.2%}\n"
+            
+            # Risk classification
+            if volatility > 0.40:
+                risk_level = "HIGH RISK - Extreme volatility"
+            elif volatility > 0.25:
+                risk_level = "MODERATE-HIGH RISK - Above average volatility"
+            elif volatility > 0.15:
+                risk_level = "MODERATE RISK - Average volatility"
+            else:
+                risk_level = "LOW-MODERATE RISK - Below average volatility"
+            
+            text += f"- **Risk Classification:** {risk_level}\n"
+        
+        # Add risk-adjusted return if available
+        if unbiased_analysis:
+            risk_adjusted_return = unbiased_analysis.risk_adjusted_return
+            text += f"- **Risk-Adjusted Return Score:** {risk_adjusted_return:.2f}\n"
+        
+        # Technical risk indicators
+        if technical_data:
+            rsi = technical_data.get('rsi', 50)
+            if rsi > 70:
+                text += f"- **Overbought Risk:** RSI at {rsi:.1f} (potential pullback)\n"
+            elif rsi < 30:
+                text += f"- **Oversold Opportunity:** RSI at {rsi:.1f} (potential bounce)\n"
+        
+        text += "\n"
+        return text
+    
     async def _generate_unbiased_symbol_analysis(self, symbol: str, analysis: Dict[str, Any],
                                                timeframe_scope: TimeframeScope,
-                                               trader_context: Dict[str, Any]) -> str:
-        """Generate UNBIASED symbol analysis focused on PROFIT POTENTIAL."""
+                                               trader_context: Dict[str, Any],
+                                               intents: List[str] = None) -> str:
+        """Generate UNBIASED symbol analysis focused on PROFIT POTENTIAL with intent-specific emphasis."""
+        
+        if intents is None:
+            intents = []
         
         unbiased_analysis = analysis.get('unbiased_analysis')
         if not unbiased_analysis or not isinstance(unbiased_analysis, dict):
@@ -958,6 +1262,10 @@ class OctavianEnhancedChatbot:
 - **Model Confidence:** {confidence_score:.1%}
 
 """
+        
+        # INTENT-SPECIFIC SECTIONS - Show risk analysis prominently if requested
+        if 'risk' in intents:
+            text += self._generate_risk_analysis_section(symbol, analysis)
         
         # Entry/Exit Signals (Pure Mathematical)
         if unbiased_analysis.entry_signals:
@@ -1422,7 +1730,7 @@ class OctavianEnhancedChatbot:
         
         # Get trader profile info
         recommendation_style = get_recommendation_style()
-        should_specify_timeframe = recommendation_style.get('should_specify_timeframe', True)
+        should_specify_timeframe = recommendation_style.get('should_specify_timeframe', True) if hasattr(recommendation_style, 'get') else True
         
         # Start with Octavian branding
         response = f"""#  **OCTAVIAN** by APB - Advanced Market Intelligence
@@ -1446,7 +1754,7 @@ class OctavianEnhancedChatbot:
 - **Volatility Regime:** {vol_regime}
 - **Risk Sentiment:** {risk_mode}
 - **Analysis Scope:** {len(symbol_analyses)} asset{'s' if len(symbol_analyses) > 1 else ''}
-- **Trader Profile:** {recommendation_style.get('timeframe_focus', 'General').replace('_', ' ').title()}
+- **Trader Profile:** {recommendation_style.get('timeframe_focus', 'General').replace('_', ' ').title() if hasattr(recommendation_style, 'get') else str(recommendation_style).title()}
 
 ---
 
@@ -1603,6 +1911,38 @@ class OctavianEnhancedChatbot:
             
             text += "\n"
         
+        # --- Profit Catalysts & Expected Return ---
+        profit_catalysts = analysis.get('profit_catalysts', [])
+        expected_ret = analysis.get('expected_return', 0)
+        risk_adj_ret = analysis.get('risk_adjusted_return', 0)
+        
+        if profit_catalysts or expected_ret != 0:
+            text += "###  Profit Catalysts & Return Outlook\n"
+            if expected_ret != 0:
+                text += f"- **Expected Annual Return:** {expected_ret:+.2%}\n"
+                text += f"- **Risk-Adjusted Return:** {risk_adj_ret:+.2f}\n"
+            if profit_catalysts:
+                text += "- **Key Catalysts:**\n"
+                for catalyst in profit_catalysts[:5]:
+                    text += f"  • {catalyst}\n"
+            text += "\n"
+        
+        # --- Risk Factors ---
+        risk_factors = analysis.get('risk_factors', [])
+        if risk_factors:
+            text += "###  Risk Factors\n"
+            for risk in risk_factors[:5]:
+                text += f"- {risk}\n"
+            text += "\n"
+        
+        # --- Model Reasoning (How the AI reached its conclusion) ---
+        model_reasoning = analysis.get('model_reasoning', [])
+        if model_reasoning:
+            text += "###  Model Reasoning\n"
+            for reason in model_reasoning[:6]:
+                text += f"- {reason}\n"
+            text += "\n"
+        
         return text
     
     def _sentiment_to_label(self, sentiment: float) -> str:
@@ -1732,7 +2072,7 @@ class OctavianEnhancedChatbot:
                     text += "- Focus on diversification\n"
             
             # Add risk management based on trader profile
-            risk_level = recommendation_style.get('risk_level', 'medium')
+            risk_level = recommendation_style.get('risk_level', 'medium') if hasattr(recommendation_style, 'get') else 'medium'
             if risk_level == 'high':
                 text += "- **Risk Management:** Aggressive position sizing acceptable\n"
             elif risk_level == 'low':
@@ -1917,403 +2257,6 @@ class OctavianEnhancedChatbot:
         
         return symbols[:6]
     
-    def _get_real_time_data(self, symbol: str, period: str = '1y') -> Tuple[Optional[pd.DataFrame], str]:
-        """Fetch real-time market data with caching and error handling."""
-        start_time = time.time()
-        
-        try:
-            # Check cache first
-            cached_data = self.db_manager.get_market_data(symbol, days=365)
-            
-            # Determine if we need fresh data (older than 1 hour)
-            need_fresh_data = True
-            if not cached_data.empty:
-                latest_timestamp = cached_data.index[-1]
-                time_diff = datetime.now() - latest_timestamp.to_pydatetime()
-                if time_diff.total_seconds() < 3600:  # Less than 1 hour old
-                    need_fresh_data = False
-            
-            df = None
-            asset_type = 'Unknown'
-            
-            if need_fresh_data:
-                # Determine asset type and fetch data
-                if '/' in symbol or '_' in symbol or any(curr in symbol for curr in ['EUR', 'GBP', 'JPY', 'CHF']):
-                    # FX pair
-                    fx_symbol = symbol.replace('/', '_').replace('-', '_')
-                    df = get_fx(fx_symbol)
-                    asset_type = 'FX'
-                elif '=F' in symbol or symbol in ['ES', 'NQ', 'CL', 'GC', 'SI']:
-                    # Futures
-                    df = get_futures_proxy(symbol, period=period)
-                    asset_type = 'Futures'
-                else:
-                    # Stock or crypto
-                    df = get_stock(symbol, period=period)
-                    asset_type = 'Crypto' if 'USD' in symbol and '-' in symbol else 'Stock'
-                
-                # Store in database if successful
-                if df is not None and not df.empty:
-                    self.db_manager.store_market_data(symbol, df, asset_type.lower())
-                    
-                    # Store technical indicators
-                    df_with_indicators = add_indicators(df.copy())
-                    if not df_with_indicators.empty:
-                        self.db_manager.store_technical_indicators(symbol, df_with_indicators)
-            else:
-                # Use cached data
-                df = cached_data
-                # Determine asset type from symbol
-                if '/' in symbol or '_' in symbol:
-                    asset_type = 'FX'
-                elif '=F' in symbol:
-                    asset_type = 'Futures'
-                elif '-USD' in symbol:
-                    asset_type = 'Crypto'
-                else:
-                    asset_type = 'Stock'
-            
-            # Log performance metrics
-            response_time = (time.time() - start_time) * 1000
-            self.db_manager.log_query_analytics(
-                'data_fetch', symbol, int(response_time), 
-                df is not None and not df.empty
-            )
-            
-            return df, asset_type
-            
-        except Exception as e:
-            error_msg = f"Error fetching data for {symbol}: {e}"
-            print(error_msg)
-            
-            # Log error
-            response_time = (time.time() - start_time) * 1000
-            self.db_manager.log_query_analytics(
-                'data_fetch', symbol, int(response_time), False, str(e)
-            )
-            
-            return None, 'Unknown'
-    
-    def _create_advanced_price_chart(self, df: pd.DataFrame, symbol: str, 
-                                     show_indicators: bool = True, 
-                                     chart_style: str = 'comprehensive') -> go.Figure:
-        """Create advanced interactive price chart with multiple analysis layers."""
-        if df.empty:
-            return None
-        
-        # Use more data for better analysis
-        df_display = df.tail(200).copy()
-        df_with_ind = add_indicators(df_display.copy())
-        
-        if chart_style == 'comprehensive':
-            # 4-panel comprehensive chart
-            fig = make_subplots(
-                rows=4, cols=1,
-                shared_xaxes=True,
-                vertical_spacing=0.03,
-                subplot_titles=(
-                    f'{symbol} - Advanced Price Action Analysis', 
-                    'Momentum Indicators (RSI & MACD)', 
-                    'Volume Profile & Analysis',
-                    'Volatility & Market Structure'
-                ),
-                row_heights=[0.4, 0.25, 0.2, 0.15]
-            )
-        else:
-            # Standard 3-panel chart
-            fig = make_subplots(
-                rows=3, cols=1,
-                shared_xaxes=True,
-                vertical_spacing=0.05,
-                subplot_titles=(f'{symbol} Price Action', 'RSI', 'Volume'),
-                row_heights=[0.5, 0.25, 0.25]
-            )
-        
-        # Enhanced Candlestick with better colors
-        fig.add_trace(
-            go.Candlestick(
-                x=df_display.index,
-                open=df_display['Open'],
-                high=df_display['High'],
-                low=df_display['Low'],
-                close=df_display['Close'],
-                name='Price',
-                increasing_line_color='#00ff88',
-                decreasing_line_color='#ff4444',
-                increasing_fillcolor='#00ff88',
-                decreasing_fillcolor='#ff4444'
-            ),
-            row=1, col=1
-        )
-        
-        if show_indicators and not df_with_ind.empty:
-            # Multiple EMAs with different colors
-            ema_configs = [
-                ('ema20', '#42a5f5', 'EMA 20', 2),
-                ('ema50', '#ff7043', 'EMA 50', 2),
-            ]
-            
-            # Add 200 EMA if we have enough data
-            if len(df_display) >= 200:
-                df_with_ind['ema200'] = df_display['Close'].ewm(span=200, adjust=False).mean()
-                ema_configs.append(('ema200', '#9c27b0', 'EMA 200', 3))
-            
-            for ema_col, color, name, width in ema_configs:
-                if ema_col in df_with_ind.columns:
-                    fig.add_trace(
-                        go.Scatter(
-                            x=df_with_ind.index,
-                            y=df_with_ind[ema_col],
-                            mode='lines',
-                            name=name,
-                            line=dict(color=color, width=width),
-                            opacity=0.8
-                        ),
-                        row=1, col=1
-                    )
-            
-            # Bollinger Bands
-            if len(df_display) >= 20:
-                bb_period = 20
-                bb_std = 2
-                bb_middle = df_display['Close'].rolling(bb_period).mean()
-                bb_std_dev = df_display['Close'].rolling(bb_period).std()
-                bb_upper = bb_middle + (bb_std_dev * bb_std)
-                bb_lower = bb_middle - (bb_std_dev * bb_std)
-                
-                # Upper band
-                fig.add_trace(
-                    go.Scatter(
-                        x=df_display.index,
-                        y=bb_upper,
-                        mode='lines',
-                        name='BB Upper',
-                        line=dict(color='rgba(128, 128, 128, 0.5)', width=1, dash='dash'),
-                        showlegend=False
-                    ),
-                    row=1, col=1
-                )
-                
-                # Lower band with fill
-                fig.add_trace(
-                    go.Scatter(
-                        x=df_display.index,
-                        y=bb_lower,
-                        mode='lines',
-                        name='Bollinger Bands',
-                        line=dict(color='rgba(128, 128, 128, 0.5)', width=1, dash='dash'),
-                        fill='tonexty',
-                        fillcolor='rgba(128, 128, 128, 0.1)'
-                    ),
-                    row=1, col=1
-                )
-            
-            # Support and Resistance levels
-            if len(df_display) >= 50:
-                # Calculate pivot points
-                recent_high = df_display['High'].tail(50).max()
-                recent_low = df_display['Low'].tail(50).min()
-                
-                fig.add_hline(
-                    y=recent_high, 
-                    line_dash="dot", 
-                    line_color="red", 
-                    opacity=0.6,
-                    annotation_text=f"Resistance: ${recent_high:.2f}",
-                    annotation_position="top right",
-                    row=1, col=1
-                )
-                
-                fig.add_hline(
-                    y=recent_low, 
-                    line_dash="dot", 
-                    line_color="green", 
-                    opacity=0.6,
-                    annotation_text=f"Support: ${recent_low:.2f}",
-                    annotation_position="bottom right",
-                    row=1, col=1
-                )
-            
-            # Enhanced RSI with multiple levels
-            if 'rsi' in df_with_ind.columns:
-                fig.add_trace(
-                    go.Scatter(
-                        x=df_with_ind.index,
-                        y=df_with_ind['rsi'],
-                        mode='lines',
-                        name='RSI',
-                        line=dict(color='#ab47bc', width=2),
-                        fill='tozeroy',
-                        fillcolor='rgba(171, 71, 188, 0.2)'
-                    ),
-                    row=2, col=1
-                )
-                
-                # RSI levels
-                rsi_levels = [
-                    (80, "red", "Extreme Overbought"),
-                    (70, "orange", "Overbought"),
-                    (50, "gray", "Neutral"),
-                    (30, "lightgreen", "Oversold"),
-                    (20, "green", "Extreme Oversold")
-                ]
-                
-                for level, color, label in rsi_levels:
-                    fig.add_hline(
-                        y=level, 
-                        line_dash="dash" if level in [70, 30] else "dot", 
-                        line_color=color, 
-                        opacity=0.7 if level in [70, 30] else 0.4,
-                        annotation_text=label if level in [80, 20] else "",
-                        row=2, col=1
-                    )
-            
-            # MACD (if comprehensive chart)
-            if chart_style == 'comprehensive' and len(df_display) >= 26:
-                ema12 = df_display['Close'].ewm(span=12, adjust=False).mean()
-                ema26 = df_display['Close'].ewm(span=26, adjust=False).mean()
-                macd_line = ema12 - ema26
-                signal_line = macd_line.ewm(span=9, adjust=False).mean()
-                histogram = macd_line - signal_line
-                
-                # MACD line
-                fig.add_trace(
-                    go.Scatter(
-                        x=df_display.index,
-                        y=macd_line,
-                        mode='lines',
-                        name='MACD',
-                        line=dict(color='#2196f3', width=2)
-                    ),
-                    row=2, col=1
-                )
-                
-                # Signal line
-                fig.add_trace(
-                    go.Scatter(
-                        x=df_display.index,
-                        y=signal_line,
-                        mode='lines',
-                        name='Signal',
-                        line=dict(color='#ff9800', width=2)
-                    ),
-                    row=2, col=1
-                )
-                
-                # Histogram
-                colors = ['green' if h >= 0 else 'red' for h in histogram]
-                fig.add_trace(
-                    go.Bar(
-                        x=df_display.index,
-                        y=histogram,
-                        name='MACD Histogram',
-                        marker_color=colors,
-                        opacity=0.6
-                    ),
-                    row=2, col=1
-                )
-        
-        # Enhanced Volume Analysis
-        if 'Volume' in df_display.columns:
-            # Volume with price correlation colors
-            colors = []
-            for i in range(len(df_display)):
-                if df_display['Close'].iloc[i] > df_display['Open'].iloc[i]:
-                    colors.append('#00ff88')  # Green for up days
-                else:
-                    colors.append('#ff4444')  # Red for down days
-            
-            volume_row = 3 if chart_style != 'comprehensive' else 3
-            
-            fig.add_trace(
-                go.Bar(
-                    x=df_display.index,
-                    y=df_display['Volume'],
-                    name='Volume',
-                    marker_color=colors,
-                    opacity=0.7
-                ),
-                row=volume_row, col=1
-            )
-            
-            # Volume moving average
-            if len(df_display) >= 20:
-                vol_ma = df_display['Volume'].rolling(20).mean()
-                fig.add_trace(
-                    go.Scatter(
-                        x=df_display.index,
-                        y=vol_ma,
-                        mode='lines',
-                        name='Volume MA(20)',
-                        line=dict(color='yellow', width=2)
-                    ),
-                    row=volume_row, col=1
-                )
-        
-        # Volatility analysis (comprehensive chart only)
-        if chart_style == 'comprehensive':
-            returns = df_display['Close'].pct_change().dropna()
-            if len(returns) >= 20:
-                rolling_vol = returns.rolling(20).std() * np.sqrt(252) * 100
-                
-                fig.add_trace(
-                    go.Scatter(
-                        x=rolling_vol.index,
-                        y=rolling_vol,
-                        mode='lines',
-                        name='20d Volatility %',
-                        line=dict(color='#e91e63', width=2),
-                        fill='tozeroy',
-                        fillcolor='rgba(233, 30, 99, 0.2)'
-                    ),
-                    row=4, col=1
-                )
-                
-                # Volatility regime lines
-                vol_mean = rolling_vol.mean()
-                fig.add_hline(
-                    y=vol_mean, 
-                    line_dash="dash", 
-                    line_color="white", 
-                    opacity=0.5,
-                    annotation_text=f"Avg Vol: {vol_mean:.1f}%",
-                    row=4, col=1
-                )
-        
-        # Enhanced layout
-        fig.update_layout(
-            height=900 if chart_style == 'comprehensive' else 700,
-            template='plotly_dark',
-            showlegend=True,
-            legend=dict(
-                orientation="h", 
-                yanchor="bottom", 
-                y=1.02, 
-                xanchor="right", 
-                x=1,
-                bgcolor="rgba(0,0,0,0.5)"
-            ),
-            xaxis_rangeslider_visible=False,
-            title={
-                'text': f'{symbol} - Advanced Technical Analysis',
-                'x': 0.5,
-                'xanchor': 'center',
-                'font': {'size': 20}
-            },
-            hovermode='x unified'
-        )
-        
-        # Update axes
-        fig.update_xaxes(title_text="Date", row=-1, col=1)
-        fig.update_yaxes(title_text="Price ($)", row=1, col=1)
-        fig.update_yaxes(title_text="RSI" if chart_style != 'comprehensive' else "Momentum", row=2, col=1)
-        fig.update_yaxes(title_text="Volume", row=3, col=1)
-        
-        if chart_style == 'comprehensive':
-            fig.update_yaxes(title_text="Volatility (%)", row=4, col=1)
-        
-        return fig
-    
     def _create_comparison_chart(self, symbols: List[str], period: str = '6mo') -> go.Figure:
         """Create a comparison chart for multiple symbols."""
         # Get chart timeframe from settings
@@ -2354,128 +2297,6 @@ class OctavianEnhancedChatbot:
             xaxis_title='Date',
             yaxis_title='Change (%)',
             hovermode='x unified'
-        )
-        
-        return fig
-    
-    def _create_prediction_chart(self, df: pd.DataFrame, symbol: str, 
-                                  prediction: Dict) -> go.Figure:
-        """Create a chart showing prediction visualization."""
-        if df.empty:
-            return None
-        
-        df_recent = df.tail(60).copy()
-        
-        fig = make_subplots(
-            rows=2, cols=2,
-            subplot_titles=(
-                f'{symbol} Recent Price Action',
-                'Signal Strength',
-                'Model Confidence',
-                'Price Position'
-            ),
-            specs=[[{"type": "scatter"}, {"type": "indicator"}],
-                   [{"type": "indicator"}, {"type": "indicator"}]]
-        )
-        
-        # Price chart with trend line
-        fig.add_trace(
-            go.Scatter(
-                x=df_recent.index,
-                y=df_recent['Close'],
-                mode='lines',
-                name='Price',
-                line=dict(color='#42a5f5', width=2)
-            ),
-            row=1, col=1
-        )
-        
-        # Add trend line
-        x_numeric = np.arange(len(df_recent))
-        z = np.polyfit(x_numeric, df_recent['Close'].values, 1)
-        p = np.poly1d(z)
-        trend_color = '#26a69a' if z[0] > 0 else '#ef5350'
-        
-        fig.add_trace(
-            go.Scatter(
-                x=df_recent.index,
-                y=p(x_numeric),
-                mode='lines',
-                name='Trend',
-                line=dict(color=trend_color, width=2, dash='dash')
-            ),
-            row=1, col=1
-        )
-        
-        # Signal strength gauge
-        signal = prediction.get('signal', 'NEUTRAL')
-        bullish_prob = prediction.get('bullish_prob', 0.5) * 100
-        
-        fig.add_trace(
-            go.Indicator(
-                mode="gauge+number",
-                value=bullish_prob,
-                title={'text': f"Signal: {signal}"},
-                gauge={
-                    'axis': {'range': [0, 100]},
-                    'bar': {'color': '#26a69a' if signal == 'BULLISH' else '#ef5350' if signal == 'BEARISH' else '#ffc107'},
-                    'steps': [
-                        {'range': [0, 40], 'color': '#ffebee'},
-                        {'range': [40, 60], 'color': '#fff8e1'},
-                        {'range': [60, 100], 'color': '#e8f5e9'}
-                    ],
-                    'threshold': {
-                        'line': {'color': "black", 'width': 4},
-                        'thickness': 0.75,
-                        'value': bullish_prob
-                    }
-                }
-            ),
-            row=1, col=2
-        )
-        
-        # Confidence indicator
-        confidence = prediction.get('confidence', 0.5) * 100
-        fig.add_trace(
-            go.Indicator(
-                mode="number+delta",
-                value=confidence,
-                title={'text': "Confidence %"},
-                delta={'reference': 50, 'relative': False},
-                number={'suffix': '%'}
-            ),
-            row=2, col=1
-        )
-        
-        # Price position indicator
-        high_20 = df_recent['High'].max()
-        low_20 = df_recent['Low'].min()
-        current = df_recent['Close'].iloc[-1]
-        position = (current - low_20) / (high_20 - low_20) * 100 if high_20 > low_20 else 50
-        
-        fig.add_trace(
-            go.Indicator(
-                mode="gauge+number",
-                value=position,
-                title={'text': "Price Position (20d Range)"},
-                gauge={
-                    'axis': {'range': [0, 100]},
-                    'bar': {'color': '#1976d2'},
-                    'steps': [
-                        {'range': [0, 20], 'color': '#e8f5e9'},
-                        {'range': [20, 80], 'color': '#fff8e1'},
-                        {'range': [80, 100], 'color': '#ffebee'}
-                    ]
-                }
-            ),
-            row=2, col=2
-        )
-        
-        fig.update_layout(
-            height=600,
-            template='plotly_dark',
-            showlegend=True,
-            title=f'{symbol} ML Prediction Visualization'
         )
         
         return fig
@@ -2676,12 +2497,56 @@ Based on the multi-layer ensemble analysis, {symbol} shows a **{signal}** signal
     def process_query(self, query: str, user_id: str = None) -> Dict[str, Any]:
         """Process user query with advanced AI analysis, real-time data, and comprehensive response generation."""
         start_time = time.time()
-        
-        # Detect intent with enhanced patterns
-        intents = self._detect_intent(query)
-        
-        # Extract symbols with improved recognition
+
+        # Portfolio-aware routing: questions about the user's own holdings are
+        # answered from their actual paper/manual portfolio data.
+        try:
+            from portfolio_chatbot_context import (
+                detect_portfolio_intent, handle_portfolio_query,
+                load_all_portfolios, _get_all_holdings,
+            )
+            pf_intent = detect_portfolio_intent(query)
+            if pf_intent:
+                ctx = load_all_portfolios(user_id)
+                holdings = _get_all_holdings(ctx) if ctx.get('has_data') else []
+                res = handle_portfolio_query(query, pf_intent, user_id)
+                if asyncio.iscoroutine(res):
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            # Cannot block inside a running loop; run in a fresh loop.
+                            res = asyncio.run(res) if asyncio.iscoroutine(res) else res
+                        else:
+                            res = loop.run_until_complete(res)
+                    except Exception:
+                        # Final fallback: run in a brand-new event loop.
+                        try:
+                            res = asyncio.run(res) if asyncio.iscoroutine(res) else res
+                        except Exception:
+                            pass
+                return {
+                    'text': res if isinstance(res, str) else str(res),
+                    'charts': [],
+                    'intents': [pf_intent],
+                    'symbols': [h.get('symbol') for h in holdings if h.get('symbol')],
+                    'suggestions': [],
+                    'response_time_ms': int((time.time() - start_time) * 1000),
+                }
+        except Exception:
+            pass
+
+        # Extract symbols first (needed for intent detection)
         symbols = self._extract_symbols(query)
+        
+        # USE ADVANCED DYNAMIC INTENT DETECTION
+        intent_analysis = self.intent_engine.analyze_intent(query, symbols)
+        
+        # Convert to legacy format for compatibility (will be fully migrated later)
+        intents = [intent_analysis.primary_intent.value] + \
+                  [intent.value for intent in intent_analysis.secondary_intents]
+        
+        # Store full intent analysis for advanced response generation
+        full_intent_analysis = intent_analysis
         
         # Get conversation context
         conversation_history = self.db_manager.get_conversation_history(self.session_id, limit=10)
@@ -2694,19 +2559,36 @@ Based on the multi-layer ensemble analysis, {symbol} shows a **{signal}** signal
                     symbols.extend(conv['symbols'][:2])  # Add up to 2 recent symbols
                     break
             
-            # If still no symbols, check for market-wide queries
+            # If still no symbols, check for market-wide queries — use full universe
             market_keywords = ['market', 'spy', 's&p', 'nasdaq', 'dow', 'index', 'stocks', 'overall']
             if any(keyword in query.lower() for keyword in market_keywords):
                 symbols = ['SPY', 'QQQ', '^VIX']
             elif any(keyword in query.lower() for keyword in ['crypto', 'bitcoin', 'btc']):
-                symbols = ['BTC-USD', 'ETH-USD']
+                # Pull crypto tickers dynamically from universe
+                if _HAS_TICKER_UNIVERSE:
+                    try:
+                        crypto_list = get_ticker_universe().get_crypto()
+                        symbols = crypto_list[:5] if crypto_list else ['BTC-USD', 'ETH-USD']
+                    except Exception:
+                        symbols = ['BTC-USD', 'ETH-USD']
+                else:
+                    symbols = ['BTC-USD', 'ETH-USD']
             elif any(keyword in query.lower() for keyword in ['forex', 'fx', 'currency', 'dollar']):
-                symbols = ['EUR/USD', 'GBP/USD', 'USD/JPY']
+                # Pull forex tickers dynamically from universe
+                if _HAS_TICKER_UNIVERSE:
+                    try:
+                        fx_list = get_ticker_universe().get_forex()
+                        symbols = fx_list[:5] if fx_list else ['EURUSD=X', 'GBPUSD=X', 'USDJPY=X']
+                    except Exception:
+                        symbols = ['EURUSD=X', 'GBPUSD=X', 'USDJPY=X']
+                else:
+                    symbols = ['EURUSD=X', 'GBPUSD=X', 'USDJPY=X']
             else:
                 return {
                     'text': self._generate_helpful_response(query, intents),
                     'charts': [],
                     'intents': intents,
+                    'intent_analysis': intent_analysis,  # Include full analysis
                     'symbols': [],
                     'suggestions': self._get_query_suggestions(),
                     'response_time_ms': int((time.time() - start_time) * 1000)
@@ -2719,6 +2601,7 @@ Based on the multi-layer ensemble analysis, {symbol} shows a **{signal}** signal
             'text': '',
             'charts': [],
             'intents': intents,
+            'intent_analysis': full_intent_analysis,  # Full intent analysis
             'symbols': symbols,
             'analysis_summary': {},
             'market_context': {},
@@ -2758,21 +2641,23 @@ Based on the multi-layer ensemble analysis, {symbol} shows a **{signal}** signal
                     print(f"Error analyzing {symbol}: {e}")
                     response['text'] += f"\n Unable to analyze {symbol}: {str(e)}\n"
         
-        # Generate comprehensive response
+        # Generate comprehensive response USING INTENT ANALYSIS
         if symbol_analyses:
-            response['text'] = self._generate_comprehensive_response(
-                query, symbol_analyses, intents, response['market_context']
+            response['text'] = self._generate_intent_aware_response(
+                query, symbol_analyses, full_intent_analysis, response['market_context']
             )
             response['analysis_summary'] = self._create_analysis_summary(symbol_analyses)
             
-            # Generate charts based on intents and analysis
-            response['charts'] = self._generate_charts(symbol_analyses, intents)
+            # Generate charts based on intent analysis
+            response['charts'] = self._generate_intent_aware_charts(
+                symbol_analyses, full_intent_analysis
+            )
             
             # Add suggestions for follow-up questions
             response['suggestions'] = self._generate_contextual_suggestions(symbol_analyses, intents)
         
         # Handle comparison intent
-        if 'comparison' in intents and len(symbol_analyses) > 1:
+        if intent_analysis.is_comparison and len(symbol_analyses) > 1:
             comparison_chart = self._create_comparison_chart(list(symbol_analyses.keys()))
             if comparison_chart:
                 response['charts'].append({
@@ -2834,19 +2719,35 @@ Based on the multi-layer ensemble analysis, {symbol} shows a **{signal}** signal
                 analysis['prediction'] = {'signal': 'NEUTRAL', 'confidence': 0.5, 'bullish_prob': 0.5}
             
             # Calculate key metrics
-            analysis['metrics'] = self._calculate_key_metrics(df)
+            try:
+                analysis['metrics'] = self._calculate_key_metrics(df)
+            except Exception as e:
+                print(f"Metrics error for {symbol}: {e}")
+                analysis['metrics'] = {}
             
             # Technical analysis
-            df_with_indicators = add_indicators(df.copy())
-            if not df_with_indicators.empty:
-                analysis['technical'] = self._extract_technical_signals(df_with_indicators)
+            try:
+                df_with_indicators = add_indicators(df.copy())
+                if not df_with_indicators.empty:
+                    analysis['technical'] = self._extract_technical_signals(df_with_indicators)
+            except Exception as e:
+                print(f"Technical analysis error for {symbol}: {e}")
+                analysis['technical'] = {}
             
             # Risk analysis
             if 'risk' in intents:
-                analysis['risk'] = self._calculate_risk_metrics(df)
+                try:
+                    analysis['risk'] = self._calculate_risk_metrics(df)
+                except Exception as e:
+                    print(f"Risk analysis error for {symbol}: {e}")
+                    analysis['risk'] = {}
             
             # Price levels and targets
-            analysis['levels'] = self._calculate_price_levels(df)
+            try:
+                analysis['levels'] = self._calculate_price_levels(df)
+            except Exception as e:
+                print(f"Price levels error for {symbol}: {e}")
+                analysis['levels'] = {}
             
             # Multi-asset specific analysis
             if 'options' in intents and asset_type.lower() == 'stock':
@@ -2917,14 +2818,21 @@ Based on the multi-layer ensemble analysis, {symbol} shows a **{signal}** signal
                     print(f"Narrative generation error for {symbol}: {e}")
             
             # Enhanced anticipation factor analysis
-            analysis['anticipation_factors'] = self._calculate_enhanced_anticipation_factors(
-                analysis, intents
-            )
+            try:
+                analysis['anticipation_factors'] = self._calculate_enhanced_anticipation_factors(
+                    analysis, intents
+                )
+            except Exception as e:
+                print(f"Anticipation factors error for {symbol}: {e}")
+                analysis['anticipation_factors'] = {}
             
             return analysis
             
         except Exception as e:
             print(f"Comprehensive analysis error for {symbol}: {e}")
+            # Instead of returning None, try to return whatever we've gathered
+            if 'analysis' in locals():
+                return locals()['analysis']
             return None
     
     def _get_symbol_sectors(self, symbol: str) -> List[str]:
@@ -3307,6 +3215,382 @@ Based on the multi-layer ensemble analysis, {symbol} shows a **{signal}** signal
         return levels
 
 
+    def _get_real_time_data(self, symbol: str, period: str = '1y') -> Tuple[Optional[pd.DataFrame], str]:
+        """Fetch real-time market data with caching and error handling."""
+        start_time = time.time()
+        
+        try:
+            # Check cache first
+            cached_data = self.db_manager.get_market_data(symbol, days=365)
+            
+            # Determine if we need fresh data (older than 1 hour)
+            need_fresh_data = True
+            if not cached_data.empty:
+                latest_timestamp = cached_data.index[-1]
+                time_diff = datetime.now() - latest_timestamp.to_pydatetime()
+                if time_diff.total_seconds() < 3600:  # Less than 1 hour old
+                    need_fresh_data = False
+            
+            df = None
+            asset_type = 'Unknown'
+            
+            if need_fresh_data:
+                # Determine asset type and fetch data
+                if '/' in symbol or '_' in symbol or any(curr in symbol for curr in ['EUR', 'GBP', 'JPY', 'CHF']):
+                    # FX pair
+                    fx_symbol = symbol.replace('/', '_').replace('-', '_')
+                    df = get_fx(fx_symbol)
+                    asset_type = 'FX'
+                elif '=F' in symbol or symbol in ['ES', 'NQ', 'CL', 'GC', 'SI']:
+                    # Futures
+                    df = get_futures_proxy(symbol, period=period)
+                    asset_type = 'Futures'
+                else:
+                    # Stock or crypto
+                    df = get_stock(symbol, period=period)
+                    asset_type = 'Crypto' if 'USD' in symbol and '-' in symbol else 'Stock'
+                
+                # Store in database if successful
+                if df is not None and not df.empty:
+                    self.db_manager.store_market_data(symbol, df, asset_type.lower())
+                    
+                    # Store technical indicators
+                    df_with_indicators = add_indicators(df.copy())
+                    if not df_with_indicators.empty:
+                        self.db_manager.store_technical_indicators(symbol, df_with_indicators)
+            else:
+                # Use cached data
+                df = cached_data
+                # Determine asset type from symbol
+                if '/' in symbol or '_' in symbol:
+                    asset_type = 'FX'
+                elif '=F' in symbol:
+                    asset_type = 'Futures'
+                elif '-USD' in symbol:
+                    asset_type = 'Crypto'
+                else:
+                    asset_type = 'Stock'
+            
+            # Log performance metrics
+            response_time = (time.time() - start_time) * 1000
+            self.db_manager.log_query_analytics(
+                'data_fetch', symbol, int(response_time), 
+                df is not None and not df.empty
+            )
+            
+            return df, asset_type
+            
+        except Exception as e:
+            error_msg = f"Error fetching data for {symbol}: {e}"
+            print(error_msg)
+            
+            # Log error
+            response_time = (time.time() - start_time) * 1000
+            self.db_manager.log_query_analytics(
+                'data_fetch', symbol, int(response_time), False, str(e)
+            )
+            
+            return None, 'Unknown'
+    
+    def _create_advanced_price_chart(self, df: pd.DataFrame, symbol: str, 
+                                     show_indicators: bool = True, 
+                                     chart_style: str = 'comprehensive') -> go.Figure:
+        """Create advanced interactive price chart with multiple analysis layers."""
+        if df.empty:
+            return None
+        
+        # Use more data for better analysis
+        df_display = df.tail(200).copy()
+        df_with_ind = add_indicators(df_display.copy())
+        
+        if chart_style == 'comprehensive':
+            # 4-panel comprehensive chart
+            fig = make_subplots(
+                rows=4, cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.03,
+                subplot_titles=(
+                    f'{symbol} - Octavian Advanced Analysis', 
+                    'Momentum Indicators (RSI & MACD)', 
+                    'Volume Profile & Analysis',
+                    'Volatility & Market Structure'
+                ),
+                row_heights=[0.4, 0.25, 0.2, 0.15]
+            )
+        else:
+            # Standard 3-panel chart
+            fig = make_subplots(
+                rows=3, cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.05,
+                subplot_titles=(f'{symbol} Price Action', 'RSI', 'Volume'),
+                row_heights=[0.5, 0.25, 0.25]
+            )
+        
+        # Enhanced Candlestick with Octavian colors (gold theme)
+        fig.add_trace(
+            go.Candlestick(
+                x=df_display.index,
+                open=df_display['Open'],
+                high=df_display['High'],
+                low=df_display['Low'],
+                close=df_display['Close'],
+                name='Price',
+                increasing_line_color='#FFD700',  # Gold
+                decreasing_line_color='#B8860B',  # Dark gold
+                increasing_fillcolor='#FFD700',
+                decreasing_fillcolor='#B8860B'
+            ),
+            row=1, col=1
+        )
+        
+        if show_indicators and not df_with_ind.empty:
+            # Multiple EMAs with Octavian theme
+            ema_configs = [
+                ('ema20', '#DAA520', 'EMA 20', 2),  # Goldenrod
+                ('ema50', '#CD853F', 'EMA 50', 2),  # Peru
+            ]
+            
+            # Add 200 EMA if we have enough data
+            if len(df_display) >= 200:
+                df_with_ind['ema200'] = df_display['Close'].ewm(span=200, adjust=False).mean()
+                ema_configs.append(('ema200', '#8B4513', 'EMA 200', 3))  # Saddle brown
+            
+            for ema_col, color, name, width in ema_configs:
+                if ema_col in df_with_ind.columns:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=df_with_ind.index,
+                            y=df_with_ind[ema_col],
+                            mode='lines',
+                            name=name,
+                            line=dict(color=color, width=width),
+                            opacity=0.8
+                        ),
+                        row=1, col=1
+                    )
+            
+            # Enhanced RSI with Octavian styling
+            if 'rsi' in df_with_ind.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=df_with_ind.index,
+                        y=df_with_ind['rsi'],
+                        mode='lines',
+                        name='RSI',
+                        line=dict(color='#DAA520', width=2),  # Goldenrod
+                        fill='tozeroy',
+                        fillcolor='rgba(218, 165, 32, 0.2)'
+                    ),
+                    row=2, col=1
+                )
+                
+                # RSI levels with Octavian theme
+                rsi_levels = [
+                    (80, "#FF6B6B", "Extreme Overbought"),
+                    (70, "#FFA500", "Overbought"),
+                    (50, "#DAA520", "Neutral"),
+                    (30, "#32CD32", "Oversold"),
+                    (20, "#228B22", "Extreme Oversold")
+                ]
+                
+                for level, color, label in rsi_levels:
+                    fig.add_hline(
+                        y=level, 
+                        line_dash="dash" if level in [70, 30] else "dot", 
+                        line_color=color, 
+                        opacity=0.7 if level in [70, 30] else 0.4,
+                        annotation_text=label if level in [80, 20] else "",
+                        row=2, col=1
+                    )
+        
+        # Enhanced Volume Analysis with Octavian colors
+        if 'Volume' in df_display.columns:
+            colors = []
+            for i in range(len(df_display)):
+                if df_display['Close'].iloc[i] > df_display['Open'].iloc[i]:
+                    colors.append('#FFD700')  # Gold for up days
+                else:
+                    colors.append('#B8860B')  # Dark gold for down days
+            
+            volume_row = 3 if chart_style != 'comprehensive' else 3
+            
+            fig.add_trace(
+                go.Bar(
+                    x=df_display.index,
+                    y=df_display['Volume'],
+                    name='Volume',
+                    marker_color=colors,
+                    opacity=0.7
+                ),
+                row=volume_row, col=1
+            )
+        
+        # Enhanced layout with Octavian branding
+        fig.update_layout(
+            height=900 if chart_style == 'comprehensive' else 700,
+            template='plotly_dark',
+            showlegend=True,
+            legend=dict(
+                orientation="h", 
+                yanchor="bottom", 
+                y=1.02, 
+                xanchor="right", 
+                x=1,
+                bgcolor="rgba(0,0,0,0.5)"
+            ),
+            xaxis_rangeslider_visible=False,
+            title={
+                'text': f' {symbol} - Octavian Advanced Analysis',
+                'x': 0.5,
+                'xanchor': 'center',
+                'font': {'size': 20, 'color': '#DAA520'}
+            },
+            hovermode='x unified',
+            paper_bgcolor='rgba(0,0,0,0.9)',
+            plot_bgcolor='rgba(0,0,0,0.9)'
+        )
+        
+        # Update axes with Octavian styling
+        fig.update_xaxes(title_text="Date", row=-1, col=1, color='#DAA520')
+        fig.update_yaxes(title_text="Price ($)", row=1, col=1, color='#DAA520')
+        fig.update_yaxes(title_text="RSI" if chart_style != 'comprehensive' else "Momentum", row=2, col=1, color='#DAA520')
+        fig.update_yaxes(title_text="Volume", row=3, col=1, color='#DAA520')
+        
+        if chart_style == 'comprehensive':
+            fig.update_yaxes(title_text="Volatility (%)", row=4, col=1, color='#DAA520')
+        
+        return fig
+    
+    def _create_prediction_chart(self, df: pd.DataFrame, symbol: str, 
+                                  prediction: Dict) -> go.Figure:
+        """Create a chart showing prediction visualization with Octavian styling."""
+        if df.empty:
+            return None
+        
+        df_recent = df.tail(60).copy()
+        
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=(
+                f'{symbol} Recent Price Action',
+                'Signal Strength',
+                'Model Confidence',
+                'Price Position'
+            ),
+            specs=[[{"type": "scatter"}, {"type": "indicator"}],
+                   [{"type": "indicator"}, {"type": "indicator"}]]
+        )
+        
+        # Price chart with trend line (Octavian colors)
+        fig.add_trace(
+            go.Scatter(
+                x=df_recent.index,
+                y=df_recent['Close'],
+                mode='lines',
+                name='Price',
+                line=dict(color='#DAA520', width=2)  # Goldenrod
+            ),
+            row=1, col=1
+        )
+        
+        # Add trend line
+        x_numeric = np.arange(len(df_recent))
+        z = np.polyfit(x_numeric, df_recent['Close'].values, 1)
+        p = np.poly1d(z)
+        trend_color = '#FFD700' if z[0] > 0 else '#B8860B'  # Gold theme
+        
+        fig.add_trace(
+            go.Scatter(
+                x=df_recent.index,
+                y=p(x_numeric),
+                mode='lines',
+                name='Trend',
+                line=dict(color=trend_color, width=2, dash='dash')
+            ),
+            row=1, col=1
+        )
+        
+        # Signal strength gauge with Octavian colors
+        signal = prediction.get('signal', 'NEUTRAL')
+        bullish_prob = prediction.get('bullish_prob', 0.5) * 100
+        
+        gauge_color = '#FFD700' if signal == 'BULLISH' else '#B8860B' if signal == 'BEARISH' else '#DAA520'
+        
+        fig.add_trace(
+            go.Indicator(
+                mode="gauge+number",
+                value=bullish_prob,
+                title={'text': f"Signal: {signal}"},
+                gauge={
+                    'axis': {'range': [0, 100]},
+                    'bar': {'color': gauge_color},
+                    'steps': [
+                        {'range': [0, 40], 'color': '#2F1B14'},
+                        {'range': [40, 60], 'color': '#8B4513'},
+                        {'range': [60, 100], 'color': '#DAA520'}
+                    ],
+                    'threshold': {
+                        'line': {'color': "white", 'width': 4},
+                        'thickness': 0.75,
+                        'value': bullish_prob
+                    }
+                }
+            ),
+            row=1, col=2
+        )
+        
+        # Confidence indicator
+        confidence = prediction.get('confidence', 0.5) * 100
+        fig.add_trace(
+            go.Indicator(
+                mode="number+delta",
+                value=confidence,
+                title={'text': "Confidence %"},
+                delta={'reference': 50, 'relative': False},
+                number={'suffix': '%', 'font': {'color': '#DAA520'}}
+            ),
+            row=2, col=1
+        )
+        
+        # Price position indicator
+        high_20 = df_recent['High'].max()
+        low_20 = df_recent['Low'].min()
+        current = df_recent['Close'].iloc[-1]
+        position = (current - low_20) / (high_20 - low_20) * 100 if high_20 > low_20 else 50
+        
+        fig.add_trace(
+            go.Indicator(
+                mode="gauge+number",
+                value=position,
+                title={'text': "Price Position (20d Range)"},
+                gauge={
+                    'axis': {'range': [0, 100]},
+                    'bar': {'color': '#DAA520'},
+                    'steps': [
+                        {'range': [0, 20], 'color': '#2F1B14'},
+                        {'range': [20, 80], 'color': '#8B4513'},
+                        {'range': [80, 100], 'color': '#CD853F'}
+                    ]
+                }
+            ),
+            row=2, col=2
+        )
+        
+        fig.update_layout(
+            height=600,
+            template='plotly_dark',
+            showlegend=True,
+            title=f' {symbol} Octavian ML Prediction',
+            paper_bgcolor='rgba(0,0,0,0.9)',
+            plot_bgcolor='rgba(0,0,0,0.9)'
+        )
+        
+        return fig
+
+
+
+
 def show_advanced_chatbot():
     """Advanced Streamlit interface for the AI chatbot with enhanced features."""
     st.header(" Advanced AI Market Assistant")
@@ -3531,7 +3815,7 @@ def show_advanced_chatbot():
                 for chart_data in charts:
                     if 'figure' in chart_data and chart_data['figure'] is not None:
                         chart_title = chart_data.get('title', f"{chart_data.get('type', 'Chart')} - {chart_data.get('symbol', 'Unknown')}")
-                        st.plotly_chart(chart_data['figure'], use_container_width=True, key=f"chart_{i}_{chart_data.get('type', 'unknown')}")
+                        st.plotly_chart(chart_data['figure'], width='stretch', key=f"chart_{i}_{chart_data.get('type', 'unknown')}")
             
             # Show analysis summary if available
             if response.get('analysis_summary'):
@@ -3601,7 +3885,7 @@ def show_advanced_chatbot():
                         for chart_data in charts:
                             if 'figure' in chart_data and chart_data['figure'] is not None:
                                 chart_title = chart_data.get('title', f"{chart_data.get('type', 'Chart')} - {chart_data.get('symbol', 'Unknown')}")
-                                st.plotly_chart(chart_data['figure'], use_container_width=True)
+                                st.plotly_chart(chart_data['figure'], width='stretch')
                     
                     # Show analysis summary
                     if response.get('analysis_summary'):
@@ -3686,15 +3970,7 @@ def show_advanced_chatbot():
     """)
 
 
-# Global instance
-_advanced_chatbot = None
 
-def get_chatbot():
-    """Get or create advanced chatbot instance."""
-    global _advanced_chatbot
-    if _advanced_chatbot is None:
-        _advanced_chatbot = AdvancedMarketChatbot()
-    return _advanced_chatbot
     def _generate_helpful_response(self, query: str, intents: List[str]) -> str:
         """Generate helpful response when no symbols are found."""
         base_response = "I'd be happy to help with your market analysis! "
@@ -3722,16 +3998,15 @@ def get_chatbot():
 """
         
         elif 'analysis' in intents:
-            return base_response + """I can provide comprehensive technical analysis for any asset. Please specify which one you'd like me to analyze:
-
-**Popular Stocks:** AAPL, MSFT, GOOGL, AMZN, TSLA, NVDA, META
-**Major ETFs:** SPY, QQQ, IWM, VTI, ARKK
-**Cryptocurrencies:** BTC-USD, ETH-USD, SOL-USD
-**Forex Pairs:** EUR/USD, GBP/USD, USD/JPY
-**Futures:** ES=F (S&P), NQ=F (NASDAQ), CL=F (Oil), GC=F (Gold)
-
-Just ask: "Analyze [SYMBOL]" or "Technical analysis of [SYMBOL]"
-"""
+            ex = self._get_asset_examples()
+            return (base_response +
+                    "I can provide comprehensive technical analysis for any asset. Please specify which one you'd like me to analyze:\n\n"
+                    f"**Stocks:** {', '.join(ex['Stocks'])}\n"
+                    f"**ETFs:** {', '.join(ex['ETFs'])}\n"
+                    f"**Cryptocurrencies:** {', '.join(ex['Crypto'])}\n"
+                    f"**Forex Pairs:** {', '.join(ex['Forex'])}\n"
+                    f"**Futures:** {', '.join(ex['Futures'])}\n\n"
+                    "Just ask: \"Analyze [SYMBOL]\" or \"Technical analysis of [SYMBOL]\"\n")
         
         elif 'comparison' in intents:
             return base_response + """I can compare multiple assets for you! Please specify which assets you'd like me to compare:
@@ -3778,6 +4053,180 @@ I'll show you relative performance, correlation analysis, and detailed compariso
             "EUR/USD technical analysis",
             "Market volatility analysis today"
         ]
+    
+    
+    def _generate_intent_aware_response(self, query: str, symbol_analyses: Dict[str, Any],
+                                       intent_analysis: IntentAnalysis, market_context: Dict[str, Any]) -> str:
+        """
+        Generate response tailored to detected intent analysis.
+        Uses advanced intent detection to format response appropriately.
+        """
+        
+        # Build response based on response format preference
+        if intent_analysis.response_format == ResponseFormat.CONCISE:
+            return self._generate_concise_response(query, symbol_analyses, intent_analysis, market_context)
+        elif intent_analysis.response_format == ResponseFormat.DETAILED:
+            return self._generate_detailed_response(query, symbol_analyses, intent_analysis, market_context)
+        elif intent_analysis.response_format == ResponseFormat.NARRATIVE:
+            return self._generate_narrative_response(query, symbol_analyses, intent_analysis, market_context)
+        elif intent_analysis.response_format == ResponseFormat.DATA_FOCUSED:
+            return self._generate_data_focused_response(query, symbol_analyses, intent_analysis, market_context)
+        elif intent_analysis.response_format == ResponseFormat.ACTIONABLE:
+            return self._generate_actionable_response(query, symbol_analyses, intent_analysis, market_context)
+        elif intent_analysis.response_format == ResponseFormat.EDUCATIONAL:
+            return self._generate_educational_response(query, symbol_analyses, intent_analysis, market_context)
+        else:
+            # Standard format
+            return self._generate_standard_intent_response(query, symbol_analyses, intent_analysis, market_context)
+    
+    def _generate_standard_intent_response(self, query: str, symbol_analyses: Dict[str, Any],
+                                          intent_analysis: IntentAnalysis, market_context: Dict[str, Any]) -> str:
+        """Generate standard response with intent-specific emphasis."""
+        
+        # Header with intent context
+        response = f"""#  OCTAVIAN Market Intelligence
+*Query: "{query}"*
+*Intent: {intent_analysis.primary_intent.value.replace('_', ' ').title()}*
+*Confidence: {intent_analysis.confidence_score:.0%}*
+*Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*
+
+"""
+        
+        # Add urgency indicator if immediate
+        if intent_analysis.urgency == Urgency.IMMEDIATE:
+            response += "**URGENT ANALYSIS REQUESTED**\n\n"
+        
+        # Lead with what user wants to see first
+        lead_with = intent_analysis.lead_with
+        
+        if lead_with == 'risk_metrics':
+            response += "##  RISK ANALYSIS (Primary Focus)\n\n"
+            for symbol, analysis in symbol_analyses.items():
+                response += self._generate_risk_analysis_section(symbol, analysis)
+                response += "\n"
+        
+        elif lead_with == 'forecast':
+            response += "##  PREDICTION & FORECAST (Primary Focus)\n\n"
+            for symbol, analysis in symbol_analyses.items():
+                response += self._generate_prediction_section(symbol, analysis)
+                response += "\n"
+        
+        elif lead_with == 'current_price':
+            response += "##  CURRENT PRICING (Primary Focus)\n\n"
+            for symbol, analysis in symbol_analyses.items():
+                response += self._generate_price_section(symbol, analysis)
+                response += "\n"
+        
+        # Add emphasized sections
+        for emphasis in intent_analysis.emphasize[:3]:  # Top 3 emphasis areas
+            if emphasis == 'comparison' and intent_analysis.is_comparison:
+                response += self._generate_comparison_section(symbol_analyses)
+            elif emphasis == 'volatility':
+                response += "##  Volatility Analysis\n\n"
+                for symbol, analysis in symbol_analyses.items():
+                    response += self._generate_volatility_section(symbol, analysis)
+        
+        # Add standard analysis for remaining symbols
+        response += "\n##  Complete Analysis\n\n"
+        for symbol, analysis in symbol_analyses.items():
+            response += f"### {symbol}\n"
+            response += self._generate_symbol_summary(symbol, analysis, intent_analysis)
+            response += "\n"
+        
+        # Add warnings if needed
+        if intent_analysis.needs_risk_warning:
+            response += "\n**RISK WARNING:** Trading involves substantial risk. "
+            response += "This analysis is for informational purposes only.\n"
+        
+        return response
+    
+    def _generate_concise_response(self, query: str, symbol_analyses: Dict[str, Any],
+                                   intent_analysis: IntentAnalysis, market_context: Dict[str, Any]) -> str:
+        """Generate brief, bullet-point response."""
+        response = f"**Quick Answer:** {query}\n\n"
+        
+        for symbol, analysis in symbol_analyses.items():
+            prediction = analysis.get('prediction', {})
+            metrics = analysis.get('metrics', {})
+            
+            response += f"**{symbol}:**\n"
+            response += f"- Price: ${metrics.get('current_price', 0):.2f} ({metrics.get('daily_change_pct', 0):+.2f}%)\n"
+            response += f"- Signal: {prediction.get('signal', 'NEUTRAL')} ({prediction.get('confidence', 0.5):.0%} confidence)\n"
+            
+            if intent_analysis.primary_intent == IntentCategory.RISK_ANALYSIS:
+                risk = analysis.get('risk', {})
+                response += f"- Volatility: {risk.get('volatility', 0):.1%}\n"
+            
+            response += "\n"
+        
+        return response
+    
+    def _generate_prediction_section(self, symbol: str, analysis: Dict[str, Any]) -> str:
+        """Generate prediction-focused section."""
+        prediction = analysis.get('prediction', {})
+        
+        text = f"**{symbol} Forecast:**\n"
+        text += f"- Direction: {prediction.get('signal', 'NEUTRAL')}\n"
+        text += f"- Confidence: {prediction.get('confidence', 0.5):.0%}\n"
+        text += f"- Bullish Probability: {prediction.get('bullish_prob', 0.5):.0%}\n"
+        
+        if 'target_price' in prediction:
+            text += f"- Price Target: ${prediction['target_price']:.2f}\n"
+        
+        return text
+    
+    def _generate_price_section(self, symbol: str, analysis: Dict[str, Any]) -> str:
+        """Generate price-focused section."""
+        metrics = analysis.get('metrics', {})
+        
+        text = f"**{symbol} Current Pricing:**\n"
+        text += f"- Current: ${metrics.get('current_price', 0):.2f}\n"
+        text += f"- Change: {metrics.get('daily_change_pct', 0):+.2f}%\n"
+        text += f"- Volume: {metrics.get('volume', 0):,.0f}\n"
+        
+        return text
+    
+    def _generate_symbol_summary(self, symbol: str, analysis: Dict[str, Any],
+                                 intent_analysis: IntentAnalysis) -> str:
+        """Generate symbol summary based on intent."""
+        prediction = analysis.get('prediction', {})
+        metrics = analysis.get('metrics', {})
+        
+        summary = f"Price: ${metrics.get('current_price', 0):.2f} | "
+        summary += f"Signal: {prediction.get('signal', 'NEUTRAL')} | "
+        summary += f"Confidence: {prediction.get('confidence', 0.5):.0%}\n"
+        
+        return summary
+    
+    def _generate_intent_aware_charts(self, symbol_analyses: Dict[str, Any],
+                                     intent_analysis: IntentAnalysis) -> List[Any]:
+        """Generate charts based on intent analysis."""
+        charts = []
+        
+        # Always include price chart if visualization requested
+        if intent_analysis.requires_charts or intent_analysis.response_format == ResponseFormat.VISUAL:
+            for symbol in list(symbol_analyses.keys())[:3]:
+                chart = self._create_price_chart(symbol, symbol_analyses[symbol])
+                if chart:
+                    charts.append(chart)
+        
+        # Add risk chart if risk analysis requested
+        if intent_analysis.primary_intent == IntentCategory.RISK_ANALYSIS:
+            for symbol in list(symbol_analyses.keys())[:2]:
+                vol_chart = self._create_volatility_chart(
+                    symbol_analyses[symbol].get('df'),
+                    symbol
+                )
+                if vol_chart:
+                    charts.append(vol_chart)
+        
+        # Add comparison chart if comparison requested
+        if intent_analysis.is_comparison and len(symbol_analyses) > 1:
+            comp_chart = self._create_comparison_chart(list(symbol_analyses.keys()))
+            if comp_chart:
+                charts.append(comp_chart)
+        
+        return charts
     
     def _generate_comprehensive_response(self, query: str, symbol_analyses: Dict[str, Any], 
                                        intents: List[str], market_context: Dict[str, Any]) -> str:
@@ -4458,38 +4907,42 @@ I'll show you relative performance, correlation analysis, and detailed compariso
         return suggestions[:6]  # Limit to 6 suggestions
 
 
-# Update the global chatbot instance
-_chatbot = None
 
-def get_chatbot():
-    """Get or create advanced chatbot instance."""
-    global _chatbot
-    if _chatbot is None:
-        _chatbot = AdvancedMarketChatbot()
-    return _chatbot
     
     def _generate_octavian_guidance(self, query: str, intents: List[str], 
                                   timeframe_scope: TimeframeScope) -> str:
-        """Generate helpful Octavian guidance when no symbols are found."""
-        base_response = f"""#  **OCTAVIAN** by APB - I'm here to help!
+        """Generate helpful Octavian guidance when no symbols are found.
 
-I'd be happy to provide advanced market analysis tailored to your **{timeframe_scope.value.replace('_', ' ')} trading/investing** approach.
+        Example assets are sourced dynamically from the live ticker universe
+        (never a hardcoded list) so the guidance always reflects the current
+        multi-asset coverage.
+        """
+        tf = timeframe_scope.value.replace('_', ' ')
+        base_response = f"""#  **OCTAVIAN** - I'm here to help!
+
+I'd be happy to provide advanced market analysis tailored to your **{tf} trading/investing** approach.
 
 """
-        
+        ex = self._get_asset_examples()
+        stocks = ', '.join(ex['Stocks'])
+        etfs = ', '.join(ex['ETFs'])
+        crypto = ', '.join(ex['Crypto'])
+        forex = ', '.join(ex['Forex'])
+        futures = ', '.join(ex['Futures'])
+
         if 'prediction' in intents:
             return base_response + f"""##  AI Predictions Available For:
 
-**Stocks:** AAPL, MSFT, GOOGL, AMZN, TSLA, NVDA, META, NFLX
-**ETFs:** SPY, QQQ, IWM, VTI, ARKK, XLF, XLK
-**Crypto:** BTC-USD, ETH-USD, SOL-USD, ADA-USD
-**Forex:** EUR/USD, GBP/USD, USD/JPY, AUD/USD
-**Futures:** ES=F (S&P), NQ=F (NASDAQ), CL=F (Oil), GC=F (Gold)
+**Stocks:** {stocks}
+**ETFs:** {etfs}
+**Crypto:** {crypto}
+**Forex:** {forex}
+**Futures:** {futures}
 
 ### Example Queries:
-- "Octavian, predict AAPL for {timeframe_scope.value.replace('_', ' ')} trading"
-- "What's your {timeframe_scope.value.replace('_', ' ')} outlook for Bitcoin?"
-- "Should I buy TSLA for {timeframe_scope.value.replace('_', ' ')} holding?"
+- "Octavian, predict AAPL for {tf} trading"
+- "What's your {tf} outlook for Bitcoin?"
+- "Should I buy TSLA for {tf} holding?"
 """
         
         elif 'analysis' in intents:
@@ -4498,7 +4951,7 @@ I'd be happy to provide advanced market analysis tailored to your **{timeframe_s
 I provide **source-weighted news analysis**, **timeframe-specific insights**, and **AI vs market sentiment** comparisons.
 
 ### What I Analyze:
-- **Technical Analysis** with {timeframe_scope.value.replace('_', ' ')}-specific indicators
+- **Technical Analysis** with {tf}-specific indicators
 - **Source-Credibility Weighted News** (Bloomberg, Reuters, WSJ prioritized)
 - **AI vs Market Sentiment** divergence analysis
 - **Cross-Sector Correlations** and anticipation factors
@@ -4506,7 +4959,7 @@ I provide **source-weighted news analysis**, **timeframe-specific insights**, an
 
 ### Example Queries:
 - "Analyze AAPL with full Octavian intelligence"
-- "Comprehensive {timeframe_scope.value.replace('_', ' ')} analysis of NVDA"
+- "Comprehensive {tf} analysis of NVDA"
 - "Show me credibility-weighted news analysis for SPY"
 """
         
@@ -4519,7 +4972,7 @@ I provide **source-weighted news analysis**, **timeframe-specific insights**, an
 - Time-decay factors for news relevance
 
 ###  **Timeframe-Aware Analysis**
-- Currently optimized for: **{timeframe_scope.value.replace('_', ' ')} strategies**
+- Currently optimized for: **{tf} strategies**
 - Different indicators and factors for each timeframe
 - Personalized based on your trading profile
 
@@ -4531,7 +4984,7 @@ I provide **source-weighted news analysis**, **timeframe-specific insights**, an
 ###  **Example Queries:**
 - "Octavian, analyze AAPL with full intelligence"
 - "Compare TSLA vs NIO with source-weighted analysis"
-- "Bitcoin comprehensive analysis for {timeframe_scope.value.replace('_', ' ')} trading"
+- "Bitcoin comprehensive analysis for {tf} trading"
 - "Show me AI vs market sentiment for SPY"
 
 **Just mention any stock symbol and I'll provide comprehensive Octavian analysis!**
@@ -5291,7 +5744,7 @@ def show_octavian_chatbot():
                 
                 for chart_data in charts:
                     if 'figure' in chart_data and chart_data['figure'] is not None:
-                        st.plotly_chart(chart_data['figure'], use_container_width=True, 
+                        st.plotly_chart(chart_data['figure'], width='stretch', 
                                       key=f"octavian_chart_{i}_{chart_data.get('type', 'unknown')}")
             
             # Show enhanced analysis summary
@@ -5367,68 +5820,128 @@ def show_octavian_chatbot():
                 except Exception as e:
                     st.error(f"Octavian encountered an error: {str(e)[:100]}")
                     response = {'text': f'Analysis failed: {str(e)[:200]}. Please try rephrasing your question.', 'charts': [], 'analysis_summary': {}, 'suggestions': []}
-                    
-                    # Display enhanced response
-                    st.markdown(response.get('text', 'No response generated'))
-                    
-                    # Display charts with error handling
-                    try:
-                        charts = response.get('charts', [])
-                        if charts:
-                            st.markdown(f"** Octavian Generated {len(charts)} Chart{'s' if len(charts) > 1 else ''}:**")
-                            
-                            for chart_data in charts:
-                                if 'figure' in chart_data and chart_data['figure'] is not None:
-                                    st.plotly_chart(chart_data['figure'], use_container_width=True)
-                    except Exception as e:
-                        st.warning("Some charts could not be displayed.")
-                    
-                    # Show enhanced analysis summary
-                    if response.get('analysis_summary'):
-                        summary = response['analysis_summary']
-                        
-                        with st.expander(" Octavian Analysis Summary", expanded=False):
-                            col1, col2, col3, col4 = st.columns(4)
-                            
-                            with col1:
-                                st.metric("Symbols Analyzed", summary.get('total_symbols', 0))
-                            with col2:
-                                st.metric("Bullish Signals", summary.get('bullish_count', 0))
-                            with col3:
-                                st.metric("Bearish Signals", summary.get('bearish_count', 0))
-                            with col4:
-                                st.metric("Avg Confidence", f"{summary.get('avg_confidence', 0)*100:.0f}%")
-                    
-                    # Show enhanced suggestions
-                    suggestions = response.get('suggestions', [])
-                    if suggestions:
-                        st.markdown("** Octavian Suggestions:**")
-                        
-                        cols = st.columns(min(len(suggestions[:4]), 2))
-                        for idx, suggestion in enumerate(suggestions[:4]):
-                            with cols[idx % 2]:
-                                if st.button(f" {suggestion}", key=f"new_octavian_suggestion_{idx}"):
-                                    st.session_state.suggested_query = suggestion
-                                    st.rerun()
-                    
-                    # Store in history
-                    st.session_state.octavian_chat_history.append({
-                        'query': user_query,
-                        'response': response,
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    
-                    # Show enhanced success metrics
-                    response_time = response.get('response_time_ms', 0)
-                    symbols_count = len(response.get('symbols', []))
-                    charts_count = len(response.get('charts', []))
-                    timeframe = response.get('timeframe_context', 'Unknown')
-                    
-                    st.success(f" Octavian analysis complete! Processed {symbols_count} symbol{'s' if symbols_count != 1 else ''} for {timeframe.replace('_', ' ')} timeframe, generated {charts_count} chart{'s' if charts_count != 1 else ''} in {response_time}ms")
                 
-                except Exception as e:
-                    st.error(f" Octavian encountered an error: {str(e)}")
-                    st.error("Please try rephrasing your question or contact APB support.")
+                # Display enhanced response (runs for BOTH success and error cases)
+                st.markdown(response.get('text', 'No response generated'))
+                
+                # Show AI Reasoning expandable (NEW FEATURE)
+                if response.get('show_reasoning_available', False) and response.get('raw_analysis'):
+                    with st.expander(" Show AI Reasoning", expanded=False):
+                        st.markdown("### Detailed Analysis Breakdown")
+                        
+                        raw_analysis = response.get('raw_analysis', {})
+                        
+                        # Symbol analyses
+                        if 'symbol_analyses' in raw_analysis:
+                            st.markdown("#### Symbol-by-Symbol Analysis")
+                            for symbol, analysis in raw_analysis['symbol_analyses'].items():
+                                with st.expander(f" {symbol} - Detailed Breakdown"):
+                                    
+                                    # Prediction details
+                                    if 'prediction' in analysis:
+                                        st.markdown("**Prediction:**")
+                                        pred = analysis['prediction']
+                                        col_pred1, col_pred2, col_pred3 = st.columns(3)
+                                        with col_pred1:
+                                            st.metric("Signal", pred.get('signal', 'N/A'))
+                                        with col_pred2:
+                                            st.metric("Confidence", f"{pred.get('confidence', 0):.1%}")
+                                        with col_pred3:
+                                            st.metric("Bullish Prob", f"{pred.get('bullish_prob', 0):.1%}")
+                                    
+                                    # Technical indicators
+                                    if 'technical_indicators' in analysis:
+                                        st.markdown("**Technical Indicators:**")
+                                        st.json(analysis['technical_indicators'])
+                                    
+                                    # ML scores
+                                    if 'ml_scores' in analysis:
+                                        st.markdown("**ML Model Scores:**")
+                                        st.json(analysis['ml_scores'])
+                                    
+                                    # Sentiment data
+                                    if 'sentiment_data' in analysis:
+                                        st.markdown("**Sentiment Analysis:**")
+                                        st.json(analysis['sentiment_data'])
+                                    
+                                    # Signal factors
+                                    if 'signal_factors' in analysis:
+                                        st.markdown("**Key Signal Factors:**")
+                                        for factor in analysis['signal_factors']:
+                                            if isinstance(factor, dict):
+                                                st.write(f"- {factor.get('factor', factor)}")
+                                            else:
+                                                st.write(f"- {factor}")
+                        
+                        # Market context
+                        if 'market_context' in raw_analysis:
+                            st.markdown("#### Market Context")
+                            st.json(raw_analysis['market_context'])
+                        
+                        # Timeframe context
+                        if 'timeframe_context' in raw_analysis:
+                            st.markdown("#### Timeframe Analysis")
+                            st.write(f"**Timeframe:** {raw_analysis['timeframe_context']}")
+                        
+                        # Detailed breakdown
+                        if 'detailed_breakdown' in raw_analysis:
+                            st.markdown("#### Complete Technical Breakdown")
+                            st.json(raw_analysis['detailed_breakdown'])
+                
+                # Display charts with error handling
+                try:
+                    charts = response.get('charts', [])
+                    if charts:
+                        st.markdown(f"** Octavian Generated {len(charts)} Chart{'s' if len(charts) > 1 else ''}:**")
+                        
+                        for chart_data in charts:
+                            if 'figure' in chart_data and chart_data['figure'] is not None:
+                                st.plotly_chart(chart_data['figure'], width='stretch')
+                except Exception:
+                    st.warning("Some charts could not be displayed.")
+                
+                # Show enhanced analysis summary
+                if response.get('analysis_summary'):
+                    summary = response['analysis_summary']
+                    
+                    with st.expander(" Octavian Analysis Summary", expanded=False):
+                        col1, col2, col3, col4 = st.columns(4)
+                        
+                        with col1:
+                            st.metric("Symbols Analyzed", summary.get('total_symbols', 0))
+                        with col2:
+                            st.metric("Bullish Signals", summary.get('bullish_count', 0))
+                        with col3:
+                            st.metric("Bearish Signals", summary.get('bearish_count', 0))
+                        with col4:
+                            st.metric("Avg Confidence", f"{summary.get('avg_confidence', 0)*100:.0f}%")
+                
+                # Show enhanced suggestions
+                suggestions = response.get('suggestions', [])
+                if suggestions:
+                    st.markdown("** Octavian Suggestions:**")
+                    
+                    suggestion_cols = st.columns(min(len(suggestions[:4]), 2))
+                    for idx, suggestion in enumerate(suggestions[:4]):
+                        with suggestion_cols[idx % 2]:
+                            if st.button(f" {suggestion}", key=f"new_octavian_suggestion_{idx}"):
+                                st.session_state.suggested_query = suggestion
+                                st.rerun()
+                
+                # Store in history
+                st.session_state.octavian_chat_history.append({
+                    'query': user_query,
+                    'response': response,
+                    'timestamp': datetime.now().isoformat()
+                })
+                
+                # Show enhanced success metrics
+                response_time = response.get('response_time_ms', 0)
+                symbols_count = len(response.get('symbols', []))
+                charts_count = len(response.get('charts', []))
+                timeframe = response.get('timeframe_context', 'Unknown')
+                
+                st.success(f" Octavian analysis complete! Processed {symbols_count} symbol{'s' if symbols_count != 1 else ''} for {timeframe.replace('_', ' ')} timeframe, generated {charts_count} chart{'s' if charts_count != 1 else ''} in {response_time}ms")
     
     # Enhanced quick actions
     st.markdown("###  Octavian Quick Intelligence")
@@ -5473,7 +5986,7 @@ def show_octavian_chatbot():
 # Global instance
 _octavian_chatbot = None
 
-def get_octavian_chatbot():
+def get_chatbot():
     """Get or create Octavian enhanced chatbot instance."""
     global _octavian_chatbot
     if _octavian_chatbot is None:

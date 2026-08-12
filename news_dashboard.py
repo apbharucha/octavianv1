@@ -194,7 +194,7 @@ def show_live_news_feed(news_engine, symbol_filter: str, time_range: str,
             hovermode='x unified'
         )
         
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         
         # Article feed
         st.subheader(" Recent Articles")
@@ -298,7 +298,7 @@ def show_sentiment_analysis(news_engine, symbol_filter: str, time_range: str):
             ))
             
             fig.update_layout(height=400, template='plotly_dark')
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         
         with col2:
             # Sentiment distribution
@@ -318,7 +318,7 @@ def show_sentiment_analysis(news_engine, symbol_filter: str, time_range: str):
                 }
             )
             fig.update_layout(height=400, template='plotly_dark')
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         
         # Sentiment trends
         st.subheader("[UP] Sentiment Trends")
@@ -344,7 +344,7 @@ def show_sentiment_analysis(news_engine, symbol_filter: str, time_range: str):
                 color_continuous_midpoint=0
             )
             fig.update_layout(height=400, template='plotly_dark')
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         
         # Key themes and insights
         st.subheader("[SCAN] Key Themes")
@@ -377,28 +377,28 @@ def show_sentiment_analysis(news_engine, symbol_filter: str, time_range: str):
                 color_continuous_midpoint=0
             )
             fig.update_layout(height=400, template='plotly_dark')
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
     
     except Exception as e:
         st.error(f"Error loading sentiment analysis: {e}")
 
 def show_market_whispers(news_engine, symbol_filter: str):
-    """Show market whispers and rumors."""
-    st.header(" Market Whispers & Rumors")
+    """Show market signals derived from real news coverage (no fabricated rumors)."""
+    st.header(" Market Signals")
     
     try:
         # Get whispers
         whispers = news_engine.get_market_whispers(symbol_filter.upper() if symbol_filter else None)
         
         if not whispers:
-            st.info("No market whispers detected recently.")
+            st.info("No news coverage detected recently. Try again after more articles are fetched.")
             return
         
         # Whispers metrics
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.metric("Total Whispers", len(whispers))
+            st.metric("Total Signals", len(whispers))
         
         with col2:
             avg_confidence = np.mean([w.confidence_level for w in whispers])
@@ -406,14 +406,14 @@ def show_market_whispers(news_engine, symbol_filter: str):
         
         with col3:
             verified_count = sum(1 for w in whispers if w.verification_status == 'verified')
-            st.metric("Verified", verified_count, f"{verified_count/len(whispers)*100:.0f}%")
+            st.metric("Corroborated", verified_count, f"{verified_count/len(whispers)*100:.0f}%")
         
         with col4:
             total_mentions = sum(w.social_mentions for w in whispers)
-            st.metric("Social Mentions", f"{total_mentions:,}")
+            st.metric("Articles", f"{total_mentions:,}")
         
         # Whispers by type
-        st.subheader("[DATA] Whispers by Type")
+        st.subheader("[DATA] Signals by Type")
         
         whisper_types = {}
         for whisper in whispers:
@@ -425,13 +425,13 @@ def show_market_whispers(news_engine, symbol_filter: str):
         fig = px.pie(
             values=list(whisper_types.values()),
             names=list(whisper_types.keys()),
-            title="Distribution of Whisper Types"
+            title="Distribution of Signal Types"
         )
         fig.update_layout(height=400, template='plotly_dark')
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         
         # Individual whispers
-        st.subheader("[SCAN] Recent Whispers")
+        st.subheader("[SCAN] Recent Signals")
         
         for whisper in whispers:
             confidence_color = "green" if whisper.confidence_level > 0.7 else "orange" if whisper.confidence_level > 0.4 else "red"
@@ -453,7 +453,7 @@ def show_market_whispers(news_engine, symbol_filter: str):
                 
                 with col2:
                     st.metric("Confidence", f"{whisper.confidence_level*100:.0f}%")
-                    st.metric("Social Mentions", f"{whisper.social_mentions:,}")
+                    st.metric("Articles", f"{whisper.social_mentions:,}")
                     st.write(f"**Status:** {whisper.verification_status.title()}")
     
     except Exception as e:
@@ -548,7 +548,7 @@ def show_sector_sentiment(news_engine):
             template='plotly_dark',
             xaxis_tickangle=-45
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         
         # Sector comparison table
         st.subheader("[DATA] Sector Comparison")
@@ -569,7 +569,7 @@ def show_sector_sentiment(news_engine):
                 'market_impact': 'Impact',
                 'change_24h': '24h Change'
             },
-            use_container_width=True
+            width='stretch'
         )
         
         # Top movers
@@ -710,7 +710,7 @@ def show_news_impact_analysis(news_engine, symbol_filter: str):
             print(f"Could not calculate trend line: {e}")
         
         fig.update_layout(height=500, template='plotly_dark')
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         
         # Correlation coefficient
         try:
@@ -723,29 +723,33 @@ def show_news_impact_analysis(news_engine, symbol_filter: str):
         # News impact events
         st.subheader("[TARGET] High Impact News Events")
         
-        impact_events = [
-            {
-                'date': '2024-02-04',
-                'headline': 'Major Tech Company Reports Earnings Beat',
-                'sentiment': 0.8,
-                'price_impact': '+5.2%',
-                'volume_spike': '3.2x'
-            },
-            {
-                'date': '2024-02-03',
-                'headline': 'Fed Hints at Rate Cut Possibility',
-                'sentiment': 0.6,
-                'price_impact': '+2.8%',
-                'volume_spike': '2.1x'
-            },
-            {
-                'date': '2024-02-02',
-                'headline': 'Regulatory Investigation Announced',
-                'sentiment': -0.7,
-                'price_impact': '-3.4%',
-                'volume_spike': '2.8x'
-            }
-        ]
+        # Real impact events derived from actual fetched news + price data
+        impact_events = []
+        try:
+            headline_by_date = {}
+            for a in articles:
+                if getattr(a, "title", None) and getattr(a, "published_at", None):
+                    d = a.published_at
+                    d = d.astimezone(timezone.utc).date() if d.tzinfo is not None else d.date()
+                    headline_by_date.setdefault(str(d), a.title)
+            cd = correlation_data.copy()
+            cd["abs_sent"] = cd["sentiment_score"].abs()
+            cd = cd.sort_values("abs_sent", ascending=False)
+            for _, row in cd.head(5).iterrows():
+                dstr = str(row["date"])[:10]
+                vol_spike = row.get("news_volume")
+                impact_events.append({
+                    'date': dstr,
+                    'headline': headline_by_date.get(dstr, f"High-magnitude market news day — {sym}"),
+                    'sentiment': float(row["sentiment_score"]),
+                    'price_impact': f"{float(row['price_change']):+.2f}%",
+                    'volume_spike': f"{int(vol_spike)} articles" if pd.notna(vol_spike) else '—',
+                })
+        except Exception as e:
+            print(f"Could not derive impact events from data: {e}")
+            impact_events = []
+        if not impact_events:
+            st.info("No high-impact news events detected in the current data window.")
         
         for event in impact_events:
             sentiment_emoji = get_sentiment_emoji(event['sentiment'])

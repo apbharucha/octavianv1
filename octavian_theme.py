@@ -199,7 +199,7 @@ def _get_theme_css() -> str:
         color: #ff9800;
     }}
 
-    /* Alert icon — replaces ⚠ warning emoji */
+    /* Alert icon — replaces  warning emoji */
     .oct-alert-icon {{
         display: inline-block;
         width: 14px;
@@ -212,7 +212,7 @@ def _get_theme_css() -> str:
         flex-shrink: 0;
     }}
 
-    /* Check icon — replaces ✓ checkmark */
+    /* Check icon — replaces  checkmark */
     .oct-check-icon {{
         display: inline-block;
         width: 12px;
@@ -225,7 +225,7 @@ def _get_theme_css() -> str:
         flex-shrink: 0;
     }}
 
-    /* Cross icon — replaces ✗ */
+    /* Cross icon — replaces  */
     .oct-cross-icon {{
         display: inline-block;
         width: 10px;
@@ -260,7 +260,7 @@ def _get_theme_css() -> str:
         flex-shrink: 0;
     }}
 
-    /* Plus icon — replaces ✦ opportunity marker */
+    /* Plus icon — replaces  opportunity marker */
     .oct-plus-icon {{
         display: inline-block;
         width: 12px;
@@ -395,6 +395,10 @@ def _get_theme_css() -> str:
         -webkit-backdrop-filter: blur(12px);
         transition: all 0.35s cubic-bezier(0.4, 0, 0.2, 1);
         animation: fadeInUp 0.4s ease-out both;
+        min-width: 0;
+        overflow: visible !important;
+        width: auto !important;
+        max-width: none !important;
     }}
 
     [data-testid="stMetric"]:hover {{
@@ -405,16 +409,26 @@ def _get_theme_css() -> str:
 
     [data-testid="stMetricLabel"] {{
         color: {COLORS['text_secondary']} !important;
-        font-size: 0.72rem !important;
+        font-size: 0.7rem !important;
         text-transform: uppercase;
         letter-spacing: 0.8px;
         font-weight: 500;
+        overflow: visible !important;
+        word-wrap: break-word !important;
+        white-space: normal !important;
+        min-width: 0;
+        line-height: 1.2;
     }}
 
     [data-testid="stMetricValue"] {{
         color: {COLORS['white']} !important;
         font-family: 'JetBrains Mono', 'Consolas', monospace !important;
         font-weight: 600;
+        font-size: 0.95rem !important;
+        overflow: visible !important;
+        word-wrap: break-word !important;
+        white-space: normal !important;
+        min-width: 0;
     }}
 
     [data-testid="stMetricDelta"] > div {{
@@ -721,6 +735,44 @@ def _get_theme_css() -> str:
         line-height: 1.6;
     }}
 
+    /* --- PHASE 6: MOBILE RESPONSIVE TERMINAL (PWA Support) --- */
+    @media (max-width: 768px) {{
+        .stApp {{
+            font-size: 0.9rem;
+        }}
+        [data-testid="stSidebar"] {{
+            min-width: 100vw;
+        }}
+        .stApp::before {{
+            display: none; /* Disable heavy animations on mobile for performance */
+        }}
+        h1 {{ font-size: 1.4rem !important; }}
+        h2 {{ font-size: 1.2rem !important; }}
+        h3 {{ font-size: 1.1rem !important; }}
+        
+        [data-testid="stMetric"] {{
+            padding: 10px 12px;
+            margin-bottom: 8px;
+        }}
+        
+        /* Force single column for metrics horizontally */
+        [data-testid="stHorizontalBlock"] {{
+            flex-direction: column !important;
+            gap: 8px !important;
+        }}
+        [data-testid="stHorizontalBlock"] > div {{
+            width: 100% !important;
+        }}
+        
+        .stButton > button {{
+            width: 100%;
+        }}
+        
+        .stTabs [data-baseweb="tab"] {{
+            padding: 8px 12px;
+            font-size: 0.75rem;
+        }}
+    }}
     </style>
     """
 
@@ -790,9 +842,9 @@ def status_badge(text: str, variant: str = "neutral") -> str:
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # ENHANCED MICROANIMATIONS - Sleek & Professional
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 def get_extended_animations() -> str:
     """Return extended CSS animations for enhanced UI."""

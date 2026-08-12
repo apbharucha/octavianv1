@@ -141,3 +141,134 @@ def position_size(account_size, risk_pct, stop_pct):
     risk_amount = account_size * risk_pct
     size = risk_amount / stop_pct
     return round(size, 2)
+
+
+def calculate_advanced_risk_metrics(
+    returns: pd.Series | np.ndarray,
+    confidence: float = 0.95,
+    horizon: int = 1,
+    monte_carlo_paths: int = 5000,
+) -> dict:
+    """
+    Compute advanced risk metrics from a return series.
+    Returns decimal-form metrics (e.g. 0.02 == 2%).
+    """
+    try:
+        r = pd.Series(returns).dropna().astype(float)
+    except Exception:
+        return {
+            "volatility": 0.0,
+            "var_historical": 0.0,
+            "var_parametric": 0.0,
+            "var_monte_carlo": 0.0,
+            "cvar": 0.0,
+        }
+
+    if r.empty:
+        return {
+            "volatility": 0.0,
+            "var_historical": 0.0,
+            "var_parametric": 0.0,
+            "var_monte_carlo": 0.0,
+            "cvar": 0.0,
+        }
+
+    # Scale to requested horizon with square-root-of-time rule
+    h = max(int(horizon), 1)
+    scale = np.sqrt(h)
+    vol = float(r.std(ddof=1)) * scale
+    mu = float(r.mean()) * h
+
+    alpha = max(1e-6, min(1 - confidence, 0.5))
+    pct = alpha * 100
+
+    # Historical VaR / CVaR
+    hist_q = float(np.percentile(r.values, pct)) * scale
+    var_historical = abs(hist_q)
+    tail = r[r <= np.percentile(r.values, pct)]
+    cvar = abs(float(tail.mean()) * scale) if not tail.empty else var_historical
+
+    # Parametric VaR via empirical quantile of simulated normal
+    sim_norm = np.random.normal(loc=mu, scale=max(vol, 1e-12), size=10000)
+    param_q = float(np.percentile(sim_norm, pct))
+    var_parametric = abs(param_q)
+
+    # Monte Carlo VaR using historical drift/vol assumptions
+    mc = np.random.normal(loc=mu, scale=max(vol, 1e-12), size=max(1000, int(monte_carlo_paths)))
+    mc_q = float(np.percentile(mc, pct))
+    var_monte_carlo = abs(mc_q)
+
+    return {
+        "volatility": float(max(0.0, vol * np.sqrt(252))),  # annualized volatility
+        "var_historical": float(max(0.0, var_historical)),
+        "var_parametric": float(max(0.0, var_parametric)),
+        "var_monte_carlo": float(max(0.0, var_monte_carlo)),
+        "cvar": float(max(0.0, cvar)),
+    }
+
+
+class InstitutionalRiskEngine:
+    """
+    Advanced Institutional Risk Engine for Octavian.
+    Extends base risk metrics with stress testing and probabilistic simulation.
+    """
+    
+    def __init__(self):
+        self.scenarios = {
+            "Lehman_Crisis": {"SPY": -0.45, "TLT": 0.20, "GLD": 0.15, "USO": -0.60},
+            "COVID_Shock": {"SPY": -0.30, "TLT": 0.15, "GLD": -0.05, "USO": -0.70},
+            "Vol_Mageddon": {"SPY": -0.15, "TLT": -0.10, "GLD": 0.10, "VIX": 1.50},
+            "Tech_Bubble_Burst": {"SPY": -0.25, "XLK": -0.50, "TLT": 0.10, "GLD": 0.05}
+        }
+
+    def run_portfolio_stress_test(self, symbols: list[str], weights: list[float]) -> dict:
+        """Evaluate portfolio impact across major historical stress scenarios."""
+        results = {}
+        for name, impacts in self.scenarios.items():
+            port_impact = 0
+            for sym, weight in zip(symbols, weights):
+                # Use proxy or correlation-adjusted impact if symbol not in impacts
+                impact = impacts.get(sym, impacts.get("SPY", -0.20))
+                port_impact += weight * impact
+            results[name] = float(port_impact)
+        return results
+
+    def monte_carlo_portfolio_simulation(self, returns: pd.DataFrame, weights: list[float], days: int = 252, sims: int = 5000) -> dict:
+        """Simulate 5,000+ paths for probabilistic portfolio evolution."""
+        if returns.empty: return {}
+        
+        mu = returns.mean()
+        cov = returns.cov()
+        w = np.array(weights)
+        
+        port_mu = np.dot(w, mu)
+        port_std = np.sqrt(np.dot(w.T, np.dot(cov, w)))
+        
+        # Simulate paths using geometric brownian motion assumption
+        sim_results = np.random.normal(port_mu, port_std, (days, sims))
+        cum_returns = np.cumprod(1 + sim_results, axis=0)
+        
+        final_returns = cum_returns[-1, :]
+        return {
+            "expected_annual_return": float(np.mean(final_returns) - 1),
+            "p5_downside_var": float(np.percentile(final_returns, 5) - 1),
+            "p95_upside_pot": float(np.percentile(final_returns, 95) - 1),
+            "prob_of_drawdown_gt_20pct": float(np.mean(np.min(cum_returns, axis=0) < 0.80))
+        }
+
+    def calculate_kelly_fraction(self, win_prob: float, win_loss_ratio: float) -> float:
+        """
+        Kelly Criterion for optimal position sizing: K% = W - (1-W)/R
+        Institutional risk management uses a 'half-Kelly' or 'quarter-Kelly' for safety.
+        """
+        if win_loss_ratio <= 0: return 0.0
+        kelly = win_prob - (1 - win_prob) / win_loss_ratio
+        return float(np.clip(kelly, 0, 1.0))
+
+    def get_risk_adjusted_grade(self, sharpe: float, sortino: float, max_drawdown: float) -> str:
+        """Score a strategy based on institutional risk/reward ratios."""
+        score = (sharpe * 0.4) + (sortino * 0.4) - (max_drawdown * 0.2)
+        if score > 2.5: return "AAA (Institutional Elite)"
+        if score > 1.5: return "A (Institutional Grade)"
+        if score > 0.8: return "B (Standard Alpha)"
+        return "C (High Tail Risk)"

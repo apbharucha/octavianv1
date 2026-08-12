@@ -1,5 +1,5 @@
 """
-Daily Market Intelligence Engine — Professional Grade
+Daily Market Intelligence Engine - Professional Grade
 Generates automated daily briefings with institutional-depth analysis:
   - Market regime detection via HMM
   - Macro indicators (yield curve, inflation, Fed signals)
@@ -24,7 +24,7 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("DailyIntel")
 
-# ── Safe imports ────────────────────────────────────────────────────────────
+#  Safe imports 
 try:
     import yfinance as yf
 
@@ -54,9 +54,9 @@ except Exception:
     HAS_MOVERS = False
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # Utility helpers
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 
 def _safe_yf_download(
@@ -174,9 +174,9 @@ def _bollinger_position(df: pd.DataFrame, window: int = 20) -> str:
     return "Lower Half"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # Data collection modules
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 
 def _fetch_equity_indices() -> dict:
@@ -252,19 +252,19 @@ def _fetch_yield_curve() -> dict:
     spread_2s30s = round((r30 - r2) * 100, 1)  # bps
 
     if spread_2s10s < -25:
-        curve_shape = "Deeply Inverted — Recession Signal"
+        curve_shape = "Deeply Inverted - Recession Signal"
         curve_signal = "BEARISH"
     elif spread_2s10s < 0:
-        curve_shape = "Inverted — Contraction Warning"
+        curve_shape = "Inverted - Contraction Warning"
         curve_signal = "CAUTION"
     elif spread_2s10s < 50:
-        curve_shape = "Flat — Transition Phase"
+        curve_shape = "Flat - Transition Phase"
         curve_signal = "NEUTRAL"
     elif spread_2s10s < 100:
-        curve_shape = "Normal — Moderate Growth"
+        curve_shape = "Normal - Moderate Growth"
         curve_signal = "BULLISH"
     else:
-        curve_shape = "Steep — Strong Growth / Reflation"
+        curve_shape = "Steep - Strong Growth / Reflation"
         curve_signal = "BULLISH"
 
     return {
@@ -390,46 +390,46 @@ def _fetch_volatility_surface() -> dict:
     if vix_spot > 0 and vix3m > 0:
         vix_ts_slope = vix3m - vix_spot
         if vix_ts_slope > 3:
-            ts_regime = "Contango — Normal / Calm"
+            ts_regime = "Contango - Normal / Calm"
         elif vix_ts_slope > 0:
-            ts_regime = "Mild Contango — Slight Caution"
+            ts_regime = "Mild Contango - Slight Caution"
         elif vix_ts_slope > -3:
-            ts_regime = "Flat — Transition"
+            ts_regime = "Flat - Transition"
         else:
-            ts_regime = "Backwardation — Elevated Fear / Potential Spike"
+            ts_regime = "Backwardation - Elevated Fear / Potential Spike"
     else:
         vix_ts_slope = 0
         ts_regime = "Unavailable"
 
     # VIX regime classification
     if vix_spot < 15:
-        vix_regime = "Complacent — Potential Tail Risk Build-Up"
+        vix_regime = "Complacent - Potential Tail Risk Build-Up"
         vix_color = "green"
     elif vix_spot < 20:
-        vix_regime = "Low Volatility — Risk-On Environment"
+        vix_regime = "Low Volatility - Risk-On Environment"
         vix_color = "green"
     elif vix_spot < 25:
-        vix_regime = "Moderate — Normal Market Conditions"
+        vix_regime = "Moderate - Normal Market Conditions"
         vix_color = "yellow"
     elif vix_spot < 35:
-        vix_regime = "Elevated — Caution / Potential Reversal"
+        vix_regime = "Elevated - Caution / Potential Reversal"
         vix_color = "orange"
     elif vix_spot < 50:
-        vix_regime = "High Stress — Fear Dominant"
+        vix_regime = "High Stress - Fear Dominant"
         vix_color = "red"
     else:
-        vix_regime = "Extreme Fear — Crisis Mode"
+        vix_regime = "Extreme Fear - Crisis Mode"
         vix_color = "darkred"
 
     skew = result.get("SKEW Index", {}).get("value", 100)
     if skew > 140:
-        skew_signal = "Extreme Tail Risk Hedging — Smart Money Worried"
+        skew_signal = "Extreme Tail Risk Hedging - Smart Money Worried"
     elif skew > 125:
-        skew_signal = "Elevated Skew — Downside Hedging Active"
+        skew_signal = "Elevated Skew - Downside Hedging Active"
     elif skew > 115:
         skew_signal = "Normal Skew Range"
     else:
-        skew_signal = "Low Skew — Complacent / Under-Hedged"
+        skew_signal = "Low Skew - Complacent / Under-Hedged"
 
     result["_meta"] = {
         "vix_spot": vix_spot,
@@ -608,11 +608,11 @@ def _fetch_fed_signals() -> dict:
             )
             signals["2Y Trend (1m)"] = f"{r2y_1m:+.2f}%"
             if r2y_1m > 2:
-                signals["Fed Expectation"] = "Hawkish shift — market pricing MORE hikes"
+                signals["Fed Expectation"] = "Hawkish shift - market pricing MORE hikes"
             elif r2y_1m < -2:
-                signals["Fed Expectation"] = "Dovish shift — market pricing CUTS"
+                signals["Fed Expectation"] = "Dovish shift - market pricing CUTS"
             else:
-                signals["Fed Expectation"] = "Stable — market expects status quo"
+                signals["Fed Expectation"] = "Stable - market expects status quo"
 
         if not df_10y.empty:
             r10y = _last_close(df_10y)
@@ -634,17 +634,17 @@ def _assess_monetary_bias() -> str:
         r2y = _last_close(df_2y)
         chg_1m = _pct_change_nd(df_2y, 21)
         if r2y > 5:
-            return "Very Restrictive — High Real Rates"
+            return "Very Restrictive - High Real Rates"
         elif r2y > 4:
             if chg_1m < -3:
-                return "Restrictive but Easing — Transition to Cuts"
-            return "Restrictive — Tight Policy Regime"
+                return "Restrictive but Easing - Transition to Cuts"
+            return "Restrictive - Tight Policy Regime"
         elif r2y > 3:
-            return "Moderately Tight — Neutral to Restrictive"
+            return "Moderately Tight - Neutral to Restrictive"
         elif r2y > 2:
-            return "Neutral — Near-Zero Real Rates"
+            return "Neutral - Near-Zero Real Rates"
         else:
-            return "Accommodative — Low Rate Environment"
+            return "Accommodative - Low Rate Environment"
     except Exception:
         return "Unknown"
 
@@ -666,7 +666,7 @@ def _detect_cross_asset_signals(
                 "title": "Stocks Rising WITH Rates",
                 "detail": (
                     f"S&P 500 +{sp500_1m:.1f}% while 10Y yields also rising "
-                    f"{yield_10y_chg:+.1f}%. Classic reflation/growth regime — "
+                    f"{yield_10y_chg:+.1f}%. Classic reflation/growth regime - "
                     "typically bullish but watch for valuation compression if yields break higher."
                 ),
                 "implication": "Favor cyclicals, financials, value over growth/duration",
@@ -677,7 +677,7 @@ def _detect_cross_asset_signals(
             {
                 "type": "DIVERGENCE",
                 "severity": "HIGH",
-                "title": "Stagflation Signal — Stocks Down, Rates Up",
+                "title": "Stagflation Signal - Stocks Down, Rates Up",
                 "detail": (
                     f"S&P 500 {sp500_1m:.1f}% while 10Y yields rising {yield_10y_chg:+.1f}%. "
                     "Stagflation risk elevated. This is the worst macro environment for equities."
@@ -709,8 +709,8 @@ def _detect_cross_asset_signals(
             {
                 "type": "MACRO",
                 "severity": "MEDIUM",
-                "title": "Dollar Weakness — Tailwind for Risk Assets",
-                "detail": f"DXY {dxy_chg:.1f}% — dollar weakness historically bullish for gold, commodities, EM equities.",
+                "title": "Dollar Weakness - Tailwind for Risk Assets",
+                "detail": f"DXY {dxy_chg:.1f}% - dollar weakness historically bullish for gold, commodities, EM equities.",
                 "implication": "Overweight commodities, gold, EM equities, international developed",
             }
         )
@@ -723,7 +723,7 @@ def _detect_cross_asset_signals(
             {
                 "type": "INFLATION",
                 "severity": "MEDIUM",
-                "title": "Oil Surge — Inflation Re-Acceleration Risk",
+                "title": "Oil Surge - Inflation Re-Acceleration Risk",
                 "detail": f"WTI Crude +{oil_1m:.1f}% over past month. Energy inflation historically feeds into CPI with 1-2 month lag.",
                 "implication": "TIPS, energy equities, commodity traders benefit; caution on high-multiple growth",
             }
@@ -733,7 +733,7 @@ def _detect_cross_asset_signals(
             {
                 "type": "INFLATION",
                 "severity": "HIGH",
-                "title": "Hard Assets Rally — Inflation Hedge Accumulation",
+                "title": "Hard Assets Rally - Inflation Hedge Accumulation",
                 "detail": f"Gold +{gold_1m:.1f}% and Oil +{oil_1m:.1f}%. Institutional rotation into inflation protection.",
                 "implication": "Commodity supercycle indicators flashing; real assets over financial assets",
             }
@@ -799,7 +799,7 @@ def _detect_cross_asset_signals(
                 {
                     "type": "RISK",
                     "severity": "MEDIUM",
-                    "title": "Risk-On Euphoria — Both Equities and Crypto Surging",
+                    "title": "Risk-On Euphoria - Both Equities and Crypto Surging",
                     "detail": "Correlated gains across equities and crypto signal broad risk appetite. Watch for crowding.",
                     "implication": "Late-stage risk-on; consider partial profit-taking and vol hedges",
                 }
@@ -814,7 +814,7 @@ def _detect_cross_asset_signals(
             {
                 "type": "COMPLACENCY",
                 "severity": "HIGH",
-                "title": "Extreme Complacency — VIX Near Historic Lows",
+                "title": "Extreme Complacency - VIX Near Historic Lows",
                 "detail": (
                     f"VIX at {vix:.1f} while S&P up {sp500_1m:.1f}%. "
                     "Sub-14 VIX historically precedes volatility spikes. Options are cheap."
@@ -854,7 +854,7 @@ def _get_regime_analysis() -> dict:
 def _detect_narrative_dislocations(
     indices: dict, sectors: dict, yields: dict, vix_data: dict
 ) -> list:
-    """Detect narrative vs. price dislocations — where the story and the data diverge."""
+    """Detect narrative vs. price dislocations - where the story and the data diverge."""
     dislocations = []
 
     sp500_3m = indices.get("S&P 500", {}).get("chg_3m", 0)
@@ -869,7 +869,7 @@ def _detect_narrative_dislocations(
             {
                 "title": "Stocks at Highs but Yield Curve Screaming Recession",
                 "narrative": "Equity market pricing in continued growth and earnings expansion",
-                "reality": f"Yield curve inverted at {spread_2s10s:.0f}bps — historically predicts recession within 12-18 months",
+                "reality": f"Yield curve inverted at {spread_2s10s:.0f}bps - historically predicts recession within 12-18 months",
                 "implication": "Either the yield curve is wrong (this time is different) or equities are priced for perfection",
                 "probability": "Equity market risk is elevated. Historical base rate: 7/8 inversions precede recessions.",
                 "severity": "HIGH",
@@ -880,9 +880,9 @@ def _detect_narrative_dislocations(
     if vix_val < 16 and sp500_rsi > 68:
         dislocations.append(
             {
-                "title": "Euphoria Signal — Low Fear + Overbought Technicals",
+                "title": "Euphoria Signal - Low Fear + Overbought Technicals",
                 "narrative": f"VIX at {vix_val:.1f} suggests market participants unconcerned about risk",
-                "reality": f"S&P RSI at {sp500_rsi:.0f} — historically overbought. When everyone is comfortable, markets become fragile.",
+                "reality": f"S&P RSI at {sp500_rsi:.0f} - historically overbought. When everyone is comfortable, markets become fragile.",
                 "implication": "Mean reversion risk elevated. Consider trimming longs and adding vol protection.",
                 "probability": "Sub-16 VIX at market highs has preceded 10%+ corrections historically.",
                 "severity": "MEDIUM",
@@ -895,7 +895,7 @@ def _detect_narrative_dislocations(
     if tech_3m > 15 and r10 > 4.5 and tech_rsi > 65:
         dislocations.append(
             {
-                "title": "Tech Rallying Despite High Rates — Valuation Divergence",
+                "title": "Tech Rallying Despite High Rates - Valuation Divergence",
                 "narrative": f"Tech sector +{tech_3m:.1f}% in 3 months amid 'AI-driven growth'",
                 "reality": f"10Y yields at {r10 / 100:.2%} historically compress long-duration growth multiples",
                 "implication": "Tech valuations stretched vs. discount rate reality. Either rates must fall or multiples must compress.",
@@ -911,7 +911,7 @@ def _detect_narrative_dislocations(
         dislocations.append(
             {
                 "title": "Smart Money Hiding in Defensives While Indices Rise",
-                "narrative": "Broad market indices showing gains — headline bullish",
+                "narrative": "Broad market indices showing gains - headline bullish",
                 "reality": f"Utilities outperforming Tech by {(utils_3m - tech_3m):.1f}%. Institutional rotation into defensives beneath the surface.",
                 "implication": "Leadership rotation is bearish. When defensives outperform at market highs, often a late-cycle signal.",
                 "probability": "Sector rotation analysis suggests distribution of risk, not accumulation.",
@@ -924,8 +924,8 @@ def _detect_narrative_dislocations(
     if sp500_3m > 10 and russell_3m < 0:
         dislocations.append(
             {
-                "title": "Narrow Market Rally — Only Mega-Caps Working",
-                "narrative": "S&P 500 showing strong gains — 'broad bull market'",
+                "title": "Narrow Market Rally - Only Mega-Caps Working",
+                "narrative": "S&P 500 showing strong gains - 'broad bull market'",
                 "reality": f"Russell 2000 {russell_3m:.1f}% while S&P +{sp500_3m:.1f}%. Market breadth deteriorating.",
                 "implication": "Narrow leadership is bearish. When gains concentrate in few mega-caps, the rally is fragile.",
                 "probability": "Historically, narrow breadth precedes corrections or breadth catch-up. Either scenario means risk.",
@@ -980,7 +980,7 @@ def _generate_trade_ideas(
             {
                 "type": "MACRO TRADE",
                 "instrument": "Long TLT + Short SHY (Steepener)",
-                "thesis": f"Curve inverted at {spread_2s10s:.0f}bps. Historically curves un-invert — steepener trade.",
+                "thesis": f"Curve inverted at {spread_2s10s:.0f}bps. Historically curves un-invert - steepener trade.",
                 "timeframe": "3-12 months",
                 "risk": "Curve remains inverted longer than expected",
                 "sizing": "3-8% of portfolio",
@@ -993,7 +993,7 @@ def _generate_trade_ideas(
             {
                 "type": "VOLATILITY LONG",
                 "instrument": "VIX calls or UVXY partial",
-                "thesis": f"VIX at {vix_spot:.1f} — historically cheap. Long vol as tail hedge when VIX sub-15.",
+                "thesis": f"VIX at {vix_spot:.1f} - historically cheap. Long vol as tail hedge when VIX sub-15.",
                 "timeframe": "4-12 weeks",
                 "risk": "Vol remains suppressed; theta decay on options",
                 "sizing": "2-4% of portfolio (tail hedge only)",
@@ -1004,10 +1004,10 @@ def _generate_trade_ideas(
             {
                 "type": "VOLATILITY SHORT / FADE",
                 "instrument": "SPY long + short SVIX",
-                "thesis": f"VIX at {vix_spot:.1f} — elevated fear historically mean-reverts. Buy the panic.",
+                "thesis": f"VIX at {vix_spot:.1f} - elevated fear historically mean-reverts. Buy the panic.",
                 "timeframe": "2-6 weeks",
                 "risk": "Crisis deepens; vol spikes further",
-                "sizing": "Partial position 5-10% — scale in tranches",
+                "sizing": "Partial position 5-10% - scale in tranches",
             }
         )
 
@@ -1062,7 +1062,7 @@ def _recommend_posture(regime: str, vix: float, spread: float) -> dict:
         }
     elif vix > 30:
         return {
-            "label": "Crisis Mode — Reduce + Hedge",
+            "label": "Crisis Mode - Reduce + Hedge",
             "equity_pct": "15-30%",
             "bond_pct": "20-30%",
             "alternatives": "10-20%",
@@ -1071,7 +1071,7 @@ def _recommend_posture(regime: str, vix: float, spread: float) -> dict:
         }
     elif "Volatile" in regime or vix > 25:
         return {
-            "label": "Cautious — Reduced Sizing",
+            "label": "Cautious - Reduced Sizing",
             "equity_pct": "40-55%",
             "bond_pct": "20-30%",
             "alternatives": "10-15%",
@@ -1089,9 +1089,9 @@ def _recommend_posture(regime: str, vix: float, spread: float) -> dict:
         }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # Main Engine
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 
 class DailyIntelligenceEngine:
@@ -1109,35 +1109,35 @@ class DailyIntelligenceEngine:
         report_date = datetime.now().strftime("%A, %B %d, %Y")
         ts = datetime.now().strftime("%H:%M:%S ET")
 
-        # ── 1. Regime Detection ──────────────────────────────────────────────
+        #  1. Regime Detection 
         regime_data = _get_regime_analysis()
 
-        # ── 2. Market Indices ────────────────────────────────────────────────
+        #  2. Market Indices 
         indices = _fetch_equity_indices()
 
-        # ── 3. Yield Curve ───────────────────────────────────────────────────
+        #  3. Yield Curve 
         yield_data = _fetch_yield_curve()
 
-        # ── 4. Volatility Surface ────────────────────────────────────────────
+        #  4. Volatility Surface 
         vix_data = _fetch_volatility_surface()
         vix_meta = vix_data.get("_meta", {})
 
-        # ── 5. FX ────────────────────────────────────────────────────────────
+        #  5. FX 
         fx_data = _fetch_fx_rates()
 
-        # ── 6. Commodities ───────────────────────────────────────────────────
+        #  6. Commodities 
         commodities = _fetch_commodities()
 
-        # ── 7. Crypto ────────────────────────────────────────────────────────
+        #  7. Crypto 
         crypto = _fetch_crypto()
 
-        # ── 8. Sector Rotation ───────────────────────────────────────────────
+        #  8. Sector Rotation 
         sectors = _fetch_sector_performance()
 
-        # ── 9. Macro Indicators ──────────────────────────────────────────────
+        #  9. Macro Indicators 
         macro = _fetch_macro_indicators()
 
-        # ── 10. Market Movers ────────────────────────────────────────────────
+        #  10. Market Movers 
         gainers, losers = [], []
         if HAS_MOVERS:
             try:
@@ -1145,29 +1145,29 @@ class DailyIntelligenceEngine:
             except Exception:
                 pass
 
-        # ── 11. Cross-Asset Signals ──────────────────────────────────────────
+        #  11. Cross-Asset Signals 
         cross_signals = _detect_cross_asset_signals(
             indices, yield_data, fx_data, commodities, sectors
         )
 
-        # ── 12. Narrative Dislocations ───────────────────────────────────────
+        #  12. Narrative Dislocations 
         dislocations = _detect_narrative_dislocations(
             indices, sectors, yield_data, vix_data
         )
 
-        # ── 13. Trade Ideas ──────────────────────────────────────────────────
+        #  13. Trade Ideas 
         trade_ideas = _generate_trade_ideas(
             regime_data, cross_signals, sectors, indices, yield_data, vix_meta
         )
 
-        # ── 14. Portfolio Posture ────────────────────────────────────────────
+        #  14. Portfolio Posture 
         posture = _recommend_posture(
             regime_data.get("regime", "Unknown"),
             vix_meta.get("vix_spot", 20),
             yield_data.get("spread_2s10s_bps", 0),
         )
 
-        # ── 15. Executive Summary ────────────────────────────────────────────
+        #  15. Executive Summary 
         regime_label = regime_data.get("regime", "Unknown")
         regime_conf = regime_data.get("confidence", 0)
         vix_spot = vix_meta.get("vix_spot", 0)
@@ -1251,7 +1251,7 @@ class DailyIntelligenceEngine:
             "posture": posture,
         }
 
-    # ── Legacy interface ─────────────────────────────────────────────────────
+    #  Legacy interface 
 
     def _get_market_regime(self):
         return _get_regime_analysis()
@@ -1271,10 +1271,10 @@ def _compile_key_risks(
     for s in [s for s in signals if s.get("severity") == "HIGH"][:2]:
         risks.append(s["title"])
     if vix_meta.get("vix_spot", 20) > 30:
-        risks.append(f"Elevated VIX at {vix_meta['vix_spot']:.1f} — Fear regime active")
+        risks.append(f"Elevated VIX at {vix_meta['vix_spot']:.1f} - Fear regime active")
     if yields.get("spread_2s10s_bps", 0) < -30:
         risks.append(
-            f"Yield curve inverted at {yields['spread_2s10s_bps']:.0f}bps — Recession signal"
+            f"Yield curve inverted at {yields['spread_2s10s_bps']:.0f}bps - Recession signal"
         )
     return risks[:6]
 
@@ -1283,13 +1283,13 @@ def _compile_key_opportunities(ideas: list, signals: list) -> list:
     """Compile top opportunities."""
     opps = []
     for idea in ideas[:4]:
-        opps.append(f"{idea['type']}: {idea['instrument']} — {idea['thesis'][:80]}...")
+        opps.append(f"{idea['type']}: {idea['instrument']} - {idea['thesis'][:80]}...")
     for s in [s for s in signals if s.get("severity") in ("LOW", "MEDIUM")][:2]:
         opps.append(s.get("implication", ""))
     return opps[:5]
 
 
-# ── Singleton ────────────────────────────────────────────────────────────────
+#  Singleton 
 _daily_engine = None
 
 

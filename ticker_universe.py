@@ -2316,140 +2316,6 @@ _CRYPTO = [
     "SAND-USD",
 ]
 
-# ETFs (non-equity)
-_ETFS = [
-    "SPY",
-    "QQQ",
-    "IWM",
-    "VTI",
-    "VEA",
-    "VWO",
-    "EFA",
-    "EEM",
-    "DIA",
-    "XLK",
-    "XLF",
-    "XLE",
-    "XLV",
-    "XLI",
-    "XLP",
-    "XLU",
-    "XLB",
-    "XLRE",
-    "XLC",
-    "ARKK",
-    "ARKQ",
-    "ARKW",
-    "ARKG",
-    "ARKF",
-    "ICLN",
-    "JETS",
-    "HACK",
-    "UVXY",
-    "SVXY",
-    "VXX",
-    "VIXY",
-    "TQQQ",
-    "SQQQ",
-    "UPRO",
-    "SPXU",
-    "TNA",
-    "TZA",
-    "LABU",
-    "LABD",
-    "FXI",
-    "ASHR",
-    "MCHI",
-    "KWEB",
-    "EWJ",
-    "EWZ",
-    "EWY",
-    "INDA",
-    "GLD",
-    "SLV",
-    "USO",
-    "UNG",
-    "DBA",
-    "DBC",
-    "PDBC",
-    "GSG",
-    "TLT",
-    "IEF",
-    "SHY",
-    "LQD",
-    "HYG",
-    "JNK",
-    "EMB",
-    "TIP",
-    "GDX",
-    "GDXJ",
-    "SIL",
-    "COPX",
-    "REMX",
-    "URA",
-    "LIT",
-    "XBI",
-    "IBB",
-    "SOXX",
-    "SMH",
-    "MSOS",
-    "XME",
-    "MOO",
-    "MDY",
-    "IJH",
-    "IWN",
-    "IWO",
-    "IJR",
-]
-
-# Forex
-_FOREX = [
-    "EUR/USD",
-    "GBP/USD",
-    "USD/JPY",
-    "USD/CHF",
-    "AUD/USD",
-    "USD/CAD",
-    "NZD/USD",
-    "EUR/GBP",
-    "EUR/JPY",
-    "GBP/JPY",
-    "AUD/JPY",
-    "CHF/JPY",
-    "CAD/JPY",
-    "USD/TRY",
-    "USD/ZAR",
-    "USD/MXN",
-]
-
-# Futures
-_FUTURES = [
-    "ES=F",
-    "NQ=F",
-    "YM=F",
-    "RTY=F",
-    "CL=F",
-    "NG=F",
-    "GC=F",
-    "SI=F",
-    "HG=F",
-    "PA=F",
-    "PL=F",
-    "ZC=F",
-    "ZS=F",
-    "ZW=F",
-    "KC=F",
-    "SB=F",
-    "CC=F",
-    "CT=F",
-    "ZN=F",
-    "ZB=F",
-    "ZF=F",
-    "ZT=F",
-]
-
-
-#
 # DYNAMIC EXPANSION — fetch tickers from ETF holdings via yfinance
 #
 
@@ -2564,6 +2430,35 @@ def _validate_ticker(sym: str) -> bool:
 
 
 #
+# ASSET CLASS SEEDS
+#
+
+_CRYPTO_SEEDS = [
+    "BTC-USD", "ETH-USD", "BNB-USD", "XRP-USD", "SOL-USD", "ADA-USD", "DOGE-USD",
+    "TRX-USD", "DOT-USD", "MATIC-USD", "LTC-USD", "LINK-USD", "BCH-USD", "SHIB-USD",
+    "AVAX-USD", "ETC-USD", "XLM-USD", "XMR-USD", "UNI-USD", "ATOM-USD", "ALGO-USD"
+]
+
+_FOREX = [
+    "EURUSD=X", "USDJPY=X", "GBPUSD=X", "AUDUSD=X", "USDCAD=X", "USDCHF=X",
+    "NZDUSD=X", "EURJPY=X", "GBPJPY=X", "EURGBP=X", "EURCHF=X", "EURAUD=X",
+    "EURCAD=X", "GBPAUD=X", "GBPCAD=X", "AUDJPY=X", "CADJPY=X", "NZDJPY=X"
+]
+
+_FUTURES = [
+    "ES=F", "NQ=F", "YM=F", "RTY=F", "CL=F", "GC=F", "SI=F", "HG=F", "NG=F", "ZB=F"
+]
+
+
+_ETFS = [
+    "SPY", "QQQ", "DIA", "IWM", "VTI", "VOO", "VEA", "VWO", "VGT", "XLK",
+    "XLF", "XLV", "XLE", "XLI", "XLP", "XLU", "XLB", "XLRE", "EEM", "FXI",
+    "EWJ", "EWZ", "INDA", "ICLN", "HACK", "GDX", "GDXJ", "SIL", "COPX",
+    "REMX", "URA", "LIT", "MSOS"
+]
+
+
+#
 # UNIVERSE CLASS — main interface
 #
 
@@ -2575,7 +2470,7 @@ class TickerUniverse:
         self._stocks: Set[str] = set()
         self._sector_map: Dict[str, Set[str]] = {}
         self._etfs: Set[str] = set()
-        self._crypto: Set[str] = set()
+        self._crypto: Set[str] = set(_CRYPTO_SEEDS)
         self._forex: List[str] = list(_FOREX)
         self._futures: List[str] = list(_FUTURES)
         self._last_refresh: Optional[str] = None
@@ -2607,6 +2502,8 @@ class TickerUniverse:
             }
             self._etfs = set(data.get("etfs", []))
             self._crypto = set(data.get("crypto", []))
+            self._forex = data.get("forex", list(_FOREX))
+            self._futures = data.get("futures", list(_FUTURES))
             self._dynamic_added = set(data.get("dynamic_added", []))
             self._last_refresh = cached_date
             return len(self._stocks) > 100
@@ -2622,6 +2519,8 @@ class TickerUniverse:
                 "sector_map": {k: sorted(v) for k, v in self._sector_map.items()},
                 "etfs": sorted(self._etfs),
                 "crypto": sorted(self._crypto),
+                "forex": self._forex,
+                "futures": self._futures,
                 "dynamic_added": sorted(self._dynamic_added),
                 "total_count": len(self._stocks) + len(self._etfs) + len(self._crypto),
                 "last_refresh_ts": datetime.now().isoformat(),
@@ -2632,7 +2531,7 @@ class TickerUniverse:
             pass
 
     def _build_from_seed(self):
-        """Build universe from hardcoded seed lists."""
+        """Build universe from hardcoded seed lists + ComprehensiveUniverse."""
         self._stocks = set()
         self._sector_map = {}
         for sector, tickers in _SEED_BY_SECTOR.items():
@@ -2640,7 +2539,21 @@ class TickerUniverse:
             self._stocks.update(valid)
             self._sector_map[sector] = valid.copy()
         self._etfs = {t.strip().upper() for t in _ETFS if _validate_ticker(t)}
-        self._crypto = set(_CRYPTO)
+        self._crypto = set(_CRYPTO_SEEDS)
+
+        # Bridge to ComprehensiveTickerUniverse for 10,000+ symbols
+        try:
+            from comprehensive_ticker_universe import ComprehensiveTickerUniverse
+            ctu = ComprehensiveTickerUniverse()
+            comp_stocks = ctu.get_stocks()
+            self._stocks.update(comp_stocks)
+            self._etfs.update(ctu.get_etfs())
+            self._crypto.update(ctu.get_crypto())
+            # Maintain uniqueness while merging
+            self._forex = sorted(list(set(self._forex + ctu.get_forex())))
+            self._futures = sorted(list(set(self._futures + ctu.get_futures())))
+        except Exception as e:
+            print(f"Warning: Could not bridge with ComprehensiveTickerUniverse: {e}")
 
     def _expand_dynamically(self):
         """Expand universe by fetching from external sources."""
@@ -2743,6 +2656,33 @@ class TickerUniverse:
         all_t = set(self._stocks)
         all_t.update(self._etfs)
         all_t.update(self._crypto)
+        return sorted(all_t)
+
+    def get_symbol_sector(self, symbol: str) -> str:
+        """Dynamically lookup the sector for any given symbol."""
+        self.refresh_if_needed()
+        sym = symbol.strip().upper()
+        # Check standard sector map
+        for sector, tickers in self._sector_map.items():
+            if sym in tickers:
+                return sector
+        
+        # Check if it's one of the other asset classes
+        if sym in self._etfs: return "ETF"
+        if sym in self._crypto: return "Crypto"
+        if sym in self._forex: return "Forex"
+        if sym in self._futures: return "Futures"
+        
+        return "Unknown"
+
+    def get_all_tickers(self) -> List[str]:
+        """Return every single ticker across ALL asset classes (Stocks, ETFs, Crypto, FX, Futures)."""
+        self.refresh_if_needed()
+        all_t = set(self._stocks)
+        all_t.update(self._etfs)
+        all_t.update(self._crypto)
+        all_t.update(self._forex)
+        all_t.update(self._futures)
         return sorted(all_t)
 
     def get_known_ticker_set(self) -> Set[str]:
@@ -2984,6 +2924,14 @@ _SECTOR_ALIASES = {
     "household": "consumer_staples",
     "crypto": "crypto_equities",
     "bitcoin": "crypto_equities",
+    # Commodities (maps to energy + mining + agriculture for broad coverage)
+    "commodity": "energy",
+    "commodities": "energy",
+    "raw materials": "mining",
+    "precious metals": "gold",
+    "base metals": "mining",
+    "grains": "agriculture",
+    "softs": "agriculture",
 }
 
 

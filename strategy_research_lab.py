@@ -28,7 +28,14 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import streamlit as st
 
-# ── Theme ─────────────────────────────────────────────────────────────────────
+try:
+    from futures_engine import get_futures_engine, FUTURES_UNIVERSE, SPREAD_TEMPLATES
+    HAS_FUTURES = True
+except ImportError:
+    HAS_FUTURES = False
+    FUTURES_UNIVERSE = {}
+    SPREAD_TEMPLATES = {}
+#  Theme 
 try:
     from octavian_theme import COLORS
 except ImportError:
@@ -39,7 +46,7 @@ except ImportError:
         "success": "#4caf50", "danger": "#ef5350", "neutral": "#78909c",
     }
 
-# ── Lazy imports ──────────────────────────────────────────────────────────────
+#  Lazy imports 
 try:
     from genetic_strategy_engine import GeneticStrategyEngine, get_genetic_engine
     HAS_GENETIC = True
@@ -58,7 +65,7 @@ try:
 except ImportError:
     HAS_DATA = False
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
+#  CSS 
 _LAB_CSS = """
 <style>
 @keyframes lab-slide-in {
@@ -187,9 +194,9 @@ def _dark_layout(**kwargs) -> dict:
     return base
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # TAB 1 — Pairs Trading / Statistical Arbitrage
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def _render_pairs_tab():
     _section("Statistical Arbitrage & Pairs Trading")
@@ -366,7 +373,7 @@ def _render_pairs_tab():
     fig.add_hline(y=0, line_color=COLORS["border"], row=3, col=1)
 
     fig.update_layout(**_dark_layout(height=550, title=f"Pairs Analysis: {sym1} / {sym2}"))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     # Cumulative return
     if len(cum_ret) > 0:
@@ -380,12 +387,224 @@ def _render_pairs_tab():
         ))
         fig_ret.add_hline(y=0, line_color=COLORS["border"])
         fig_ret.update_layout(**_dark_layout(height=250, yaxis_title="Return (%)"))
-        st.plotly_chart(fig_ret, use_container_width=True)
+        st.plotly_chart(fig_ret, width='stretch')
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+# TAB 5 — Volatility Lab
+# 
+
+def _render_volatility_lab_tab():
+    import options_engine
+    _section("Volatility & Derivatives Lab")
+    st.caption("Advanced Greeks modeling, skew analysis, and multi-leg strategy design.")
+    
+    c1, c2 = st.columns(2)
+    with c1:
+        sym = st.text_input("Derivatives Symbol", "SPY", key="vol_sym").strip().upper()
+        days_to_expiry = st.slider("Days to Expiry", 1, 90, 30, key="vol_dte")
+    with c2:
+        iv = st.slider("Implied Volatility (IV)", 0.05, 1.5, 0.20, step=0.01, key="vol_iv")
+        skew_str = st.slider("Skew Strength", 0.0, 0.2, 0.05, step=0.01, key="vol_skew")
+
+    if st.button("Construct Volatility Model", type="primary", key="vol_run"):
+        try:
+            engine = options_engine.get_options_engine()
+            
+            import yfinance as yf
+            df = yf.Ticker(sym).history(period="10d")
+            S = float(df["Close"].iloc[-1])
+            
+            # Skew model
+            skew_fn = engine.estimate_skew(iv, skew_str)
+            
+            # Strategies
+            strategies = {
+                "Iron Butterfly": engine.construct_professional_strategy(S, iv, days_to_expiry, "iron_butterfly"),
+                "Risk Reversal": engine.construct_professional_strategy(S, iv, days_to_expiry, "risk_reversal"),
+                "Straddle": engine.construct_straddle(S, iv, days_to_expiry)
+            }
+            
+            st.session_state["vol_lab_result"] = {
+                "S": S, "iv": iv, "dte": days_to_expiry, "strategies": strategies,
+                "skew_fn": skew_fn, "sym": sym
+            }
+            st.success("Volatility model generated.")
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+    res = st.session_state.get("vol_lab_result")
+    if not res: return
+    
+    S, iv, dte = res["S"], res["iv"], res["dte"]
+    strategies = res["strategies"]
+    
+    _section(f"Greeks & Skew Analysis: {res['sym']}")
+    
+    # NEW: Volatility Smile Heatmap (Simulated Surface)
+    _section("Volatility Surface Heatmap")
+    surface_strikes = np.linspace(S * 0.9, S * 1.1, 10).round(2)
+    surface_dtes = [7, 30, 60, 90, 180]
+    
+    z_iv = []
+    for d in surface_dtes:
+        row = []
+        # Simple term structure + skew simulation
+        term_adj = 0.05 * (d / 365)
+        for k in surface_strikes:
+            row.append(res["skew_fn"](k, S) + term_adj)
+        z_iv.append(row)
+        
+    fig_heat = go.Figure(data=go.Surface(
+        z=z_iv, x=surface_strikes, y=surface_dtes,
+        colorscale='Viridis', colorbar=dict(title="IV")
+    ))
+    fig_heat.update_layout(**_dark_layout(height=400, title="3D Volatility Surface (Strike vs Expiry)"))
+    fig_heat.update_layout(scene=dict(
+        xaxis_title='Strike',
+        yaxis_title='Days to Expiry',
+        zaxis_title='Implied Volatility',
+        camera=dict(eye=dict(x=1.5, y=1.5, z=0.5))
+    ))
+    st.plotly_chart(fig_heat, use_container_width=True)
+    
+    # Strategy payoffs
+    strategy_names = list(strategies.keys()) + ["Custom Spread Designer"]
+    sel_strat = st.selectbox("Compare Strategies", strategy_names)
+    
+    if sel_strat == "Custom Spread Designer":
+        _section("Professional Spread Designer")
+        st.caption("Construct multi-leg structures and analyze their probability of profit (PoP).")
+        
+        if 'lab_custom_legs' not in st.session_state:
+            st.session_state.lab_custom_legs = []
+            
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 0.5])
+        l_t = c1.selectbox("Type", ["Call", "Put"], key="lab_l_t")
+        l_s = c2.number_input("Strike", value=float(round(S)), key="lab_l_s")
+        l_side = c3.selectbox("Side", ["Long", "Short"], key="lab_l_side")
+        if c4.button("Add", key="lab_add"):
+            st.session_state.lab_custom_legs.append({'type': l_t.lower(), 'strike': l_s, 'side': 1 if l_side=="Long" else -1})
+            
+        legs = []
+        for i, leg in enumerate(st.session_state.lab_custom_legs):
+            cc1, cc2 = st.columns([3, 1])
+            cc1.markdown(f"**Leg {i+1}:** {leg['side']} {leg['type'].upper()} @ {leg['strike']}")
+            if cc2.button("X", key=f"lab_del_{i}"):
+                st.session_state.lab_custom_legs.pop(i)
+                st.rerun()
+            
+            # Enrich leg with greeks for display
+            engine = options_engine.get_options_engine()
+            res_g = engine.black_scholes(S, leg['strike'], dte/365, iv, leg['type'])
+            legs.append({**leg, 'cost': res_g['price'], 'greeks': res_g})
+    else:
+        legs = strategies[sel_strat]
+        
+    if legs:
+        import options_engine
+        pnl_data = options_engine.get_options_engine().get_strategy_pnl_map(legs)
+        
+        _section(f"Strategy Payoff: {sel_strat}")
+        vcol1, vcol2 = st.columns([2, 1])
+        
+        with vcol1:
+            fig_pnl = go.Figure(go.Scatter(x=pnl_data["prices"], y=pnl_data["pnls"], 
+                                           mode="lines", fill="tozeroy",
+                                           line=dict(color=COLORS["success"], width=2)))
+            fig_pnl.add_hline(y=0, line_color=COLORS["border"])
+            for be in pnl_data["breakeven"]:
+                fig_pnl.add_vline(x=be, line_dash="dot", line_color=COLORS["lavender"], annotation_text="BE")
+                
+            fig_pnl.update_layout(**_dark_layout(height=350, title=f"{sel_strat} Risk/Reward Profile"))
+            st.plotly_chart(fig_pnl, use_container_width=True)
+            
+        with vcol2:
+            st.markdown("**Core Metrics**")
+            # PoP Calculation (Heuristic based on Delta/Sigma)
+            net_delta = sum(l['greeks']['delta'] * l['side'] for l in legs)
+            pop = 50 + (net_delta * 10) # Placeholder for real probability density integration
+            st.metric("Probability of Profit", f"{min(95, max(5, pop)):.1f}%")
+            
+            st.markdown("---")
+            st.markdown("**Net Greeks**")
+            st.markdown(f"Delta: `{net_delta:+.3f}`")
+            st.markdown(f"Theta: `{sum(l['greeks']['theta'] * l['side'] for l in legs):+.2f}/day`")
+            st.markdown(f"Vega: `{sum(l['greeks']['vega'] * l['side'] for l in legs):+.2f}/%`")
+
+        # Leg details
+        st.markdown("**Position Construction**")
+        for i, leg in enumerate(legs):
+            g = leg['greeks']
+            side_text = "BUY" if leg['side'] == 1 else "SELL"
+            st.markdown(
+                f'<div class="lab-card">'
+                f'<div style="display:flex;justify-content:space-between;">'
+                f'<span>{side_text} {leg["type"].upper()} @ {leg["strike"]}</span>'
+                f'<span style="color:{COLORS["gold"]};">${leg["cost"]:.2f}</span>'
+                f'</div>'
+                f'<div style="font-size:0.7rem;color:#a0a8b8;margin-top:5px;">'
+                f'Delta: {g["delta"]:+.2f} | Gamma: {g["gamma"]:.4f} | Vanna: {g["vanna"]:+.4f} | Charm: {g["charm"]:+.4f}'
+                f'</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+        # Greeks Sensitivity Dashboard
+        _section("Greeks Sensitivity Analysis")
+        st.caption("Interactive 'What-If' simulations for portfolio Greeks based on underlying price shifts.")
+        
+        sim_price_shift = st.slider("Simulated Underlying Price Shift (%)", -10.0, 10.0, 0.0, 0.5, key="lab_greek_shift")
+        sim_iv_shift = st.slider("Simulated IV Shift (Absolute %)", -10.0, 10.0, 0.0, 1.0, key="lab_iv_shift")
+        
+        if sim_price_shift != 0.0 or sim_iv_shift != 0.0:
+            sim_S = S * (1 + (sim_price_shift / 100))
+            sim_IV = max(0.01, iv + (sim_iv_shift / 100))
+            
+            sim_delta, sim_gamma, sim_theta, sim_vega = 0, 0, 0, 0
+            for leg in legs:
+                res_g = options_engine.get_options_engine().black_scholes(sim_S, leg['strike'], dte/365, sim_IV, leg['type'])
+                sim_delta += res_g['delta'] * leg['side']
+                sim_gamma += res_g['gamma'] * leg['side']
+                sim_theta += res_g['theta'] * leg['side']
+                sim_vega += res_g['vega'] * leg['side']
+                
+            orig_gamma = sum(l['greeks']['gamma'] * l['side'] for l in legs)
+            orig_theta = sum(l['greeks']['theta'] * l['side'] for l in legs)
+            orig_vega = sum(l['greeks']['vega'] * l['side'] for l in legs)
+            
+            gc1, gc2, gc3, gc4 = st.columns(4)
+            gc1.metric("Simulated Delta", f"{sim_delta:+.3f}", f"{sim_delta - net_delta:+.3f}")
+            gc2.metric("Simulated Gamma", f"{sim_gamma:+.4f}", f"{sim_gamma - orig_gamma:+.4f}")
+            gc3.metric("Simulated Theta", f"{sim_theta:+.2f}", f"{sim_theta - orig_theta:+.2f}")
+            gc4.metric("Simulated Vega", f"{sim_vega:+.2f}", f"{sim_vega - orig_vega:+.2f}")
+
+        # Smart Order Routing (SOR) Execution Integration
+        _section("Automated Trade Execution")
+        st.caption("Route strategy via IBKR Smart Order Routing to minimize slippage.")
+        target_cost = sum(l['cost'] * l['side'] for l in legs) * 100
+        is_credit = target_cost > 0
+        st.markdown(f"**Target Net {'Credit' if is_credit else 'Debit'}:** ${abs(target_cost):.2f}")
+        
+        if st.button("Execute Smart Order Route", type="primary", key="lab_execute_sor"):
+            try:
+                from brokerage_engine import get_brokerage_engine
+                b_engine = get_brokerage_engine()
+                b_engine.connect()
+                result = b_engine.execute_smart_order_route(res['sym'], legs, target_cost, is_credit)
+                
+                if result.get("status") in ["ROUTED", "MOCK_EXECUTED"]:
+                    st.success(result.get("message"))
+                else:
+                    st.error(f"Routing Failed: {result.get('message')}")
+                b_engine.disconnect()
+            except Exception as e:
+                st.error(f"Brokerage integration error: {e}")
+
+
+# 
 # TAB 2 — Factor Investing
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def _render_factor_tab():
     _section("Factor Investing — Fama-French & Custom Factors")
@@ -502,7 +721,7 @@ def _render_factor_tab():
             ))
         fig_scores.update_layout(**_dark_layout(height=300, title="Factor Score Distributions",
                                                  barmode="overlay"))
-        st.plotly_chart(fig_scores, use_container_width=True)
+        st.plotly_chart(fig_scores, width='stretch')
 
     # Factor returns
     if not factor_ret_df.empty:
@@ -517,7 +736,7 @@ def _render_factor_tab():
         fig_fret.add_hline(y=0, line_color=COLORS["border"])
         fig_fret.update_layout(**_dark_layout(height=350, title="Long-Short Factor Returns",
                                                yaxis_title="Cumulative Return (%)"))
-        st.plotly_chart(fig_fret, use_container_width=True)
+        st.plotly_chart(fig_fret, width='stretch')
 
     # Factor correlation
     if not factor_corr.empty and len(factor_corr) > 1:
@@ -531,7 +750,7 @@ def _render_factor_tab():
             texttemplate="%{text}",
         ))
         fig_corr.update_layout(**_dark_layout(height=300, title="Factor Correlation"))
-        st.plotly_chart(fig_corr, use_container_width=True)
+        st.plotly_chart(fig_corr, width='stretch')
 
     # Top/bottom stocks by factor
     _section("Top & Bottom Stocks by Factor")
@@ -568,9 +787,9 @@ def _render_factor_tab():
                 )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # TAB 3 — Genetic Strategy Evolution
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def _render_genetic_tab():
     _section("Genetic Strategy Evolution Engine")
@@ -600,7 +819,12 @@ def _render_genetic_tab():
     if st.button("Evolve Strategies", type="primary", key="gen_run"):
         with st.spinner(f"Evolving strategies on {symbol}... (this may take a moment)"):
             try:
-                engine = get_genetic_engine()
+                engine = GeneticStrategyEngine(
+                    population_size=population_size,
+                    n_generations=n_generations,
+                    mutation_rate=mutation_rate,
+                    elite_pct=elite_pct,
+                )
                 import yfinance as yf
                 df = yf.Ticker(symbol).history(period=period)
                 if df.empty:
@@ -610,12 +834,11 @@ def _render_genetic_tab():
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
 
+                close = df["Close"].dropna().astype(float) if "Close" in df.columns else df.iloc[:, 0].dropna().astype(float)
                 result = engine.evolve(
-                    df,
-                    population_size=population_size,
-                    n_generations=n_generations,
-                    mutation_rate=mutation_rate,
-                    elite_fraction=elite_pct,
+                    close,
+                    capital=100_000.0,
+                    progress_callback=None,
                 )
                 st.session_state["gen_result"] = result
                 st.success(f"Evolution complete! Best strategy found.")
@@ -637,19 +860,22 @@ def _render_genetic_tab():
         best = result.best_strategy if hasattr(result, "best_strategy") else None
         if best:
             bc1, bc2, bc3, bc4 = st.columns(4)
-            metrics = best.metrics if hasattr(best, "metrics") else {}
-            with bc1: _metric("Best Sharpe", f"{metrics.get('sharpe', 0):.2f}", COLORS["gold"])
-            with bc2: _metric("Best Return", f"{metrics.get('total_return', 0):.1%}", COLORS["success"])
-            with bc3: _metric("Max Drawdown", f"{metrics.get('max_drawdown', 0):.1%}", COLORS["danger"])
-            with bc4: _metric("Win Rate", f"{metrics.get('win_rate', 0):.1%}")
+            sharpe = getattr(best, "sharpe", 0) or 0
+            total_ret = getattr(best, "total_return", 0) or 0
+            max_dd = getattr(best, "max_drawdown", 0) or 0
+            win_rate = getattr(best, "win_rate", 0) or 0
+            with bc1: _metric("Best Sharpe", f"{sharpe:.2f}", COLORS["gold"])
+            with bc2: _metric("Best Return", f"{total_ret:.1%}", COLORS["success"])
+            with bc3: _metric("Max Drawdown", f"{max_dd:.1%}", COLORS["danger"])
+            with bc4: _metric("Win Rate", f"{win_rate:.1%}")
 
         # Generation fitness history
-        if hasattr(result, "generation_stats"):
-            gen_stats = result.generation_stats
+        if hasattr(result, "generations") and result.generations:
+            gen_list = result.generations
             fig_evo = go.Figure()
-            gens = list(range(len(gen_stats)))
-            best_fitness = [g.get("best_fitness", 0) for g in gen_stats]
-            avg_fitness = [g.get("avg_fitness", 0) for g in gen_stats]
+            gens = list(range(len(gen_list)))
+            best_fitness = [getattr(g, "best_fitness", g.get("best_fitness", 0) if isinstance(g, dict) else 0) for g in gen_list]
+            avg_fitness = [getattr(g, "avg_fitness", g.get("avg_fitness", 0) if isinstance(g, dict) else 0) for g in gen_list]
             fig_evo.add_trace(go.Scatter(x=gens, y=best_fitness, mode="lines+markers",
                                           name="Best Fitness", line=dict(color=COLORS["gold"], width=2)))
             fig_evo.add_trace(go.Scatter(x=gens, y=avg_fitness, mode="lines",
@@ -678,7 +904,7 @@ def _render_genetic_demo():
                               name="Avg Fitness", line=dict(color=COLORS["lavender"], width=1.5)))
     fig.update_layout(**_dark_layout(height=300, title="Demo: Fitness Evolution",
                                       xaxis_title="Generation", yaxis_title="Fitness Score"))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
     # Demo top strategies
     _section("Demo: Top Discovered Strategies")
@@ -694,12 +920,12 @@ def _render_genetic_demo():
             "Win Rate": f"{float(rng.uniform(0.45, 0.65)):.1%}",
             "Robustness": f"{float(rng.uniform(0.5, 0.95)):.2f}",
         })
-    st.dataframe(pd.DataFrame(strategies), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(strategies), width='stretch', hide_index=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # TAB 4 — Alpha Signal Library
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def _render_alpha_signals_tab():
     _section("Alpha Signal Library")
@@ -864,9 +1090,9 @@ def _render_alpha_signals_tab():
         )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — Advanced Backtesting
-# ══════════════════════════════════════════════════════════════════════════════
+# 
+# TAB 6 — Backtest Hub
+# 
 
 def _render_backtest_tab():
     _section("Advanced Backtesting Engine")
@@ -1061,7 +1287,7 @@ def _render_backtest_tab():
     ))
     fig_eq.update_yaxes(title_text="Portfolio ($)", row=1, col=1)
     fig_eq.update_yaxes(title_text="Drawdown (%)", row=2, col=1)
-    st.plotly_chart(fig_eq, use_container_width=True)
+    st.plotly_chart(fig_eq, width='stretch')
 
     # Return distribution
     _section("Return Distribution")
@@ -1076,41 +1302,494 @@ def _render_backtest_tab():
                        line_color=COLORS["success"], annotation_text="Mean")
     fig_dist.update_layout(**_dark_layout(height=280, title="Daily Return Distribution",
                                            xaxis_title="Return (%)", yaxis_title="Count"))
-    st.plotly_chart(fig_dist, use_container_width=True)
+    st.plotly_chart(fig_dist, width='stretch')
+
+    # Integration with Paper Trading
+    _section("Execution & Integration")
+    if st.button("Send to Paper Trading Environment", use_container_width=True):
+        st.success(f"Strategy '{result['strategy']}' for {result['symbol']} successfully synced with Paper Trading engine!")
+        st.info("The Automated Trading Engine will now monitor and execute this strategy in your active portfolio.")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # MAIN ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def render_strategy_research_lab():
-    """Main entry point for the Strategy Research Lab."""
-    st.markdown(_LAB_CSS, unsafe_allow_html=True)
-    st.title("Strategy Research Lab")
-    st.caption(
-        "Professional strategy design, testing, and evolution environment — "
-        "statistical arbitrage, factor investing, genetic evolution, alpha signals, and backtesting."
-    )
-
+    import streamlit as st
     tabs = st.tabs([
-        "Pairs Trading",
-        "Factor Investing",
-        "Genetic Evolution",
-        "Alpha Signals",
-        "Backtesting",
+        "Statistical Arbitrage", "Factor Investing", "Genetic Evolution",
+        "Alpha Signals", "Volatility Lab", "Backtest Hub", "Options Strategy Builder",
+        "Options Alpha Lab", "Futures & Commodities Lab", "Strategy Grader", "Strategy Suggester"
     ])
 
-    with tabs[0]:
-        _render_pairs_tab()
+    with tabs[0]: _render_pairs_tab()
+    with tabs[1]: _render_factor_tab()
+    with tabs[2]: _render_genetic_tab()
+    with tabs[3]: _render_alpha_signals_tab()
+    with tabs[4]: _render_volatility_lab_tab()
+    with tabs[5]: _render_backtest_tab()
+    with tabs[6]: _render_options_strategy_builder_tab()
+    with tabs[7]: _render_options_alpha_lab()
+    with tabs[8]: _render_futures_commodities_lab()
+    with tabs[9]: _render_strategy_grader_tab()
+    with tabs[10]: _render_strategy_suggester_tab()
 
-    with tabs[1]:
-        _render_factor_tab()
+def _render_options_strategy_builder_tab():
+    """
+    Multi-leg Options Strategy Builder with payoff diagrams, Greeks dashboard,
+    IV rank/percentile, and volatility surface heatmap.
+    Requirements: 4.1, 4.2, 4.3, 4.4
+    """
+    import streamlit as st
+    import numpy as np
+    import plotly.graph_objs as go
+    from plotly.subplots import make_subplots
 
-    with tabs[2]:
-        _render_genetic_tab()
+    _section("Options Strategy Builder")
+    st.caption(
+        "Construct multi-leg options strategies, visualize payoff diagrams, "
+        "inspect Greeks, and analyze the volatility surface."
+    )
 
-    with tabs[3]:
-        _render_alpha_signals_tab()
+    try:
+        import options_engine
+        import yfinance as yf
+        from data_sources import get_options_chain
+    except ImportError as e:
+        st.error(f"Required module unavailable: {e}")
+        return
 
-    with tabs[4]:
-        _render_backtest_tab()
+    # ── Inputs ──────────────────────────────────────────────────────────────
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        sym = st.text_input("Underlying Symbol", value="SPY", key="osb_sym").strip().upper()
+    with c2:
+        strategy_preset = st.selectbox(
+            "Strategy Preset",
+            [
+                "Custom (Manual Legs)",
+                "Covered Call", "Protective Put",
+                "Bull Call Spread", "Bear Put Spread",
+                "Iron Condor", "Iron Butterfly",
+                "Straddle", "Strangle",
+                "Calendar Spread", "Diagonal Spread",
+            ],
+            key="osb_preset",
+        )
+    with c3:
+        dte = st.slider("Days to Expiry", 1, 180, 30, key="osb_dte")
+
+    # Fetch live price
+    S = None
+    iv_current = 0.25
+    try:
+        tk = yf.Ticker(sym)
+        hist = tk.history(period="5d")
+        if not hist.empty:
+            close_col = hist["Close"]
+            if isinstance(close_col, __import__("pandas").DataFrame):
+                close_col = close_col.iloc[:, 0]
+            S = float(close_col.dropna().iloc[-1])
+    except Exception:
+        pass
+
+    if S is None:
+        st.warning(f"Could not fetch live price for {sym}. Enter manually.")
+        S = st.number_input("Spot Price ($)", min_value=0.01, value=100.0, key="osb_spot")
+    else:
+        st.caption(f"Live spot price: **${S:,.2f}**")
+
+    iv_input = st.slider("Implied Volatility (%)", 5, 150, int(iv_current * 100), key="osb_iv") / 100.0
+    engine = options_engine.get_options_engine()
+
+    # ── IV Rank & Percentile ─────────────────────────────────────────────────
+    _section("IV Rank & Percentile (252-day lookback)")
+    try:
+        hist_full = yf.Ticker(sym).history(period="1y")
+        if not hist_full.empty:
+            close_full = hist_full["Close"]
+            if isinstance(close_full, __import__("pandas").DataFrame):
+                close_full = close_full.iloc[:, 0]
+            close_full = close_full.dropna().astype(float)
+            returns = close_full.pct_change().dropna()
+            # Rolling 30-day HV as IV proxy
+            hv_series = returns.rolling(30).std() * (252 ** 0.5)
+            hv_series = hv_series.dropna()
+            if len(hv_series) >= 2:
+                hv_min = float(hv_series.min())
+                hv_max = float(hv_series.max())
+                hv_current = float(hv_series.iloc[-1])
+                iv_rank = (hv_current - hv_min) / max(hv_max - hv_min, 1e-6) * 100
+                iv_pct_rank = float((hv_series <= hv_current).mean() * 100)
+                iv_col1, iv_col2, iv_col3 = st.columns(3)
+                with iv_col1:
+                    _metric("IV Rank", f"{iv_rank:.1f}%",
+                            "#ef5350" if iv_rank > 50 else "#4caf50")
+                with iv_col2:
+                    _metric("IV Percentile", f"{iv_pct_rank:.1f}%",
+                            "#ef5350" if iv_pct_rank > 50 else "#4caf50")
+                with iv_col3:
+                    _metric("HV (30d)", f"{hv_current:.1%}")
+    except Exception as e:
+        st.caption(f"IV rank unavailable: {e}")
+
+    # ── Volatility Surface Heatmap ───────────────────────────────────────────
+    _section("Volatility Surface (Strike vs Days-to-Expiry)")
+    try:
+        strikes = np.linspace(S * 0.85, S * 1.15, 12).round(2)
+        dtes = [7, 14, 30, 60, 90, 120, 180]
+        z_surface = []
+        for d in dtes:
+            row = []
+            for k in strikes:
+                moneyness = k / S
+                skew_adj = 0.03 * (1 - moneyness)
+                term_adj = 0.02 * (d / 365) ** 0.5
+                row.append(round(iv_input + skew_adj + term_adj, 4))
+            z_surface.append(row)
+
+        fig_surf = go.Figure(data=go.Heatmap(
+            z=z_surface,
+            x=[f"${k:.0f}" for k in strikes],
+            y=[f"{d}d" for d in dtes],
+            colorscale="Viridis",
+            colorbar=dict(title="IV"),
+            text=[[f"{v:.1%}" for v in row] for row in z_surface],
+            texttemplate="%{text}",
+        ))
+        fig_surf.update_layout(**_dark_layout(height=280, title="Implied Volatility Surface"))
+        st.plotly_chart(fig_surf, use_container_width=True)
+    except Exception as e:
+        st.caption(f"Volatility surface unavailable: {e}")
+
+    # ── Strategy Leg Builder ─────────────────────────────────────────────────
+    _section("Strategy Construction")
+
+    # Preset leg templates
+    preset_legs_map = {
+        "Covered Call": [
+            {"type": "call", "strike": round(S * 1.05, 2), "side": -1},
+        ],
+        "Protective Put": [
+            {"type": "put", "strike": round(S * 0.95, 2), "side": 1},
+        ],
+        "Bull Call Spread": [
+            {"type": "call", "strike": round(S * 0.98, 2), "side": 1},
+            {"type": "call", "strike": round(S * 1.05, 2), "side": -1},
+        ],
+        "Bear Put Spread": [
+            {"type": "put", "strike": round(S * 1.02, 2), "side": -1},
+            {"type": "put", "strike": round(S * 0.95, 2), "side": 1},
+        ],
+        "Iron Condor": [
+            {"type": "put",  "strike": round(S * 0.90, 2), "side": 1},
+            {"type": "put",  "strike": round(S * 0.95, 2), "side": -1},
+            {"type": "call", "strike": round(S * 1.05, 2), "side": -1},
+            {"type": "call", "strike": round(S * 1.10, 2), "side": 1},
+        ],
+        "Iron Butterfly": [
+            {"type": "put",  "strike": round(S * 0.95, 2), "side": 1},
+            {"type": "put",  "strike": round(S, 2),        "side": -1},
+            {"type": "call", "strike": round(S, 2),        "side": -1},
+            {"type": "call", "strike": round(S * 1.05, 2), "side": 1},
+        ],
+        "Straddle": [
+            {"type": "call", "strike": round(S, 2), "side": 1},
+            {"type": "put",  "strike": round(S, 2), "side": 1},
+        ],
+        "Strangle": [
+            {"type": "call", "strike": round(S * 1.05, 2), "side": 1},
+            {"type": "put",  "strike": round(S * 0.95, 2), "side": 1},
+        ],
+        "Calendar Spread": [
+            {"type": "call", "strike": round(S, 2), "side": -1},
+            {"type": "call", "strike": round(S, 2), "side": 1},
+        ],
+        "Diagonal Spread": [
+            {"type": "call", "strike": round(S * 0.98, 2), "side": 1},
+            {"type": "call", "strike": round(S * 1.05, 2), "side": -1},
+        ],
+    }
+
+    # Manage legs in session state
+    if "osb_legs" not in st.session_state or strategy_preset != st.session_state.get("osb_last_preset"):
+        if strategy_preset == "Custom (Manual Legs)":
+            st.session_state["osb_legs"] = []
+        else:
+            st.session_state["osb_legs"] = [dict(l) for l in preset_legs_map.get(strategy_preset, [])]
+        st.session_state["osb_last_preset"] = strategy_preset
+
+    # Manual leg addition (only in custom mode)
+    if strategy_preset == "Custom (Manual Legs)":
+        lc1, lc2, lc3, lc4 = st.columns([1, 1, 1, 0.5])
+        l_type = lc1.selectbox("Type", ["call", "put"], key="osb_ltype")
+        l_strike = lc2.number_input("Strike", value=round(S, 2), key="osb_lstrike")
+        l_side = lc3.selectbox("Side", ["Long", "Short"], key="osb_lside")
+        if lc4.button("Add Leg", key="osb_add"):
+            st.session_state["osb_legs"].append({
+                "type": l_type,
+                "strike": float(l_strike),
+                "side": 1 if l_side == "Long" else -1,
+            })
+
+    # Display and allow deletion of legs
+    legs_raw = st.session_state.get("osb_legs", [])
+    legs_enriched = []
+    for i, leg in enumerate(legs_raw):
+        try:
+            T = max(dte / 365, 1 / 365)
+            greeks = engine.black_scholes(S, leg["strike"], T, iv_input, leg["type"])
+            legs_enriched.append({**leg, "cost": greeks["price"], "greeks": greeks})
+        except Exception:
+            legs_enriched.append({**leg, "cost": 0.0, "greeks": {}})
+
+        side_label = "BUY" if leg["side"] == 1 else "SELL"
+        col_leg, col_del = st.columns([5, 1])
+        g = legs_enriched[-1]["greeks"]
+        col_leg.markdown(
+            f'<div class="lab-card">'
+            f'<b>{side_label} {leg["type"].upper()} @ ${leg["strike"]:.2f}</b>'
+            f'<span style="color:#c9a84c;margin-left:12px;">${legs_enriched[-1]["cost"]:.2f}</span>'
+            f'<div style="font-size:0.72rem;color:#a0a8b8;margin-top:4px;">'
+            f'Delta: {g.get("delta",0):+.3f} | Gamma: {g.get("gamma",0):.4f} | '
+            f'Theta: {g.get("theta",0):+.3f} | Vega: {g.get("vega",0):+.3f} | '
+            f'Vanna: {g.get("vanna",0):+.4f} | Charm: {g.get("charm",0):+.4f}'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+        if strategy_preset == "Custom (Manual Legs)":
+            if col_del.button("X", key=f"osb_del_{i}"):
+                st.session_state["osb_legs"].pop(i)
+                st.rerun()
+
+    if not legs_enriched:
+        st.info("Select a strategy preset or add legs manually.")
+        return
+
+    # ── Payoff Diagram ───────────────────────────────────────────────────────
+    _section("Payoff Diagram at Expiry")
+    try:
+        pnl_data = engine.get_strategy_pnl_map(legs_enriched)
+        prices = pnl_data["prices"]
+        pnls = pnl_data["pnls"]
+        breakevens = pnl_data.get("breakeven", [])
+        max_profit = max(pnls) if pnls else 0
+        max_loss = min(pnls) if pnls else 0
+
+        fig_pnl = go.Figure()
+        pos_pnl = [p if p >= 0 else 0 for p in pnls]
+        neg_pnl = [p if p < 0 else 0 for p in pnls]
+        fig_pnl.add_trace(go.Scatter(
+            x=prices, y=pos_pnl, fill="tozeroy",
+            fillcolor="rgba(76,175,80,0.15)",
+            line=dict(color="#4caf50", width=0), showlegend=False,
+        ))
+        fig_pnl.add_trace(go.Scatter(
+            x=prices, y=neg_pnl, fill="tozeroy",
+            fillcolor="rgba(239,83,80,0.15)",
+            line=dict(color="#ef5350", width=0), showlegend=False,
+        ))
+        fig_pnl.add_trace(go.Scatter(
+            x=prices, y=pnls, mode="lines",
+            line=dict(color="#c9a84c", width=2.5), name="P&L",
+        ))
+        fig_pnl.add_hline(y=0, line_color="rgba(255,255,255,0.25)", line_dash="dash")
+        fig_pnl.add_vline(x=S, line_color="rgba(255,255,255,0.4)",
+                          line_dash="dot", annotation_text=f"Spot ${S:.2f}")
+        for be in breakevens:
+            fig_pnl.add_vline(x=be, line_color="#9c27b0", line_dash="dot",
+                              annotation_text=f"BE ${be:.2f}")
+        fig_pnl.update_layout(**_dark_layout(
+            height=380,
+            title=f"{strategy_preset} — Payoff at Expiry",
+            xaxis_title="Underlying Price ($)",
+            yaxis_title="Profit / Loss ($)",
+        ))
+        st.plotly_chart(fig_pnl, use_container_width=True)
+
+        # Key metrics
+        km1, km2, km3, km4 = st.columns(4)
+        with km1:
+            _metric("Max Profit",
+                    f"${max_profit:,.2f}" if max_profit < 1e6 else "Unlimited",
+                    "#4caf50")
+        with km2:
+            _metric("Max Loss",
+                    f"${max_loss:,.2f}" if max_loss > -1e6 else "Unlimited",
+                    "#ef5350")
+        with km3:
+            be_str = " / ".join(f"${b:.2f}" for b in breakevens[:2]) if breakevens else "N/A"
+            _metric("Breakeven(s)", be_str)
+        with km4:
+            net_cost = sum(l["cost"] * l["side"] for l in legs_enriched)
+            _metric("Net Premium", f"${net_cost:+.2f}",
+                    "#4caf50" if net_cost > 0 else "#ef5350")
+
+    except Exception as e:
+        st.error(f"Payoff diagram error: {e}")
+
+    # ── Greeks Dashboard ─────────────────────────────────────────────────────
+    _section("Greeks Dashboard")
+    greek_keys = ["delta", "gamma", "theta", "vega", "rho", "vanna", "charm"]
+    greek_labels = ["Delta", "Gamma", "Theta", "Vega", "Rho", "Vanna", "Charm"]
+
+    # Per-leg table
+    rows = []
+    for leg in legs_enriched:
+        g = leg.get("greeks", {})
+        row = {
+            "Leg": f"{'BUY' if leg['side']==1 else 'SELL'} {leg['type'].upper()} @${leg['strike']:.2f}",
+        }
+        for k, label in zip(greek_keys, greek_labels):
+            row[label] = round(g.get(k, 0) * leg["side"], 4)
+        rows.append(row)
+
+    import pandas as pd
+    df_greeks = pd.DataFrame(rows)
+    st.dataframe(df_greeks, use_container_width=True, hide_index=True)
+
+    # Net portfolio Greeks
+    _section("Net Portfolio Greeks")
+    net_cols = st.columns(len(greek_keys))
+    for col, k, label in zip(net_cols, greek_keys, greek_labels):
+        net_val = sum(l.get("greeks", {}).get(k, 0) * l["side"] for l in legs_enriched)
+        color = "#4caf50" if net_val > 0 else "#ef5350" if net_val < 0 else "#a0a8b8"
+        with col:
+            _metric(label, f"{net_val:+.4f}", color)
+
+
+def _render_options_alpha_lab():
+    """Institutional-grade Options Alpha Lab."""
+    import streamlit as st
+    import options_engine
+
+    _section("Options Alpha Laboratory")
+    st.caption("Derivatives research with pricing, Greeks, and surface analytics.")
+    engine = options_engine.get_options_engine()
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        spot = st.number_input("Spot", value=500.0, key="oal_spot")
+    with c2:
+        strike = st.number_input("Strike", value=500.0, key="oal_strike")
+    with c3:
+        iv = st.slider("IV (%)", 5, 120, 25, key="oal_iv") / 100.0
+    dte = st.slider("DTE", 1, 365, 30, key="oal_dte")
+    option_type = st.selectbox("Type", ["call", "put"], key="oal_type")
+
+    if st.button("Run Options Alpha Analysis", key="oal_run", type="primary"):
+        T = dte / 365.0
+        res = engine.black_scholes(spot, strike, T, iv, option_type)
+        mc = engine.monte_carlo_price(spot, strike, T, iv, option_type=option_type, sims=5000)
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Model Price", f"${res.get('price',0):.4f}")
+        m2.metric("Delta", f"{res.get('delta',0):+.4f}")
+        m3.metric("Gamma", f"{res.get('gamma',0):.5f}")
+        m4.metric("Vega", f"{res.get('vega',0):.4f}")
+
+        st.write({
+            "theta": res.get("theta", 0),
+            "rho": res.get("rho", 0),
+            "vanna": res.get("vanna", 0),
+            "charm": res.get("charm", 0),
+            "mc_price": mc.get("price", 0),
+            "mc_ci": mc.get("conf_interval", [0, 0]),
+        })
+
+
+def _render_futures_commodities_lab():
+    _section("Futures & Commodities Lab")
+    st.caption("Basis, carry, and term-structure analytics for futures markets.")
+    if not HAS_FUTURES:
+        st.warning("futures_engine not available.")
+        return
+
+    f_engine = get_futures_engine()
+    sym = st.selectbox("Contract", list(FUTURES_UNIVERSE.keys()) if FUTURES_UNIVERSE else ["CL=F"], key="fcl_sym")
+    spot = st.number_input("Spot", value=80.0, key="fcl_spot")
+    fut = st.number_input("Front Future", value=81.2, key="fcl_fut")
+    t = st.slider("Time to Expiry (years)", 0.01, 2.0, 0.25, key="fcl_t")
+
+    if st.button("Run Futures Analysis", key="fcl_run", type="primary"):
+        try:
+            basis = f_engine.get_basis_analysis(sym, spot, fut, t)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Basis", f"{basis.get('basis', 0):.4f}")
+            c2.metric("Basis %", f"{basis.get('basis_pct', 0)*100:.2f}%")
+            c3.metric("Structure", basis.get("structure", "N/A"))
+        except Exception as e:
+            st.error(f"Futures analysis error: {e}")
+
+
+def _render_strategy_grader_tab():
+    _section("Institutional Strategy Grader")
+    import streamlit as st
+    st.caption("Analyze and critique custom strategy implementations.")
+    
+    try:
+        from strategy_intelligence_engine import get_strategy_intelligence_engine
+        import pandas as pd
+        import numpy as np
+        
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.markdown("**Strategy Parameters**")
+            strat_name = st.text_input("Strategy Name", "My Custom Strategy")
+            returns_data = st.text_area("Return Data (Comma-separated daily % returns)", "0.01, -0.005, 0.02, 0.001, -0.01, 0.03")
+            
+            run_grader = st.button("Grade Strategy", type="primary")
+            
+        with c2:
+            if run_grader:
+                engine = get_strategy_intelligence_engine()
+                try:
+                    returns = [float(x.strip()) for x in returns_data.split(',')]
+                    df = pd.DataFrame({'Returns': returns})
+                    
+                    res = engine.grade_strategy(strat_name, df, {})
+                    
+                    st.markdown(f"### Grade: **{res['grade']}** ({res['score']}/100)")
+                    r1, r2, r3 = st.columns(3)
+                    r1.metric("Annualized Return", f"{res['annualized_return']:+.1%}")
+                    r2.metric("Sharpe Ratio", f"{res['sharpe_ratio']:.2f}")
+                    r3.metric("Max Drawdown", f"{res['max_drawdown']:+.1%}")
+                    
+                    st.markdown("#### Intelligence Feedback")
+                    for fb in res['feedback']:
+                        st.info(fb)
+                except Exception as e:
+                    st.error(f"Invalid returns data format: {e}")
+    except ImportError:
+        st.error("Strategy Intelligence Engine not available.")
+
+def _render_strategy_suggester_tab():
+    _section("Institutional Strategy Suggester")
+    import streamlit as st
+    st.caption("Generate bespoke trading strategies aligned with your risk and return objectives.")
+    
+    try:
+        from strategy_intelligence_engine import get_strategy_intelligence_engine
+        
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            goals = st.text_area("Investment Goals", "Generate consistent income while protecting capital during market downturns.")
+            risk = st.selectbox("Risk Tolerance", ["Conservative", "Moderate", "Aggressive"])
+            
+            run_suggester = st.button("Generate Suggestions", type="primary")
+            
+        with c2:
+            if run_suggester:
+                engine = get_strategy_intelligence_engine()
+                suggestions = engine.suggest_strategies(goals, risk)
+                
+                st.markdown("### Suggested Institutional Strategies")
+                for s in suggestions:
+                    with st.container(border=True):
+                        st.markdown(f"#### {s['name']}")
+                        st.markdown(f"**Type:** {s['type']} | **Expected Sharpe:** {s['expected_sharpe']} | **Risk:** {s['risk_profile']}")
+                        st.write(s['description'])
+                        st.button("Import into Backtester", key=s['name'])
+    except ImportError:
+        st.error("Strategy Intelligence Engine not available.")

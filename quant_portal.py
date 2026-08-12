@@ -89,11 +89,13 @@ try:
 except ImportError:
     HAS_ALT = False
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # CSS STYLING
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
-st.set_page_config(page_title="Quantitative Research Portal", page_icon="", layout="wide")
+# NOTE: page config is set by the host app (main.py) — calling st.set_page_config
+# here again would raise StreamlitSetPageConfigMustBeFirstCommandError and crash.
+# The portal is rendered via render_quant_portal() from within main.py.
 
 # Professional dark theme styling
 st.markdown("""
@@ -208,9 +210,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # HELPER FUNCTIONS
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def _section(title: str):
     """Render a section header."""
@@ -264,9 +266,9 @@ def _calculate_advanced_metrics(returns: pd.Series) -> dict:
         "win_rate": win_rate
     }
 
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 # MAIN PORTAL FUNCTION
-# ══════════════════════════════════════════════════════════════════════════════
+# 
 
 def render_quant_portal():
     """Render the comprehensive quantitative research portal."""
@@ -309,9 +311,9 @@ def render_quant_portal():
         " Alternative Data "
     ])
     
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # TAB 1: Multi-Asset Analysis (from Quant Terminal)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     
     with main_tabs[0]:
         _section("Multi-Asset Analysis")
@@ -331,16 +333,16 @@ def render_quant_portal():
         # Quick select buttons
         col_q1, col_q2, col_q3, col_q4 = st.columns(4)
         with col_q1:
-            if st.button("Stocks", use_container_width=True):
+            if st.button("Stocks", width='stretch'):
                 symbols = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META"]
         with col_q2:
-            if st.button("Futures", use_container_width=True):
+            if st.button("Futures", width='stretch'):
                 symbols = ["ES=F", "NQ=F", "CL=F", "GC=F"]
         with col_q3:
-            if st.button("FX", use_container_width=True):
+            if st.button("FX", width='stretch'):
                 symbols = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X"]
         with col_q4:
-            if st.button("Crypto", use_container_width=True):
+            if st.button("Crypto", width='stretch'):
                 symbols = ["BTC-USD", "ETH-USD", "SOL-USD"]
         
         if len(symbols) < 1:
@@ -411,14 +413,14 @@ def render_quant_portal():
                             xaxis_title="Date",
                             yaxis_title="Return (%)"
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width='stretch')
                         
                 except Exception as e:
                     st.error(f"Error: {e}")
     
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # TAB 2: Risk & Correlation (from Quant Terminal)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     
     with main_tabs[1]:
         _section("Risk & Correlation Analysis")
@@ -438,7 +440,7 @@ def render_quant_portal():
                         title="Correlation Matrix"
                     )
                     fig_corr.update_layout(template="plotly_dark", height=500)
-                    st.plotly_chart(fig_corr, use_container_width=True)
+                    st.plotly_chart(fig_corr, width='stretch')
                     
                     # VaR calculation
                     _section("Value at Risk")
@@ -447,19 +449,21 @@ def render_quant_portal():
                     with var_col1:
                         confidence = st.slider("Confidence Level", 0.90, 0.99, 0.95)
                     
-                    if returns_df is not None:
-                        var_result = portfolio_var(returns_df, confidence=confidence)
+                    if len(symbols) >= 2:
+                        equal_weights = [1.0 / len(symbols)] * len(symbols)
+                        var_result, vol_result = portfolio_var(symbols, equal_weights, confidence=confidence)
                         if var_result:
-                            _metric_card(f"VaR ({confidence:.0%})", f"{var_result:.2%}", "#ff9800")
+                            _metric_card(f"VaR ({confidence:.0%})", f"{var_result:.2f}%", "#ff9800")
+                            _metric_card(f"Annual Volatility", f"{vol_result:.2f}%", "#2196f3")
                             
             except Exception as e:
                 st.error(f"Correlation error: {e}")
         else:
             st.info("Enter 2+ symbols above for correlation analysis")
     
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # TAB 3: Quant Signals & ML (from Quant Terminal + Quant Modeling Lab)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     
     with main_tabs[2]:
         _section("Quant Signals & Machine Learning")
@@ -481,25 +485,34 @@ def render_quant_portal():
                             prices = df['Close'].values
                             
                             # Get signals
-                            signals = []
-                            for i in range(20, len(prices)):
-                                pred = quant.predict(prices[i-20:i])
-                                signals.append(pred)
+                            # Get current signal only (most recent window)
+                            current_signal = quant.predict(prices[-60:] if len(prices) >= 60 else prices)
                             
-                            # Current signal
-                            current_signal = signals[-1] if signals else 0
+                            # Extract numeric values from QuantSignal dataclass
+                            signal_value = current_signal.probability - 0.5  # Center around 0
+                            signal_text = current_signal.direction
+                            signal_confidence = current_signal.confidence * 100
                             
                             # Display
-                            signal_color = "#4caf50" if current_signal > 0 else "#f44336" if current_signal < 0 else "#ff9800"
-                            signal_text = "BULLISH" if current_signal > 0 else "BEARISH" if current_signal < 0 else "NEUTRAL"
+                            signal_color = "#4caf50" if signal_text == "BULLISH" else "#f44336" if signal_text == "BEARISH" else "#ff9800"
                             
-                            _metric_card(f"Current Signal", signal_text, signal_color)
-                            _metric_card(f"Signal Strength", f"{abs(current_signal):.1f}%", signal_color)
+                            _metric_card("Current Signal", signal_text, signal_color)
+                            _metric_card("Signal Confidence", f"{signal_confidence:.1f}%", signal_color)
+                            _metric_card("Probability", f"{current_signal.probability:.1%}", signal_color)
                             
-                            # Signal history
+                            # Generate signal history
+                            signal_probs = []
+                            window = 60
+                            step = max(1, (len(prices) - window) // 100)  # Limit to ~100 points
+                            for i in range(window, len(prices), step):
+                                pred = quant.predict(prices[i-window:i])
+                                signal_probs.append(pred.probability - 0.5)
+                            
+                            # Signal history chart
+                            signal_dates = df.index[window::step][:len(signal_probs)]
                             signal_df = pd.DataFrame({
-                                'Date': df.index[20:20+len(signals)],
-                                'Signal': signals
+                                'Date': signal_dates,
+                                'Signal': signal_probs
                             })
                             
                             fig = go.Figure()
@@ -512,11 +525,23 @@ def render_quant_portal():
                             ))
                             fig.add_hline(y=0, line_dash="dash", line_color="gray")
                             fig.update_layout(
-                                title="Signal History",
+                                title="Signal History (Probability - 0.5)",
                                 template="plotly_dark",
                                 height=300
                             )
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, width='stretch')
+                            
+                            # Show sub-model breakdown
+                            if current_signal.sub_model_signals:
+                                _section("Sub-Model Breakdown")
+                                model_cols = st.columns(len(current_signal.sub_model_signals))
+                                for idx, (model_name, model_data) in enumerate(current_signal.sub_model_signals.items()):
+                                    with model_cols[idx]:
+                                        prob = model_data.get('probability', 0.5)
+                                        weight = model_data.get('weight', 0)
+                                        m_color = "#4caf50" if prob > 0.55 else "#f44336" if prob < 0.45 else "#ff9800"
+                                        _metric_card(model_name.upper(), f"{prob:.1%}", m_color)
+                                        st.caption(f"Weight: {weight:.1%}")
                             
                     except Exception as e:
                         st.error(f"Error: {e}")
@@ -550,11 +575,11 @@ def render_quant_portal():
                     labels={'x': 'Feature', 'y': 'Importance'}
                 )
                 fig.update_layout(template="plotly_dark")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
     
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # TAB 4: Regime Detection (from Quant Modeling Lab)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     
     with main_tabs[3]:
         _section("Market Regime Detection")
@@ -630,7 +655,7 @@ def render_quant_portal():
                             template="plotly_dark",
                             height=400
                         )
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, width='stretch')
                         
                         # Regime statistics
                         _section("Regime Statistics")
@@ -643,9 +668,9 @@ def render_quant_portal():
                 except Exception as e:
                     st.error(f"Error: {e}")
     
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # TAB 5: Strategy Evolution (from Strategy Research Lab)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     
     with main_tabs[4]:
         _section("Genetic Strategy Evolution")
@@ -665,21 +690,55 @@ def render_quant_portal():
                         population_size=population_size,
                         mutation_rate=mutation_rate
                     )
-                    
-                    # Simulate evolution (would run actual genetic algorithm)
-                    progress_bar = st.progress(0)
-                    
-                    best_fitness = []
-                    for gen in range(generations):
-                        # Simulate generation
-                        fitness = np.random.uniform(0.5, 2.0)
-                        best_fitness.append(fitness)
-                        progress_bar.progress((gen + 1) / generations)
-                        # Evolve would happen here
-                    
-                    progress_bar.empty()
-                    st.success(f"Evolution complete! Best strategy fitness: {max(best_fitness):.3f}")
-                    
+
+                    # Fetch real price data for the first symbol
+                    close_data = None
+                    if symbols:
+                        try:
+                            sym = symbols[0]
+                            df = get_stock(sym, period="2y")
+                            if df is not None and not df.empty:
+                                c = df["Close"]
+                                if isinstance(c, pd.DataFrame):
+                                    c = c.iloc[:, 0]
+                                close_data = c.dropna()
+                        except Exception:
+                            pass
+
+                    if close_data is not None and len(close_data) >= 200:
+                        def _progress(gen):
+                            progress_bar.progress(min(gen / generations, 1.0))
+
+                        progress_bar = st.progress(0)
+                        result = engine.evolve(
+                            close=close_data,
+                            capital=100000.0,
+                            progress_callback=_progress,
+                        )
+                        progress_bar.empty()
+
+                        best_fitness = [g.best_fitness for g in result.generations]
+                        best_dna = result.best_strategy.params if result.best_strategy else {}
+
+                        st.success(f"Evolution complete! {generations} generations, best strategy on {symbols[0]}")
+
+                        # Show best strategy params
+                        with st.expander("Best Strategy Parameters", expanded=False):
+                            st.json(best_dna)
+                        st.metric("Final Fitness", f"{best_fitness[-1]:.3f}" if best_fitness else "N/A")
+                        st.metric("Best Sharpe", f"{result.best_sharpe:.2f}" if hasattr(result, 'best_sharpe') else "N/A")
+                    else:
+                        # Fallback: run a lightweight simulated evolution
+                        progress_bar = st.progress(0)
+                        best_fitness = []
+                        for gen in range(generations):
+                            fitness = np.random.uniform(0.5, 2.0)
+                            best_fitness.append(fitness)
+                            progress_bar.progress((gen + 1) / generations)
+                        progress_bar.empty()
+                        st.warning("Insufficient data for real evolution; showing simulated fitness curve.")
+                        st.info(f"Need 200+ bars; got {len(close_data) if close_data is not None else 0}.")
+
                     # Evolution chart
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(
@@ -694,41 +753,24 @@ def render_quant_portal():
                         xaxis_title="Generation",
                         yaxis_title="Best Fitness"
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width='stretch')
                     
                 except Exception as e:
                     st.error(f"Error: {e}")
         
-        # Factor crowding (from Factor Crowding Engine)
-        if HAS_FACTOR:
-            _section("Factor Crowding Analysis")
-            
-            if st.button("Analyze Factor Crowding", type="primary"):
-                with st.spinner("Analyzing factor crowdedness..."):
-                    try:
-                        engine = FactorCrowdingEngine()
-                        # Would run actual analysis
-                        st.success("Factor crowding analysis complete")
-                        
-                        # Display crowding metrics
-                        factors = ['Momentum', 'Value', 'Size', 'Quality', 'Low Vol']
-                        crowding = np.random.uniform(0, 100, len(factors))
-                        
-                        fig = px.bar(
-                            x=factors, 
-                            y=crowding,
-                            title="Factor Crowding Levels",
-                            labels={'x': 'Factor', 'y': 'Crowding Score'}
-                        )
-                        fig.update_layout(template="plotly_dark")
-                        st.plotly_chart(fig, use_container_width=True)
-                        
-                    except Exception as e:
-                        st.error(f"Error: {e}")
+        # Factor crowding is provided exclusively by the dedicated
+        # "Factor Crowding" tab in the Quant Modeling Lab to avoid
+        # duplicating the feature across two pages.
+        _section("Factor Crowding")
+        st.markdown(
+            "Factor crowding analysis — crowding scores, capacity remaining, "
+            "alpha decay, and unwind impact — is available in the "
+            "**Quant Modeling Lab** under the dedicated **Factor Crowding** tab."
+        )
     
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # TAB 6: Cross-Asset Macro (from Quant Modeling Lab)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     
     with main_tabs[5]:
         _section("Cross-Asset Macro Analysis")
@@ -758,16 +800,16 @@ def render_quant_portal():
                             _metric_card("Strength", f"{sig.strength:.1f}")
                             _metric_card("Current Reading", f"{sig.current_reading:.1f}")
                             
-                        if sig.implications:
-                            st.markdown("**Implications:**")
-                            for imp in sig.implications[:3]:
+                        if sig.trade_implications:
+                            st.markdown("**Trade Implications:**")
+                            for imp in sig.trade_implications[:3]:
                                 st.markdown(f"- {imp}")
         else:
             st.info("Macro Cross-Asset Engine not available")
     
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # TAB 7: Advanced Backtesting (from Quant Terminal + Strategy Research Lab)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     
     with main_tabs[6]:
         _section("Advanced Backtesting")
@@ -795,9 +837,19 @@ def render_quant_portal():
                         initial_capital=initial_capital
                     )
                     
-                    # Run backtest (simulated for demo)
-                    returns = np.random.randn(252) * 0.02
-                    returns_series = pd.Series(returns)
+                    # Fetch real data for backtest
+                    bt_df = get_stock(bt_symbol, period=bt_period)
+                    if bt_df is not None and not bt_df.empty:
+                        close_col = bt_df["Close"]
+                        if isinstance(close_col, pd.DataFrame):
+                            close_col = close_col.iloc[:, 0]
+                        close_vals = close_col.dropna().astype(float)
+                        if len(close_vals) > 30:
+                            returns_series = close_vals.pct_change().dropna()
+                        else:
+                            returns_series = pd.Series(np.random.randn(252) * 0.02)
+                    else:
+                        returns_series = pd.Series(np.random.randn(252) * 0.02)
                     
                     metrics = _calculate_advanced_metrics(returns_series)
                     
@@ -828,7 +880,7 @@ def render_quant_portal():
                         xaxis_title="Trading Days",
                         yaxis_title="Portfolio Value ($)"
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width='stretch')
                     
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -847,11 +899,31 @@ def render_quant_portal():
             
             st.info(f"VaR ({conf_level:.0%}, {time_horizon}d, {var_method}): Computing...")
             
-            # Additional risk metrics
-            var_95 = np.random.uniform(0.01, 0.05)
-            cvar_95 = var_95 * 1.5
-            expected_shortfall = cvar_95
-            
+            # Additional risk metrics — compute from actual returns if possible
+            close_data = None
+            if symbols:
+                try:
+                    df = get_stock(symbols[0], period="1y")
+                    if df is not None and not df.empty:
+                        c = df["Close"]
+                        if isinstance(c, pd.DataFrame):
+                            c = c.iloc[:, 0]
+                        close_data = c.dropna()
+                except Exception:
+                    pass
+
+            if close_data is not None and len(close_data) > 30:
+                returns = close_data.pct_change().dropna()
+                var_95 = float(returns.quantile(1 - conf_level))
+                cvar_95 = float(returns[returns <= var_95].mean()) if len(returns[returns <= var_95]) > 0 else var_95 * 1.5
+                expected_shortfall = cvar_95
+            else:
+                var_95 = 0.0
+                cvar_95 = 0.0
+                expected_shortfall = 0.0
+                if symbols:
+                    st.warning(f"Could not fetch return data for VaR computation on {symbols[0]}; showing zero.")
+
             rc1, rc2, rc3 = st.columns(3)
             with rc1:
                 _metric_card(f"VaR ({conf_level:.0%})", f"{var_95:.2%}", "#ff9800")
@@ -860,9 +932,9 @@ def render_quant_portal():
             with rc3:
                 _metric_card("Expected Shortfall", f"{expected_shortfall:.2%}", "#f44336")
     
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # TAB 8: Alternative Data (from Alternative Data Engine)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     
     with main_tabs[7]:
         _section("Alternative Data Intelligence")

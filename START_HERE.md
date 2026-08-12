@@ -1,10 +1,10 @@
-# 🚀 Octavian Market AI - Updated Version Ready
+# Octavian Market AI - Updated Version Ready
 
-## ✅ ALL CHANGES VERIFIED AND READY
+## ALL CHANGES VERIFIED AND READY
 
 Your system has been upgraded with the following features:
 
-### 🎯 New Features Implemented:
+### New Features Implemented:
 
 1. **Breaking Trades Tab**
    - High-confidence trade setups (>55% confidence)
@@ -27,13 +27,13 @@ Your system has been upgraded with the following features:
    - Daily loss limits
 
 4. **Fixed Issues**
-   - AdvancedBacktester now has `run()` method
+   - AdvancedBacktester now has `run()`method
    - Enhanced simulation grading
    - Integrated risk checks on all trades
 
 ---
 
-## 🎬 HOW TO START
+## HOW TO START
 
 ### Problem Identified:
 You had **2 Streamlit processes running simultaneously**, causing the old version to be served.
@@ -45,25 +45,22 @@ You had **2 Streamlit processes running simultaneously**, causing the old versio
 cd /Users/aavibharucha/Documents/market_ai
 ./start_streamlit.sh
 ```
-
 #### Option 2: Manual Start
 ```bash
 cd /Users/aavibharucha/Documents/market_ai
 
 # Kill any running Streamlit
 pkill -9 -f "streamlit run"
-
 # Clear caches
 rm -rf __pycache__ .streamlit/cache trading_system/__pycache__
-find . -name "*.pyc" -delete
+find . -name "*.pyc"-delete
 
 # Start fresh
 streamlit run main.py
 ```
-
 ---
 
-## 🔍 What You'll See
+## What You'll See
 
 ### In the Paper Trading Page:
 
@@ -86,7 +83,7 @@ streamlit run main.py
 
 ---
 
-## 📊 Using Breaking Trades
+## Using Breaking Trades
 
 1. Click on **"Breaking Trades"** tab
 2. Click **"Generate Breaking Trades"** button
@@ -101,42 +98,37 @@ streamlit run main.py
 
 ---
 
-## ✅ Verification
+## Verification
 
 Before starting, you can run:
 ```bash
 python3 test_before_start.py
 ```
-
 This will verify all changes are present (all 6 tests should pass).
 
 ---
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 ### If you still don't see changes:
 
-1. **Hard refresh browser**: `Ctrl+Shift+R` (Windows) or `Cmd+Shift+R` (Mac)
+1. **Hard refresh browser**: `Ctrl+Shift+R`(Windows) or `Cmd+Shift+R`(Mac)
 
 2. **Check browser cache**:
    - Open developer tools (F12)
    - Right-click reload button → "Empty Cache and Hard Reload"
-
 3. **Verify only one Streamlit is running**:
    ```bash
    ps aux | grep streamlit | grep -v grep
-   ```
-   Should show only ONE process.
+   ```   Should show only ONE process.
 
 4. **If multiple processes**, kill all:
    ```bash
-   pkill -9 -f "streamlit run"
-   ```
-   Then restart using the script above.
+   pkill -9 -f "streamlit run"   ```   Then restart using the script above.
 
 ---
 
-## 📝 Notes
+## Notes
 
 - **Forex pricing is correct** (verified EUR/USD ~$1.18, USD/JPY ~¥155)
 - All modules tested and working
@@ -145,11 +137,11 @@ This will verify all changes are present (all 6 tests should pass).
 
 ---
 
-## 🎉 You're Ready!
+## You're Ready!
 
 All changes are implemented and verified. Simply start Streamlit using the clean start script or manual method above, and navigate to **Paper Trading** to see your new features!
 
 ---
 
 **Created**: Feb 20, 2026
-**Status**: ✅ Ready for Production
+**Status**: Ready for Production

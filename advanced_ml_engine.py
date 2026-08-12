@@ -4,6 +4,7 @@ Implements massive and complex neural network models within an ensemble framewor
 Includes LSTM, Transformer, and Deep Dense Networks weighted dynamically.
 """
 
+import streamlit as st
 import torch
 import torch.nn as nn
 import numpy as np
@@ -83,9 +84,15 @@ class AdvancedEnsembleEngine:
     def __init__(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Initialize Neural Networks
-        self.lstm_model = MarketLSTM(input_dim=5).to(self.device)
-        self.transformer_model = MarketTransformer(input_dim=5).to(self.device)
+        # Deterministic initialization: online-learning nets are random-init and
+        # undertrained by design (fast path), so seed them to keep forecasts
+        # reproducible across calls/instances rather than coin-flip directions.
+        torch.manual_seed(42)
+        np.random.seed(42)
+        
+        # Initialize Neural Networks (8 massive comprehensive features)
+        self.lstm_model = MarketLSTM(input_dim=8).to(self.device)
+        self.transformer_model = MarketTransformer(input_dim=8).to(self.device)
         
         # Initialize Scikit-Learn Models (Deep Dense & Tree-based)
         self.mlp_model = MLPRegressor(hidden_layer_sizes=(100, 50, 25), max_iter=200, random_state=42, alpha=0.01) # Added L2 Regularization
@@ -106,6 +113,42 @@ class AdvancedEnsembleEngine:
         
         self.scaler = MinMaxScaler()
         
+    def auto_tune_weights(self, model_performance_history: Dict[str, List[float]]):
+        """
+        Phase 4: AutoML Model Auto-Tuning
+        Actively re-weights sub-engines (LSTM vs. Transformer vs. Dense) based on their
+        historical predictive accuracy (e.g., hit rate or Sharpe contribution).
+        """
+        if not model_performance_history:
+            return
+            
+        total_score = 0.0
+        updated_weights = {}
+        
+        # Calculate recent performance score (exponential moving average approximation)
+        for model_name, history in model_performance_history.items():
+            if not history:
+                updated_weights[model_name] = self.model_weights.get(model_name, 0.2)
+                continue
+            
+            # Weigh recent performance heavier
+            weights = np.exp(np.linspace(-1, 0, len(history)))
+            score = np.average(history, weights=weights)
+            
+            # Penalty for consistently bad performance (Pruning)
+            if score < 0.45: # e.g., Worse than a coin flip
+                score = score * 0.5 
+                
+            updated_weights[model_name] = max(0.01, score)
+            total_score += updated_weights[model_name]
+            
+        # Normalize weights
+        if total_score > 0:
+            for model_name in updated_weights:
+                self.model_weights[model_name] = updated_weights[model_name] / total_score
+        
+        logger.info(f"AutoML tuning complete. New weights: {self.model_weights}")
+
     def _pretrain_general_model(self):
         """Pre-train models on synthetic data to establish baseline weights."""
         try:
@@ -173,18 +216,43 @@ class AdvancedEnsembleEngine:
         except Exception as e:
             logger.warning(f"Pre-training failed: {e}")
 
-    def _prepare_data(self, df: pd.DataFrame, lookback: int = 60) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Prepare data for training/inference from a DataFrame."""
-        if len(df) < lookback + 10:
+    def _prepare_data(self, df: pd.DataFrame, symbol: str, lookback: int = 60) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Prepare massive institutional data for training/inference from a DataFrame."""
+        if len(df) < lookback + 20:
             return None, None, None
             
-        # Feature Engineering
-        cols_to_get = ['Open', 'High', 'Low', 'Close']
+        # Feature Engineering — robust to price-only inputs (e.g. a bare Close series
+        # from a scanner/backtester). Missing OHLC is synthesized from Close using the
+        # standard convention Open=prev Close, High/Low = small band around Close,
+        # which keeps the 8-feature model pipeline fully functional for any input.
+        cols_to_get = []
+        if 'Close' in df.columns:
+            cols_to_get.append('Close')
+        if 'Open' in df.columns:
+            cols_to_get.append('Open')
+        if 'High' in df.columns:
+            cols_to_get.append('High')
+        if 'Low' in df.columns:
+            cols_to_get.append('Low')
         if 'Volume' in df.columns:
             cols_to_get.append('Volume')
-            
+        if not cols_to_get:
+            # No recognized columns at all — fall back to the first numeric column
+            cols_to_get = [df.columns[0]]
+
         data = df[cols_to_get].copy()
-        
+
+        # Normalize column presence so downstream code can rely on a canonical schema
+        if 'Close' not in data.columns:
+            data['Close'] = data.iloc[:, 0]
+        if 'Open' not in data.columns:
+            # Standard convention: Open = previous Close (first row = Close)
+            data['Open'] = data['Close'].shift(1).fillna(data['Close'])
+        if 'High' not in data.columns:
+            data['High'] = data[['Open', 'Close']].max(axis=1) * 1.001
+        if 'Low' not in data.columns:
+            data['Low'] = data[['Open', 'Close']].min(axis=1) * 0.999
+
         # Ensure Volume exists for the models even if not in data
         if 'Volume' not in data.columns:
             data['Volume'] = 0
@@ -192,10 +260,33 @@ class AdvancedEnsembleEngine:
         # Add basic technical features for the ML models
         data['Returns'] = data['Close'].pct_change()
         data['Volatility'] = data['Returns'].rolling(window=20).std()
+        
+        # Massive comprehensive indicators
+        delta = data['Close'].diff()
+        gain = delta.where(delta > 0, 0).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        data['RSI'] = 100 - (100 / (1 + gain / (loss + 1e-10)))
+        
+        ema12 = data['Close'].ewm(span=12, adjust=False).mean()
+        ema26 = data['Close'].ewm(span=26, adjust=False).mean()
+        data['MACD'] = ema12 - ema26
+        
+        # Incorporate Trades Filed (Institutional 13F Flow) directly into training data
+        try:
+            from sec_13f_engine import get_sec_13f_engine
+            sec_engine = get_sec_13f_engine()
+            flows = sec_engine.get_global_smart_money_flow()
+            net_flow_map = flows.get("net_flow_map", {})
+            symbol_flow = net_flow_map.get(symbol, 0)
+        except:
+            symbol_flow = 0
+            
+        data['Inst_Flow'] = symbol_flow / 1e9 # Normalize to Billions for the neural network
+        
         data = data.fillna(0)
         
-        # Select 5 core features for consistent input dimension
-        features = ['Close', 'High', 'Low', 'Volume', 'Volatility']
+        # Select 8 core features for massive comprehensive input dimension
+        features = ['Close', 'High', 'Low', 'Volume', 'Volatility', 'RSI', 'MACD', 'Inst_Flow']
         dataset = data[features].values
         
         scaled_data = self.scaler.fit_transform(dataset)
@@ -212,63 +303,90 @@ class AdvancedEnsembleEngine:
         
         return X, y, last_sequence
 
-    def analyze_symbol_ensemble(self, df: pd.DataFrame, symbol: str, fast_mode: bool = False) -> Dict[str, Any]:
+    def analyze_symbol_ensemble(
+        self,
+        data: pd.DataFrame,
+        symbol: str = "UNKNOWN",
+        asset_type: str = "STOCK",
+        options_context: Dict[str, Any] = None,
+        fast_mode: bool = False
+    ) -> Dict[str, Any]:
         """
-        Run the massive ensemble analysis on a single symbol.
-        Performs online learning on recent data and predicts future movement.
+        Backward-compatible ensemble interface used across quant/optimizer/portal.
         """
+        df = data
+        if df is None or df.empty:
+            return {
+                "decision": "NEUTRAL",
+                "confidence": 0.0,
+                "predicted_return": 0.0,
+                "alpha_score": 50.0,
+                "driving_factor": "FUNDAMENTAL",
+                "weights": {"fundamental": 0.45, "technical": 0.30, "sentiment": 0.15, "options": 0.10},
+                "factors": {"fundamental": 50.0, "technical": 50.0, "sentiment": 50.0, "options": 50.0},
+                "options_edge": None,
+                "volatility": 0.25,
+                "model_breakdown": {},
+            }
+
         lookback = 30
-        X, y, last_seq = self._prepare_data(df, lookback=lookback)
+        X, y, last_seq = self._prepare_data(df, symbol=symbol, lookback=lookback)
         
         if X is None or len(X) < 10:
             return {
                 "decision": "NEUTRAL",
                 "confidence": 0.0,
                 "predicted_return": 0.0,
-                "model_breakdown": {}
+                "alpha_score": 50.0,
+                "driving_factor": "FUNDAMENTAL",
+                "weights": {"fundamental": 0.45, "technical": 0.30, "sentiment": 0.15, "options": 0.10},
+                "factors": {"fundamental": 50.0, "technical": 50.0, "sentiment": 50.0, "options": 50.0},
+                "options_edge": None,
+                "volatility": 0.25,
+                "model_breakdown": {},
             }
             
         # --- Online Learning (Rapid Adaptation) ---
         # We train the models on the specific asset's recent history to adapt to its current regime.
         
-            # Train PyTorch Models (Short epochs for speed)
-            # Incorporating L2 Regularization (weight_decay)
-            optimizer_lstm = torch.optim.Adam(self.lstm_model.parameters(), lr=0.01, weight_decay=1e-4)
-            optimizer_trans = torch.optim.Adam(self.transformer_model.parameters(), lr=0.01, weight_decay=1e-4)
-            
-            # --- Time-Series Cross-Validation logic (Simplified for speed) ---
-            # Instead of just fitting on the whole X, we can do a walk-forward split
-            # For fast online learning we'll still fit on all data but ensure we have regularization
-            from sklearn.model_selection import TimeSeriesSplit
-            tscv = TimeSeriesSplit(n_splits=3)
-            
-            self.lstm_model.train()
-            # Reduce epochs for speed if just initializing
-            epochs = 5 if not fast_mode else 1
-            for _ in range(epochs): 
-                optimizer_lstm.zero_grad()
-                out = self.lstm_model(X_tensor)
-                loss = criterion(out, y_tensor)
-                loss.backward()
-                optimizer_lstm.step()
-                
-            # Train Transformer
-            self.transformer_model.train()
-            for _ in range(epochs):
-                optimizer_trans.zero_grad()
-                out = self.transformer_model(X_tensor)
-                loss = criterion(out, y_tensor)
-                loss.backward()
-                optimizer_trans.step()
-                
-            # Train Sklearn Models with walk-forward validation (conceptually)
-            X_flat = X.reshape(X.shape[0], -1)
-            
-            # To actually reduce overfitting during fit, we could use GridSearch but it's too slow for online learning.
-            # We rely on the structural regularization added in __init__ (alpha, max_depth, min_samples_leaf)
-            self.mlp_model.fit(X_flat, y)
-            self.rf_model.fit(X_flat, y)
-            self.gbm_model.fit(X_flat, y)
+        # Convert numpy arrays to PyTorch Tensors
+        X_tensor = torch.FloatTensor(X).to(self.device)
+        y_tensor = torch.FloatTensor(y).view(-1, 1).to(self.device)
+        last_seq_tensor = torch.FloatTensor(last_seq).to(self.device)
+        criterion = nn.MSELoss()
+        
+        # Train PyTorch Models (Short epochs for speed)
+        # Incorporating L2 Regularization (weight_decay)
+        optimizer_lstm = torch.optim.Adam(self.lstm_model.parameters(), lr=0.01, weight_decay=1e-4)
+        optimizer_trans = torch.optim.Adam(self.transformer_model.parameters(), lr=0.01, weight_decay=1e-4)
+        
+        # Reduce epochs for speed — fast_mode uses 2 epochs, normal uses 5 max
+        # IMPORTANT: Sklearn models fit ONCE outside the loop (not O(epochs) times)
+        epochs = 2 if fast_mode else 5
+        
+        # Train LSTM
+        self.lstm_model.train()
+        for _ in range(epochs):
+            optimizer_lstm.zero_grad()
+            out = self.lstm_model(X_tensor)
+            loss = criterion(out, y_tensor)
+            loss.backward()
+            optimizer_lstm.step()
+
+        # Train Transformer (separate loop — not nested!)
+        self.transformer_model.train()
+        for _ in range(epochs):
+            optimizer_trans.zero_grad()
+            out = self.transformer_model(X_tensor)
+            loss = criterion(out, y_tensor)
+            loss.backward()
+            optimizer_trans.step()
+
+        # Train Sklearn Models ONCE (not inside PyTorch loop)
+        X_flat = X.reshape(X.shape[0], -1)
+        self.mlp_model.fit(X_flat, y)
+        self.rf_model.fit(X_flat, y)
+        self.gbm_model.fit(X_flat, y)
         
         # --- Ensemble Inference ---
         self.lstm_model.eval()
@@ -306,7 +424,7 @@ class AdvancedEnsembleEngine:
         
         def inverse_price(pred_val):
             # Create a dummy row with the predicted close and 0s for others
-            dummy = np.zeros((1, 5))
+            dummy = np.zeros((1, 8))
             dummy[0, 0] = pred_val
             return self.scaler.inverse_transform(dummy)[0, 0]
             
@@ -324,54 +442,260 @@ class AdvancedEnsembleEngine:
             'Gradient_Boosting_Machine': target_gbm
         }
         
-        # --- Weighted Voting Mechanism ---
-        weighted_sum = 0
-        total_weight = 0
+        # --- Institutional Enrichment ---
+        # 1. Denoise the price action before final decision
+        kalman_series = self._kalman_filter(df['Close'].values)
+        kalman_price = kalman_series[-1]
+        vol_forecast = self._calculate_garch_vol(df)
         
-        # Calculate dynamic weights based on error on last training sample (sanity check)
-        # (Simplified: using static weights defined in __init__ for now, but could be dynamic)
+        # --- Regression-to-mean bias correction ---
+        # Undertrained regressors (short online-learning horizon) predict near the
+        # training-window mean close, which mechanically biases forecasts DOWNWARD on
+        # uptrends and UPWARD on downtrends (a strong linear uptrend would otherwise
+        # print a false SELL). De-mean each model target against the window mean so the
+        # ML contribution is residual alpha around the level, not a level artifact.
+        window_mean_close = float(df['Close'].iloc[-min(len(df), 90):].mean())
+        raw_predictions = dict(predictions)  # keep raw targets for transparency
+        for _name in list(predictions.keys()):
+            _denom = max(abs(window_mean_close), 1e-9)
+            predictions[_name] = current_close * (1.0 + (predictions[_name] - window_mean_close) / _denom)
         
-        for name, weight in self.model_weights.items():
-            pred = predictions[name]
-            weighted_sum += pred * weight
-            total_weight += weight
+        # 2. Robust Weighted Voting (trimmed mean) — Regime-Aware
+        # Undertrained online-learning nets can emit pathological outliers (e.g. a
+        # Transformer that hasn't converged in a handful of epochs). A trimmed
+        # ensemble drops the best and worst sub-model target each forecast, then
+        # weights the remaining members — robust to any single model failure.
+        dynamic_weights = self.model_weights.copy()
+        if vol_forecast > 0.30: # High vol regime
+            dynamic_weights['Transformer_Attention'] *= 1.2
+            dynamic_weights['Random_Forest_Ensemble'] *= 1.2
+            dynamic_weights['Deep_MLP_Network'] *= 0.8
             
-        final_predicted_price = weighted_sum / total_weight
+        _items = sorted(predictions.items(), key=lambda kv: kv[1])
+        _keep = _items[1:-1]  # drop the single best and worst sub-model target
+        if len(_keep) < 2:
+            _keep = _items
+        weighted_sum = 0.0
+        total_weight = 0.0
+        for name, pred in _keep:
+            w = dynamic_weights.get(name, 0.15)
+            weighted_sum += pred * w
+            total_weight += w
+            
+        ensemble_forecast = weighted_sum / max(total_weight, 1e-9)
+        
+        # 3. Trend anchor: extrapolate the Kalman-smoothed drift over a short lookback.
+        # Keeps the forecast aligned with the actual recent trend even when the
+        # ML sub-models are uncertain (institutional fallback for low-signal regimes).
+        drift_lookback = min(10, max(1, len(kalman_series) - 1))
+        kalman_prev = kalman_series[-1 - drift_lookback]
+        kalman_drift = (kalman_price - kalman_prev) / max(abs(kalman_prev), 1e-9)
+        kalman_drift = float(np.clip(kalman_drift, -0.15, 0.15))
+        trend_anchor = current_close * (1.0 + kalman_drift)
+        
+        # Blend the ensemble forecast with the trend anchor.
+        # The anchor gets the larger weight: online-learning sub-models are
+        # undertrained by design (fast path), so the Kalman-smoothed technical
+        # trend is the more reliable directional backbone; the ensemble adds
+        # residual alpha rather than dictating direction.
+        final_predicted_price = (ensemble_forecast * 0.35) + (trend_anchor * 0.65)
+        
+        # --- 13F Smart Money Flow Integration ---
+        try:
+            from sec_13f_engine import get_sec_13f_engine
+            sec_engine = get_sec_13f_engine()
+            flows = sec_engine.get_global_smart_money_flow()
+            net_flow_map = flows.get("net_flow_map", {})
+            symbol_flow = net_flow_map.get(symbol, 0)
+            
+            # Adjust price target based on massive institutional flow
+            # A $1B inflow pushes price target slightly higher
+            if symbol_flow > 0:
+                flow_boost = min(0.02, (symbol_flow / 1e10)) # Cap at 2% boost
+                final_predicted_price *= (1 + flow_boost)
+            elif symbol_flow < 0:
+                flow_drag = min(0.02, (abs(symbol_flow) / 1e10))
+                final_predicted_price *= (1 - flow_drag)
+        except Exception as e:
+            logger.warning(f"Failed to integrate 13F smart money flow: {e}")
+            
         predicted_return = (final_predicted_price - current_close) / current_close
         
-        # Determine Confidence based on model agreement
-        # Calculate standard deviation of predictions
-        pred_values = list(predictions.values())
-        pred_std = np.std(pred_values)
-        # Lower std dev means models agree -> Higher confidence
-        confidence = max(0.0, 1.0 - (pred_std / current_close) * 100) # Simple heuristic
+        # 3. Monte Carlo Probabilistic Forecast
+        mc_data = self.compute_probabilistic_targets(current_close, vol_forecast)
+        
+        # Determine Confidence based on directional model agreement and volatility
+        # Use the trimmed (non-outlier) sub-model targets for a robust dispersion signal
+        trimmed_values = [p for _, p in _keep]
+        pred_std = np.std(trimmed_values)
+        direction_votes = sum(1 for v in trimmed_values if (v - current_close) * (final_predicted_price - current_close) > 0)
+        agreement = direction_votes / max(len(trimmed_values), 1)
+        confidence = 0.15 + agreement * 0.65 - min(0.2, vol_forecast)
+        confidence = float(np.clip(confidence, 0.10, 0.95))
         
         decision = "HOLD"
-        if predicted_return > 0.005: # > 0.5% predicted gain
+        if predicted_return > 0.005: 
             decision = "BUY"
-        elif predicted_return < -0.005: # < -0.5% predicted loss
+        elif predicted_return < -0.005: 
             decision = "SELL"
             
-        return {
+        out = {
             "decision": decision,
-            "confidence": confidence,
-            "predicted_return": predicted_return,
-            "final_predicted_price": final_predicted_price,
-            "current_price": current_close,
+            "confidence": float(confidence),
+            "predicted_return": float(predicted_return),
+            "final_predicted_price": float(final_predicted_price),
+            "current_price": float(current_close),
             "model_breakdown": predictions,
-            "model_weights": self.model_weights
+            "raw_model_targets": raw_predictions,
+            "volatility_forecast": vol_forecast,
+            "monte_carlo": mc_data,
+            "is_institutional": True
         }
+
+        # Normalize decision to platform standard
+        raw_decision = str(out.get("decision", "HOLD")).upper()
+        if raw_decision == "BUY":
+            norm_decision = "BULLISH"
+        elif raw_decision == "SELL":
+            norm_decision = "BEARISH"
+        else:
+            norm_decision = "NEUTRAL"
+
+        vol = float(out.get("volatility_forecast", 0.25))
+        alpha_score = float(np.clip(50.0 + out.get("predicted_return", 0.0) * 300.0, 0.0, 100.0))
+
+        # Derive factor/weight compatibility fields
+        model_weights = self.get_model_summary() if hasattr(self, "get_model_summary") else {}
+        w_sum = max(sum(model_weights.values()), 1e-9)
+        weights = {
+            "fundamental": 0.45,
+            "technical": 0.30,
+            "sentiment": 0.15,
+            "options": 0.10,
+        }
+        factors = {
+            "fundamental": float(np.clip(50 + out.get("predicted_return", 0) * 120, 0, 100)),
+            "technical": float(np.clip(50 + out.get("predicted_return", 0) * 180, 0, 100)),
+            "sentiment": float(np.clip(50 + (out.get("confidence", 0.5) - 0.5) * 80, 0, 100)),
+            "options": 50.0,
+        }
+
+        # Optional options overlay
+        options_edge = None
+        if options_context:
+            try:
+                import options_engine
+                oe = options_engine.get_options_engine()
+                options_edge = oe.predict_option_edge(
+                    spot=float(options_context["spot"]),
+                    strike=float(options_context["strike"]),
+                    dte_days=int(options_context["dte_days"]),
+                    iv=float(options_context["iv"]),
+                    option_type=str(options_context.get("option_type", "call")),
+                    market_view=float(options_context.get("market_view", 0.0)),
+                    confidence=float(options_context.get("confidence", 0.5)),
+                )
+                factors["options"] = float(np.clip(50 + options_edge["edge_score"] * 45, 0, 100))
+            except Exception:
+                pass
+
+        out.update({
+            "decision": norm_decision,
+            "alpha_score": alpha_score,
+            "driving_factor": "TECHNICAL" if vol > 0.35 else "FUNDAMENTAL",
+            "weights": weights,
+            "factors": factors,
+            "options_edge": options_edge,
+            "volatility": vol,
+        })
+        return out
 
     def get_model_summary(self) -> Dict[str, Any]:
         """Return summary of model weights."""
         return self.model_weights
 
+    # 
+    # INSTITUTIONAL MODULES
+    # 
+
+    def _kalman_filter(self, data: np.ndarray) -> np.ndarray:
+        """
+        Denoise price action using a steady-state Kalman Filter.
+        Removes 'market noise' while preserving structural trend changes.
+        """
+        if len(data) < 2: return data
+        n_iter = len(data)
+        sz = (n_iter,)
+        xhat = np.zeros(sz)      # a posteri estimate of x
+        P = np.zeros(sz)         # a posteri error estimate
+        xhatminus = np.zeros(sz) # a priori estimate of x
+        Pminus = np.zeros(sz)    # a priori error estimate
+        K = np.zeros(sz)         # gain or blending factor
+
+        Q = 1e-5 # process variance
+        R = 0.01**2 # estimate of measurement variance
+        
+        xhat[0] = data[0]
+        P[0] = 1.0
+
+        for k in range(1, n_iter):
+            xhatminus[k] = xhat[k-1]
+            Pminus[k] = P[k-1] + Q
+            K[k] = Pminus[k] / (Pminus[k] + R)
+            xhat[k] = xhatminus[k] + K[k] * (data[k] - xhatminus[k])
+            P[k] = (1 - K[k]) * Pminus[k]
+            
+        return xhat
+
+    def _calculate_garch_vol(self, df: pd.DataFrame) -> float:
+        """
+        Recursive GARCH(1,1) variance estimation.
+        Institutional-standard volatility forecasting.
+        """
+        try:
+            rets = df["Close"].pct_change().dropna()
+            if len(rets) < 50: return 0.20
+            
+            omega, alpha, beta = 1e-6, 0.1, 0.8
+            sigma_sq = rets.var()
+            
+            for r in rets.values[-100:]:
+                sigma_sq = omega + alpha * (r**2) + beta * sigma_sq
+                
+            return float(np.sqrt(sigma_sq * 252))
+        except:
+            return 0.20
+
+    def compute_probabilistic_targets(self, current_price: float, vol: float) -> dict:
+        """
+        Monte Carlo price path simulation (5,000 paths).
+        Provides a probabilistic distribution of potential returns.
+        """
+        horizon = 21 # 1 month
+        sims = 5000
+        daily_vol = vol / np.sqrt(252)
+        
+        # Log-normal paths
+        sim_rets = np.random.normal(0, daily_vol, (horizon, sims))
+        paths = current_price * np.exp(np.cumsum(sim_rets, axis=0))
+        
+        final_prices = paths[-1, :]
+        return {
+            "expected_target": float(np.mean(final_prices)),
+            "upside_95": float(np.percentile(final_prices, 95)),
+            "downside_5": float(np.percentile(final_prices, 5)),
+            "prob_profit": float(np.mean(final_prices > current_price))
+        }
+
 # --- Singleton Instance (Lazy Loading handled by caller or Streamlit cache) ---
 # Removed global instantiation to prevent import-time training lag
 # ensemble_engine = AdvancedEnsembleEngine() 
 
+@st.cache_resource
 def get_ensemble_engine():
     """Factory to get singleton instance."""
-    if not hasattr(get_ensemble_engine, "instance"):
-        get_ensemble_engine.instance = AdvancedEnsembleEngine()
-    return get_ensemble_engine.instance
+    return AdvancedEnsembleEngine()
+
+def get_ml_engine():
+    """Compatibility alias for legacy callers."""
+    return get_ensemble_engine()

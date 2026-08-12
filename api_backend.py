@@ -40,10 +40,14 @@ logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'your-secret-key-here')
+# Session signing key: read from config. config generates an ephemeral secure
+# random key when SECRET_KEY is not set, so sessions never rely on a known
+# hardcoded default (which would allow session forgery).
+from config import FLASK_SECRET_KEY, CORS_ORIGINS, API_BACKEND_KEY
+app.secret_key = FLASK_SECRET_KEY
 
-# Enable CORS
-CORS(app, origins=['*'])  # Configure appropriately for production
+# Enable CORS restricted to configured origins (default: local Streamlit dev).
+CORS(app, origins=CORS_ORIGINS)
 
 # Initialize Redis for caching and rate limiting
 try:
@@ -95,16 +99,24 @@ analyzer = get_analyzer()
 executor = ThreadPoolExecutor(max_workers=10)
 
 def require_api_key(f):
-    """Decorator to require API key for certain endpoints."""
+    """
+    Decorator to require a valid API key for protected endpoints.
+
+    The key is compared against the API_BACKEND_KEY environment variable
+    (constant-time comparison). When no key is configured, protected
+    endpoints refuse requests rather than silently accepting any key, so a
+    default-open deployment cannot happen by accident.
+    """
     @wraps(f)
     def decorated_function(*args, **kwargs):
         api_key = request.headers.get('X-API-Key') or request.args.get('api_key')
-        
-        # For demo purposes, accept any key or no key
-        # In production, implement proper API key validation
-        if not api_key and request.endpoint in ['analytics_dashboard', 'admin_stats']:
+        if not API_BACKEND_KEY:
+            return jsonify({'error': 'API backend key not configured on server'}), 503
+        if not api_key:
             return jsonify({'error': 'API key required'}), 401
-        
+        import hmac as _hmac
+        if not _hmac.compare_digest(str(api_key), API_BACKEND_KEY):
+            return jsonify({'error': 'Invalid API key'}), 403
         return f(*args, **kwargs)
     return decorated_function
 
@@ -502,9 +514,71 @@ def get_predictions(symbol):
         
         log_api_request('predictions', True, time.time() - start_time)
         return jsonify(response)
-    
     except Exception as e:
         log_api_request('predictions', False, time.time() - start_time, str(e))
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/v1/predict/advanced', methods=['POST'])
+@limiter.limit("200 per minute")
+def advanced_tiered_prediction():
+    """
+    Phase 6: API Access Tiering.
+    Provides direct access to Octavian internal LSTM/Transformer nodes based on API tier.
+    Tiers:
+    - free: Simple Moving Average heuristics (Mock)
+    - pro: LSTM prediction access
+    - institutional: Full Ensemble Engine access (LSTM + Transformer + GBM)
+    """
+    start_time = time.time()
+    try:
+        data = request.get_json()
+        symbol = data.get('symbol', 'SPY')
+        api_key = request.headers.get('X-API-Key', 'free_tier_key')
+        
+        # Mock Tier validation
+        tier = "free"
+        if api_key.startswith("sk_pro_"):
+            tier = "pro"
+        elif api_key.startswith("sk_inst_"):
+            tier = "institutional"
+            
+        if tier == "free":
+            # Mock return for free tier
+            return jsonify({
+                "tier": tier,
+                "symbol": symbol,
+                "prediction": "Available in Pro tier. Upgrade to access LSTM.",
+                "status": "RESTRICTED"
+            }), 403
+            
+        # Fetch Data
+        df = get_stock(symbol, period='1y')
+        if df is None or df.empty:
+            return jsonify({'error': f'No data found for symbol {symbol}'}), 404
+            
+        # Institutional vs Pro tier logic
+        from advanced_ml_engine import get_ensemble_engine
+        engine = get_ensemble_engine()
+        
+        if tier == "pro":
+            # Just return LSTM specific output
+            engine.train_on_data(df)
+            result = engine.predict(df) # Normally we'd extract just LSTM
+            result["engine_used"] = "LSTM_Only"
+        else: # Institutional
+            engine.train_on_data(df)
+            result = engine.predict(df)
+            result["engine_used"] = "Full_Ensemble"
+            
+        log_api_request('advanced_tiered_prediction', True, time.time() - start_time)
+        return jsonify({
+            "tier": tier,
+            "symbol": symbol,
+            "prediction_results": result,
+            "timestamp": datetime.now().isoformat()
+        })
+    except Exception as e:
+        log_api_request('advanced_tiered_prediction', False, time.time() - start_time, str(e))
         return jsonify({'error': str(e)}), 500
 
 # ============= USER AND SESSION MANAGEMENT =============

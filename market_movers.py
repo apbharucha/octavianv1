@@ -297,13 +297,9 @@ def _get_scan_universe() -> List[str]:
         universe = get_ticker_universe()
         return universe.get_random_sample(200)
     except Exception:
-        # Last-resort hardcoded list if ticker_universe itself fails
-        return [
-            "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA",
-            "JPM", "V", "JNJ", "WMT", "PG", "UNH", "HD", "MA",
-            "XOM", "CVX", "BAC", "PFE", "ABBV", "KO", "PEP", "MRK",
-            "AMD", "CRM", "ADBE", "NFLX", "PYPL", "COIN", "PLTR",
-        ]
+        # Universe unavailable — return empty so the caller degrades gracefully
+        # rather than presenting a fixed screening list as if it were the universe.
+        return []
 
 
 def _get_ticker_performance(symbol: str) -> Optional[Dict]:
@@ -574,7 +570,7 @@ def _calculate_technicals(df: pd.DataFrame) -> Dict:
         return {}
 
 
-def _generate_ai_insights(symbol: str, technicals: Dict, df: pd.DataFrame) -> Dict:
+def _generate_ai_insights(symbol: str, technicals: Dict, df: pd.DataFrame, asset_type: str = "Stock") -> Dict:
     """Generate AI-powered insights with weighted multi-factor probability model."""
     if not technicals:
         return {"signal": "NEUTRAL", "insights": [], "trade_ideas": [],
@@ -605,6 +601,69 @@ def _generate_ai_insights(symbol: str, technicals: Dict, df: pd.DataFrame) -> Di
     #  Weighted scoring: each factor contributes a continuous score 
     # Positive = bullish, negative = bearish, magnitude = conviction
     weighted_scores = []  # list of (score, weight) tuples
+
+    # MULTI-ASSET INTEGRATION
+    try:
+        from multi_asset_analyzer import MultiAssetAnalyzer
+        maa = MultiAssetAnalyzer()
+        
+        if asset_type.upper() == "FX":
+            fx_data = maa.analyze_fx_pair(symbol)
+            if 'carry_trade_analysis' in fx_data:
+                carry = fx_data['carry_trade_analysis']
+                if carry.get('recommendation') == 'FAVORABLE_CARRY_LONG':
+                    weighted_scores.append((0.5, 1.5))
+                    insights.append(f"Favorable carry trade ({carry.get('carry_differential', 0):.2f}% yield advantage) supporting longs")
+                    trade_ideas.append("Carry trade setup: hold long positions to collect swap yield")
+                elif carry.get('recommendation') == 'FAVORABLE_CARRY_SHORT':
+                    weighted_scores.append((-0.5, 1.5))
+                    insights.append(f"Unfavorable carry ({carry.get('carry_differential', 0):.2f}%) putting downward pressure")
+                    trade_ideas.append("Carry trade setup: short positions benefit from positive swap")
+            
+            if 'central_bank_analysis' in fx_data:
+                cb = fx_data['central_bank_analysis']
+                if cb.get('divergence_interpretation') == 'BASE_FAVORED':
+                    weighted_scores.append((0.4, 1.0))
+                    insights.append("Central bank policy divergence favors base currency")
+                elif cb.get('divergence_interpretation') == 'QUOTE_FAVORED':
+                    weighted_scores.append((-0.4, 1.0))
+                    insights.append("Central bank policy divergence favors quote currency")
+
+        elif asset_type.upper() == "FUTURES":
+            fut_data = maa.analyze_futures(symbol)
+            if 'curve_analysis' in fut_data:
+                curve = fut_data['curve_analysis']
+                if curve.get('structure') == 'BACKWARDATION':
+                    weighted_scores.append((0.4, 1.2))
+                    insights.append(f"Curve in backwardation (slope {curve.get('curve_slope_percent',0):.2f}%) indicating tight near-term supply")
+                    trade_ideas.append("Positive roll yield favors holding long positions")
+                elif curve.get('structure') == 'CONTANGO':
+                    weighted_scores.append((-0.3, 1.0))
+                    insights.append(f"Curve in contango (slope {curve.get('curve_slope_percent',0):.2f}%) indicating oversupply or carrying costs")
+                    trade_ideas.append("Negative roll yield creates headwind for long positions")
+                    
+            if 'seasonality' in fut_data:
+                season = fut_data['seasonality']
+                if season.get('seasonal_bias') == 'BULLISH':
+                    weighted_scores.append((0.3, 1.0))
+                    insights.append("Current month exhibits historically bullish seasonality")
+                elif season.get('seasonal_bias') == 'BEARISH':
+                    weighted_scores.append((-0.3, 1.0))
+                    insights.append("Current month exhibits historically bearish seasonality")
+
+        elif asset_type.upper() == "CRYPTO":
+            crypto_data = maa.analyze_crypto(symbol)
+            if 'volatility_regime' in crypto_data:
+                regime = crypto_data['volatility_regime']
+                vol = crypto_data.get('volatility_30d_annualized', 0)
+                if regime == 'EXTREME':
+                    insights.append(f"Extreme spot volatility regime ({vol:.0f}% annualized) — expect violent price action")
+                    trade_ideas.append("Use significantly wider stops and reduce position sizing")
+                elif regime == 'HIGH':
+                    insights.append(f"High spot volatility regime ({vol:.0f}% annualized)")
+
+    except Exception as e:
+        print(f"Multi-asset context error: {e}")
 
     # --- RSI (weight 2.0) — most reliable mean-reversion signal ---
     if rsi is not None:
@@ -1121,7 +1180,7 @@ def show_symbol_search():
     # Chart
     fig = _create_comprehensive_chart(search_symbol, df, technicals, selected_indicators)
     if fig:
-        st.plotly_chart(fig, use_container_width=True, key=f"search_chart_{search_symbol}_{period}")
+        st.plotly_chart(fig, width='stretch', key=f"search_chart_{search_symbol}_{period}")
     
     # AI Insights and Trade Ideas
     col_insights, col_trades = st.columns(2)
@@ -1200,18 +1259,3 @@ def show_symbol_search():
             f'<br><span style="color:#8b949e;">Bearish</span></div>',
             unsafe_allow_html=True
         )
-
-
-# 
-# MAIN DASHBOARD COMPONENT
-# 
-
-def show_market_intelligence():
-    """Main entry point for market movers and search dashboard."""
-    tabs = st.tabs(["Market Movers", "Symbol Search"])
-    
-    with tabs[0]:
-        show_market_movers()
-    
-    with tabs[1]:
-        show_symbol_search()

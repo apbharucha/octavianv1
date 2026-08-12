@@ -14,6 +14,7 @@ Author: AI Market Team
 import asyncio
 import websockets
 import json
+import random
 import threading
 import time
 from datetime import datetime, timedelta
@@ -55,7 +56,28 @@ class MarketEvent:
 
 class RealTimeDataService:
     """Real-time market data streaming and alert service."""
-    
+
+    @staticmethod
+    def _build_default_watchlist() -> Set[str]:
+        """Default monitored symbols drawn from the dynamic ticker universe.
+
+        A seeded, deterministic sample is used so the default set is stable
+        between restarts while still reflecting current universe coverage.
+        """
+        symbols: Set[str] = {"^VIX"}
+        try:
+            from ticker_universe import get_ticker_universe
+            u = get_ticker_universe()
+            rng = random.Random(7)
+            stocks = sorted(u.get_all_stocks())
+            symbols.update(rng.sample(stocks, min(8, len(stocks))))
+            symbols.update(sorted(u.get_etfs())[:5])
+            symbols.update(sorted(u.get_crypto())[:3])
+            symbols.update(sorted(u.get_forex())[:3])
+        except Exception:
+            pass
+        return symbols
+
     def __init__(self):
         self.db_manager = get_database_manager()
         self.chatbot = get_chatbot()
@@ -72,11 +94,8 @@ class RealTimeDataService:
         # Market data cache
         self.market_cache: Dict[str, Dict[str, Any]] = {}
         
-        # Watchlist of symbols to monitor
-        self.watchlist: Set[str] = {
-            'SPY', 'QQQ', 'IWM', 'VTI', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA',
-            'META', 'NFLX', 'BTC-USD', 'ETH-USD', 'EUR/USD', 'GBP/USD', '^VIX'
-        }
+        # Watchlist of symbols to monitor (drawn from the dynamic ticker universe)
+        self.watchlist: Set[str] = self._build_default_watchlist()
         
         # Event detection thresholds
         self.event_thresholds = {

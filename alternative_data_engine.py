@@ -22,9 +22,13 @@ Each signal returns:
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import os
 import random
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -32,7 +36,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-# ── Optional dependencies ─────────────────────────────────────────────────────
+#  Optional dependencies 
 try:
     import yfinance as yf
 
@@ -48,9 +52,9 @@ except ImportError:
     HAS_SCIPY = False
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Data Structures
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 @dataclass
@@ -95,9 +99,9 @@ class SocialSentimentSnapshot:
     platforms: dict[str, float]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Sector / Company Metadata Registry
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 SECTOR_MAP: dict[str, str] = {
     # Technology
@@ -299,9 +303,9 @@ ESG_CONTROVERSY_TICKERS = {
 }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Core Engine
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 class AlternativeDataEngine:
@@ -320,8 +324,17 @@ class AlternativeDataEngine:
         self._cache: dict[str, tuple[float, Any]] = {}
         self._cache_ttl = 300  # 5 minutes
         self.rng_seed_base = int(datetime.utcnow().strftime("%Y%m%d%H"))
+        self.massive_api_key = os.getenv("MASSIVE_API_KEY", "").strip()
+        if not self.massive_api_key:
+            try:
+                import streamlit as st
 
-    # ── Cache helpers ─────────────────────────────────────────────────────────
+                self.massive_api_key = str(st.secrets.get("MASSIVE_API_KEY", "")).strip()
+            except Exception:
+                self.massive_api_key = ""
+        self.massive_enabled = bool(self.massive_api_key)
+
+    #  Cache helpers 
 
     def _cache_get(self, key: str) -> Any | None:
         if key in self._cache:
@@ -333,20 +346,27 @@ class AlternativeDataEngine:
     def _cache_set(self, key: str, val: Any) -> None:
         self._cache[key] = (time.time(), val)
 
-    # ── Seeded deterministic RNG (reproducible within the same hour) ──────────
+    #  Seeded deterministic RNG (reproducible within the same hour) 
 
     def _rng(self, ticker: str, salt: str = "") -> np.random.Generator:
         seed_str = f"{self.rng_seed_base}:{ticker}:{salt}"
         seed = int(hashlib.md5(seed_str.encode()).hexdigest(), 16) % (2**32)
         return np.random.default_rng(seed)
 
-    # ── Price data fetch ──────────────────────────────────────────────────────
+    #  Price data fetch 
 
     def _get_close(self, ticker: str, period: str = "6mo") -> pd.Series | None:
         key = f"close:{ticker}:{period}"
         cached = self._cache_get(key)
         if cached is not None:
             return cached
+
+        # Prefer Massive.com (Polygon) when configured
+        if self.massive_enabled:
+            close_series = self._get_close_from_massive(ticker, period)
+            if close_series is not None and len(close_series) > 0:
+                self._cache_set(key, close_series)
+                return close_series
 
         if not HAS_YF:
             return None
@@ -370,6 +390,59 @@ class AlternativeDataEngine:
         except Exception:
             return None
 
+    def _get_close_from_massive(self, ticker: str, period: str = "6mo") -> pd.Series | None:
+        """Fetch daily close series from Massive.com (Polygon API-compatible endpoint)."""
+        if not self.massive_api_key:
+            return None
+
+        period_days_map = {
+            "1mo": 31,
+            "2mo": 62,
+            "3mo": 93,
+            "6mo": 186,
+            "1y": 366,
+        }
+        lookback_days = period_days_map.get(period, 186)
+        end_date = datetime.utcnow().date()
+        start_date = end_date - timedelta(days=lookback_days)
+
+        base_url = (
+            f"https://api.polygon.io/v2/aggs/ticker/{urllib.parse.quote(ticker)}/range/1/day/"
+            f"{start_date.isoformat()}/{end_date.isoformat()}"
+        )
+        params = {
+            "adjusted": "true",
+            "sort": "asc",
+            "limit": "5000",
+            "apiKey": self.massive_api_key,
+        }
+        url = f"{base_url}?{urllib.parse.urlencode(params)}"
+
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Octavian/1.0",
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            results = payload.get("results", [])
+            if not results:
+                return None
+            closes = pd.Series(
+                [float(row["c"]) for row in results if "c" in row and "t" in row],
+                index=pd.to_datetime(
+                    [int(row["t"]) for row in results if "c" in row and "t" in row], unit="ms"
+                ),
+                dtype="float64",
+            ).sort_index()
+            closes = closes.dropna()
+            return closes if not closes.empty else None
+        except Exception:
+            return None
+
     def _get_sector_etf(self, sector: str) -> str:
         mapping = {
             "Technology": "XLK",
@@ -390,9 +463,9 @@ class AlternativeDataEngine:
         }
         return mapping.get(sector, "SPY")
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 1. SATELLITE IMAGERY PROXY ENGINE
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def get_satellite_signals(self, ticker: str) -> list[AltDataSignal]:
         """
@@ -408,7 +481,7 @@ class AlternativeDataEngine:
         sector = SECTOR_MAP.get(ticker, "Unknown")
         month = datetime.utcnow().month
 
-        # ── Facility-specific satellite proxy ─────────────────────────────────
+        #  Facility-specific satellite proxy 
         if ticker in FACILITY_ACTIVITY_MAP:
             fac = FACILITY_ACTIVITY_MAP[ticker]
             base = fac["base_activity"]
@@ -445,7 +518,7 @@ class AlternativeDataEngine:
                 )
             )
 
-        # ── Shipping activity proxy ────────────────────────────────────────────
+        #  Shipping activity proxy 
         if sector in SHIPPING_PROXIES:
             ship = SHIPPING_PROXIES[sector]
             # Use sector ETF momentum as shipping proxy
@@ -507,7 +580,7 @@ class AlternativeDataEngine:
                     )
                 )
 
-        # ── Generic sector-level satellite (e.g., office occupancy via REITs) ──
+        #  Generic sector-level satellite (e.g., office occupancy via REITs) 
         if sector == "Real Estate" or ticker in ("AMT", "PLD", "SPG", "O"):
             occ = float(rng.uniform(0.70, 0.92))
             z = (occ - 0.82) / 0.08
@@ -532,9 +605,9 @@ class AlternativeDataEngine:
 
         return signals
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 2. SOCIAL MEDIA SENTIMENT ENGINE
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def get_social_sentiment(self, ticker: str) -> SocialSentimentSnapshot:
         """
@@ -672,9 +745,9 @@ class AlternativeDataEngine:
             },
         )
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 3. HIRING TREND ENGINE
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def get_hiring_signal(self, ticker: str) -> AltDataSignal:
         """
@@ -812,9 +885,9 @@ class AlternativeDataEngine:
         indices = rng.choice(len(cats), size=n, replace=False)
         return [cats[i] for i in sorted(indices)]
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 4. WEB TRAFFIC & SEARCH INTEREST ENGINE
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def get_web_traffic_signal(self, ticker: str) -> AltDataSignal:
         """
@@ -899,9 +972,9 @@ class AlternativeDataEngine:
             },
         )
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 5. CREDIT CARD SPENDING PROXY ENGINE
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def get_credit_card_signal(self, ticker: str) -> AltDataSignal | None:
         """
@@ -980,9 +1053,9 @@ class AlternativeDataEngine:
             },
         )
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 6. ESG MOMENTUM ENGINE
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def get_esg_signal(self, ticker: str) -> AltDataSignal:
         """
@@ -1053,9 +1126,9 @@ class AlternativeDataEngine:
             },
         )
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 7. DARK POOL ACTIVITY PROXY ENGINE
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def get_dark_pool_signal(self, ticker: str) -> AltDataSignal:
         """
@@ -1144,9 +1217,9 @@ class AlternativeDataEngine:
             },
         )
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 8. OPTIONS FLOW SENTIMENT ENGINE
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def get_options_flow_signal(self, ticker: str) -> AltDataSignal:
         """
@@ -1233,9 +1306,9 @@ class AlternativeDataEngine:
             },
         )
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 9. COMPOSITE SIGNAL AGGREGATOR
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def get_all_signals(self, ticker: str) -> list[AltDataSignal]:
         """
@@ -1351,13 +1424,16 @@ class AlternativeDataEngine:
             "bull_signals": bull,
             "bear_signals": bear,
             "total_signals": len(signals),
+            "vendor_integrations": {
+                "massive": "configured" if self.massive_enabled else "not_configured"
+            },
             "signals": signals,
         }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Singleton accessor
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 _engine_instance: AlternativeDataEngine | None = None
 

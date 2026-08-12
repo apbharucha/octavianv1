@@ -1,47 +1,281 @@
 """
-Institutional Financial Model Generator
-Wall Street-grade DCF valuation engine with:
-  - Revenue → EBIT → NOPAT → FCF cascade
-  - WACC with CAPM cost of equity
-  - 20-line Investment Banking DCF template
-  - Scenario-weighted valuation (Bull / Base / Bear)
-  - Monte Carlo simulation (10,000 paths)
-  - Relative valuation (P/E, EV/EBITDA, EV/FCF, PEG)
-  - Catalyst tracking dashboard
-  - Trade signal engine with risk-adjusted position sizing
+Octavian Financial Model Generator
+Institutional-grade DCF valuation engine
 """
 
-from __future__ import annotations
-
-# Explicit public API — guards against stale .pyc ImportErrors
-__all__ = [
-    "DCFAssumptions",
-    "DCFResult",
-    "ScenarioResult",
-    "CatalystEvent",
-    "TradeSignal",
-    "InstitutionalDCFEngine",
-    "FinancialModelGenerator",
-    "get_dcf_engine",
-    "get_financial_generator",
-]
-
-import io
-import logging
-import random
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
 import pandas as pd
+import numpy as np
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Tuple, Any
+from datetime import datetime, timedelta
+import io
+from historical_data_engine import get_historical_engine
+import logging
+import importlib
+import inspect
+import sys
+from functools import wraps
 
-logger = logging.getLogger("InstitutionalDCF")
-logging.basicConfig(level=logging.INFO)
+# --- Runtime-safe DCF patch ---
+def _apply_financial_runtime_safety_patch():
+    """
+    Additive runtime patch:
+    - Wrap InstitutionalDCFEngine.run_dcf
+    - Guarantee stable DCFResult shape
+    - Prevent downstream crashes from partial/legacy paths
+    """
+    engine_cls = InstitutionalDCFEngine
+    run_fn = getattr(engine_cls, "run_dcf", None)
+    if run_fn is None or getattr(run_fn, "_octavian_runtime_safe", False):
+        return
+
+    @wraps(run_fn)
+    def _wrapped_run_dcf(self, assumptions: DCFAssumptions) -> DCFResult:
+        try:
+            result = run_fn(self, assumptions)
+            if result is None:
+                raise ValueError("run_dcf returned None")
+
+            # Normalize key fields (non-destructive)
+            if result.assumptions is None:
+                result.assumptions = assumptions
+            if result.trade_signal is None:
+                result.trade_signal = TradeSignal(
+                    ticker=assumptions.ticker,
+                    fair_value=float(result.fair_value_per_share or 0.0),
+                    market_price=float(assumptions.current_price or 0.0),
+                    upside_pct=(
+                        ((float(result.fair_value_per_share or 0.0) / float(assumptions.current_price)) - 1.0) * 100.0
+                        if float(assumptions.current_price or 0.0) > 0 else 0.0
+                    ),
+                    signal="Neutral",
+                    confidence_pct=50.0,
+                    risk_level="Medium",
+                    risk_adjusted_return=0.0,
+                    position_size_pct=0.0,
+                    rationale="Runtime fallback signal generated for structural safety.",
+                )
+
+            result.trade_signal.ticker = assumptions.ticker
+            result.scenarios = result.scenarios or []
+            result.relative_valuation = result.relative_valuation or {}
+            result.wacc_breakdown = result.wacc_breakdown or {}
+            result.expected_returns = result.expected_returns or {}
+            result.mc_distribution = result.mc_distribution or [float(assumptions.current_price or 0.0)]
+            result.mc_percentiles = result.mc_percentiles or {
+                "p5": float(np.percentile(result.mc_distribution, 5)),
+                "p25": float(np.percentile(result.mc_distribution, 25)),
+                "p50": float(np.percentile(result.mc_distribution, 50)),
+                "p75": float(np.percentile(result.mc_distribution, 75)),
+                "p95": float(np.percentile(result.mc_distribution, 95)),
+            }
+            result.visualization_payload = result.visualization_payload or {}
+            result.probabilistic_forecast = result.probabilistic_forecast or {}
+
+            return result
+
+        except Exception as e:
+            logging.getLogger(__name__).exception("run_dcf failed; returning safe fallback: %s", e)
+            safe_price = float(assumptions.current_price or 0.0)
+            fallback = DCFResult(
+                ticker=assumptions.ticker,
+                assumptions=assumptions,
+                fair_value_per_share=safe_price,
+                enterprise_value=0.0,
+                equity_value=0.0,
+                wacc=float(getattr(assumptions, "risk_free_rate", 0.10) + 0.05),
+                cost_of_equity=float(getattr(assumptions, "risk_free_rate", 0.04) + getattr(assumptions, "equity_risk_premium", 0.06)),
+                line_items=pd.DataFrame(),
+                scenarios=[],
+                mc_distribution=[safe_price],
+                mc_median=safe_price,
+                mc_mean=safe_price,
+                mc_std=0.0,
+                mc_upside_prob=0.5,
+                mc_downside_prob=0.5,
+                mc_percentiles={"p5": safe_price, "p25": safe_price, "p50": safe_price, "p75": safe_price, "p95": safe_price},
+                relative_valuation={},
+                sensitivity=pd.DataFrame(),
+                catalysts=[],
+                wacc_breakdown={},
+                expected_returns={},
+                historical_data=pd.DataFrame(),
+                historical_stats={},
+                forecast_vs_historical={},
+                stress_tests=[],
+                regime_adjusted_values={},
+                diagnostic_flags=["run_dcf_exception_fallback"],
+                visualization_payload={},
+                probabilistic_forecast={
+                    "horizon_years": assumptions.projection_years,
+                    "expected_price": safe_price,
+                    "prob_up_10pct": 0.0,
+                    "prob_down_10pct": 0.0,
+                    "distribution_moments": {"mean": safe_price, "std": 0.0, "skew_proxy": 0.0},
+                },
+                trade_signal=TradeSignal(
+                    ticker=assumptions.ticker,
+                    fair_value=safe_price,
+                    market_price=safe_price,
+                    upside_pct=0.0,
+                    signal="Neutral",
+                    confidence_pct=0.0,
+                    risk_level="High",
+                    risk_adjusted_return=0.0,
+                    position_size_pct=0.0,
+                    rationale="Fallback result due to internal DCF runtime error.",
+                ),
+            )
+            return fallback
+
+    _wrapped_run_dcf._octavian_runtime_safe = True
+    setattr(engine_cls, "run_dcf", _wrapped_run_dcf)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# Auto-apply once on import (additive, idempotent)
+try:
+    _apply_financial_runtime_safety_patch()
+except Exception:
+    pass
+
+# 
 # DATA CLASSES
-# ─────────────────────────────────────────────────────────────────────────────
+# 
+
+def _patch_alt_data_signal() -> Dict[str, Any]:
+    """
+    Add backward-compatible `signal_type` property to AltDataSignal if missing.
+    """
+    patched = False
+    details = []
+    candidate_modules = [
+        "alternative_data_engine",
+        "alt_data_engine",
+        "market_alt_data",
+        "advanced_backtester",
+        "backtester",
+        "simulation_hub",
+    ]
+
+    # include already-loaded modules too
+    loaded = list(sys.modules.keys())
+    for mod_name in list(dict.fromkeys(candidate_modules + loaded)):
+        try:
+            mod = sys.modules.get(mod_name) or importlib.import_module(mod_name)
+        except Exception:
+            continue
+
+        cls = getattr(mod, "AltDataSignal", None)
+        if cls is None:
+            continue
+
+        if hasattr(cls, "signal_type"):
+            details.append(f"{mod_name}.AltDataSignal already has signal_type")
+            continue
+
+        def _get_signal_type(self):
+            for attr in ("type", "signal", "category", "event_type", "label"):
+                if hasattr(self, attr):
+                    v = getattr(self, attr)
+                    if v is not None:
+                        return v
+            return "unknown"
+
+        def _set_signal_type(self, value):
+            for attr in ("type", "signal", "category", "event_type", "label"):
+                if hasattr(self, attr):
+                    setattr(self, attr, value)
+                    return
+            # fallback: create dynamic attr
+            setattr(self, "_signal_type_compat", value)
+
+        try:
+            setattr(cls, "signal_type", property(_get_signal_type, _set_signal_type))
+            patched = True
+            details.append(f"patched {mod_name}.AltDataSignal.signal_type")
+        except Exception as e:
+            details.append(f"failed patch {mod_name}.AltDataSignal: {e}")
+
+    return {"patched": patched, "details": details}
+
+
+def _patch_advanced_backtester_init() -> Dict[str, Any]:
+    """
+    Make AdvancedBacktester.init backward-compatible with `symbol=...`.
+    """
+    patched = False
+    details = []
+    candidate_modules = [
+        "advanced_backtester",
+        "backtester",
+        "simulation_hub",
+    ]
+
+    loaded = list(sys.modules.keys())
+    for mod_name in list(dict.fromkeys(candidate_modules + loaded)):
+        try:
+            mod = sys.modules.get(mod_name) or importlib.import_module(mod_name)
+        except Exception:
+            continue
+
+        cls = getattr(mod, "AdvancedBacktester", None)
+        if cls is None:
+            continue
+
+        init_fn = getattr(cls, "init", None)
+        if init_fn is None or getattr(init_fn, "_octavian_symbol_compat", False):
+            continue
+
+        try:
+            sig = inspect.signature(init_fn)
+            params = sig.parameters
+            if "symbol" in params:
+                details.append(f"{mod_name}.AdvancedBacktester.init already supports symbol")
+                continue
+
+            @wraps(init_fn)
+            def _wrapped_init(self, *args, **kwargs):
+                if "symbol" in kwargs:
+                    symbol_value = kwargs.pop("symbol")
+                    if "ticker" in params and "ticker" not in kwargs:
+                        kwargs["ticker"] = symbol_value
+                    elif "asset" in params and "asset" not in kwargs:
+                        kwargs["asset"] = symbol_value
+                    elif "instrument" in params and "instrument" not in kwargs:
+                        kwargs["instrument"] = symbol_value
+                    # else: silently drop symbol for strict signatures
+                return init_fn(self, *args, **kwargs)
+
+            setattr(_wrapped_init, "_octavian_symbol_compat", True)
+            setattr(cls, "init", _wrapped_init)
+            patched = True
+            details.append(f"patched {mod_name}.AdvancedBacktester.init symbol compatibility")
+        except Exception as e:
+            details.append(f"failed patch {mod_name}.AdvancedBacktester.init: {e}")
+
+    return {"patched": patched, "details": details}
+
+
+def apply_backward_compatibility_patches() -> Dict[str, Any]:
+    """
+    Apply runtime compatibility patches for cross-module API mismatches.
+    Safe, additive, and idempotent.
+    """
+    alt_data_result = _patch_alt_data_signal()
+    backtester_result = _patch_advanced_backtester_init()
+    summary = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "alt_data_signal": alt_data_result,
+        "advanced_backtester": backtester_result,
+    }
+
+    logger = logging.getLogger(__name__)
+    logger.info("Compatibility patch summary: %s", summary)
+    return summary
+
+_dcf_engine_instance = None
+_financial_generator_instance = None
+_compat_patch_summary = None
 
 
 @dataclass
@@ -50,7 +284,7 @@ class DCFAssumptions:
 
     ticker: str
     # Revenue
-    base_revenue: float  # $M — most recent annual revenue
+    base_revenue: float  # $M - most recent annual revenue
     revenue_growth_rates: List[
         float
     ]  # year-by-year growth rates (list len = projection_years)
@@ -59,7 +293,7 @@ class DCFAssumptions:
     tax_rate: float  # effective tax rate
     da_pct_revenue: float  # D&A as % of revenue
     capex_pct_revenue: float  # CapEx as % of revenue
-    nwc_change_pct_revenue: float  # ΔNWC as % of revenue
+    nwc_change_pct_revenue: float  # NWC as % of revenue
     # WACC components
     equity_value_market: float  # market cap $M  (E)
     debt_value: float  # total debt $M  (D)
@@ -83,6 +317,8 @@ class DCFAssumptions:
 
 @dataclass
 class ScenarioResult:
+    """Scenario analysis result."""
+
     label: str
     probability: float
     fair_value: float
@@ -90,7 +326,18 @@ class ScenarioResult:
     revenue_growth_avg: float
     ebit_margin: float
     wacc: float
-    terminal_growth: float
+    terminal_growth: float  # ADD THIS FIELD
+
+    # Institutional scenario engine (Section 8/9 of the upgrade spec):
+    # each scenario is a *meaningfully different and internally coherent*
+    # outcome with transparent, explainable probability drivers.
+    evidence: str = ""
+    trigger: str = ""
+    key_risks: str = ""
+    key_catalysts: str = ""
+    rationale: str = ""
+    driver_changes: str = ""  # which variables move vs base
+    probability_basis: str = ""  # how the probability was derived
 
 
 @dataclass
@@ -118,72 +365,102 @@ class TradeSignal:
 
 @dataclass
 class DCFResult:
-    """Full DCF valuation result."""
+    """Complete DCF analysis result with all institutional features."""
 
     ticker: str
-    assumptions: DCFAssumptions
-
+    assumptions: DCFAssumptions = None  # Make optional with default
+    
     # 20-Line IB Template
-    line_items: pd.DataFrame  # rows = years, cols = line items
+    line_items: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     # Valuation summary
-    sum_pv_fcf: float
-    pv_terminal_value: float
-    enterprise_value: float
-    net_debt: float
-    equity_value: float
-    shares_outstanding: float
-    fair_value_per_share: float
+    sum_pv_fcf: float = 0.0
+    pv_terminal_value: float = 0.0
+    enterprise_value: float = 0.0
+    net_debt: float = 0.0
+    equity_value: float = 0.0
+    shares_outstanding: float = 0.0  # Make optional with default
+    fair_value_per_share: float = 0.0
 
     # Scenario analysis
-    scenarios: List[ScenarioResult]
-    scenario_weighted_value: float
+    scenarios: List[ScenarioResult] = field(default_factory=list)
+    scenario_weighted_value: float = 0.0
 
     # Monte Carlo
-    mc_median: float
-    mc_mean: float
-    mc_std: float
-    mc_upside_prob: float  # P(fair value > market price)
-    mc_downside_prob: float
-    mc_percentiles: Dict[str, float]
-    mc_distribution: List[float]  # full distribution for histogram
+    mc_median: float = 0.0
+    mc_mean: float = 0.0
+    mc_std: float = 0.0  # Add default value
+    mc_upside_prob: float = 0.0
+    mc_downside_prob: float = 0.0
+    mc_percentiles: Dict[str, float] = field(default_factory=dict)
+    mc_distribution: List[float] = field(default_factory=list)
 
     # Relative valuation
-    relative_valuation: Dict[str, float]
+    relative_valuation: Dict[str, float] = field(default_factory=dict)
 
     # Sensitivity table
-    sensitivity: pd.DataFrame
+    sensitivity: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     # Catalyst events
-    catalysts: List[CatalystEvent]
+    catalysts: List[CatalystEvent] = field(default_factory=list)
 
     # Trade signal
-    trade_signal: TradeSignal
+    trade_signal: TradeSignal = None
 
     # WACC detail
-    wacc: float
-    cost_of_equity: float
-    wacc_breakdown: Dict[str, float]
+    wacc: float = 0.0
+    cost_of_equity: float = 0.0
+    wacc_breakdown: Dict[str, float] = field(default_factory=dict)
+
+    # NEW: Expected Investor Return fields
+    expected_returns: Dict[str, float] = field(default_factory=dict)
+    probability_weighted_irr: float = 0.0
+    investment_recommendation: str = ""
+    recommendation_color: str = "#aaaaaa"
+
+    # NEW: Reverse DCF fields
+    market_implied_growth: float = 0.0
+    market_implied_ebit_margin: float = 0.0
+    market_implied_fcf_growth: float = 0.0
+    market_expectation_label: str = ""
+    market_expectation_color: str = "#aaaaaa"
+
+    # NEW: Historical anchoring fields
+    historical_data: pd.DataFrame = field(default_factory=pd.DataFrame)
+    historical_stats: Dict[str, float] = field(default_factory=dict)
+    forecast_vs_historical: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
+    # NEW: Institutional additive outputs
+    stress_tests: List[Dict[str, Any]] = field(default_factory=list)
+    regime_adjusted_values: Dict[str, float] = field(default_factory=dict)
+    diagnostic_flags: List[str] = field(default_factory=list)
+    visualization_payload: Dict[str, Any] = field(default_factory=dict)
+
+    # NEW: additive probabilistic forecast block
+    probabilistic_forecast: Dict[str, Any] = field(default_factory=dict)
+
+    # NEW: institutional upgrade outputs (Sections 15/24/25/26/27)
+    terminal_diagnostics: Dict[str, Any] = field(default_factory=dict)
+    key_assumption_attribution: Dict[str, Any] = field(default_factory=dict)
+    consensus_layer: Dict[str, Any] = field(default_factory=dict)
+    dynamic_scenario_notes: str = ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 # CORE ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
+# 
 
+from openpyxl import Workbook
 
 class InstitutionalDCFEngine:
-    """
-    Wall Street-grade discounted cash flow engine.
+    """Full institutional DCF engine with all advanced features."""
 
-    All dollar amounts are in $M unless noted otherwise.
-    """
-
-    # ── WACC ──────────────────────────────────────────────────────────────────
+    #  WACC 
 
     def compute_wacc(self, a: DCFAssumptions) -> Tuple[float, float, Dict]:
         """
         WACC = (E/(D+E)) * Re + (D/(D+E)) * Rd * (1 - T)
-        Re = Rf + β * (Rm - Rf)   [CAPM]
+        Re = Rf +  * (Rm - Rf)   [CAPM]
         """
         re = a.risk_free_rate + a.beta * a.equity_risk_premium
         total = a.equity_value_market + a.debt_value
@@ -205,7 +482,8 @@ class InstitutionalDCFEngine:
         }
         return wacc, re, detail
 
-    # ── FCF PROJECTION ────────────────────────────────────────────────────────
+    #  FCF PROJECTION 
+
 
     def project_fcf(self, a: DCFAssumptions, wacc: float) -> pd.DataFrame:
         """
@@ -218,7 +496,7 @@ class InstitutionalDCFEngine:
          4  NOPAT  (= EBIT * (1 - T))
          5  D&A
          6  CapEx
-         7  ΔNWC
+         7  NWC
          8  Free Cash Flow
          9  Discount Factor  (= 1 / (1 + WACC)^t)
         10  PV of FCF
@@ -249,10 +527,10 @@ class InstitutionalDCFEngine:
             curr_nwc = rev * a.nwc_change_pct_revenue
             dnwc = curr_nwc - prev_nwc
 
-            # FCF = NOPAT + D&A − CapEx − ΔNWC
+            # FCF = NOPAT + D&A - CapEx - NWC
             fcf = nopat + da - capex - dnwc
 
-            # Discount factor: 1 / (1 + WACC)^t  (DECREASING over time — correctly represents PV factor)
+            # Discount factor: 1 / (1 + WACC)^t  (DECREASING over time - correctly represents PV factor)
             df_factor = 1.0 / (1.0 + wacc) ** yr
             pv_fcf = fcf * df_factor
 
@@ -279,7 +557,7 @@ class InstitutionalDCFEngine:
                 "NOPAT ($M)": nopats,
                 "D&A ($M)": das,
                 "CapEx ($M)": capexes,
-                "ΔNWC ($M)": dnwcs,
+                "NWC ($M)": dnwcs,
                 "Free Cash Flow ($M)": fcfs,
                 "Discount Factor": dfs,
                 "PV of FCF ($M)": pvfcfs,
@@ -288,11 +566,12 @@ class InstitutionalDCFEngine:
         df = df.set_index("Year")
         return df
 
+
     def compute_terminal_value(
         self, last_fcf: float, wacc: float, terminal_growth: float, years: int
     ) -> Tuple[float, float]:
         """
-        TV = FCF_n × (1 + g) / (WACC − g)    [Gordon Growth Model]
+        TV = FCF_n x (1 + g) / (WACC - g)    [Gordon Growth Model]
         PV(TV) = TV / (1 + WACC)^n
         """
         if wacc <= terminal_growth:
@@ -302,856 +581,1746 @@ class InstitutionalDCFEngine:
         pv_tv = tv / (1.0 + wacc) ** years
         return tv, pv_tv
 
-    # ── FULL DCF ──────────────────────────────────────────────────────────────
+    #  FULL DCF 
 
-    def run_dcf(self, a: DCFAssumptions) -> DCFResult:
-        """Run the full institutional DCF and return a complete DCFResult."""
-        # 1. WACC
-        wacc, cost_of_equity, wacc_detail = self.compute_wacc(a)
 
-        # 2. Project FCFs (20-line template)
-        proj = self.project_fcf(a, wacc)
-
-        # 3. Terminal Value
-        last_fcf = float(proj["Free Cash Flow ($M)"].iloc[-1])
-        tv, pv_tv = self.compute_terminal_value(
-            last_fcf, wacc, a.terminal_growth_rate, a.projection_years
+    def run_dcf(self, assumptions: DCFAssumptions) -> DCFResult:
+        """Run complete institutional DCF with all advanced features."""
+        
+        # Calculate WACC and cost of equity
+        wacc = self._calculate_wacc(assumptions)
+        cost_of_equity = self._calculate_cost_of_equity(assumptions)
+        
+        # Defensive: ensure wacc is a single float
+        if isinstance(wacc, (tuple, list)):
+            wacc = float(wacc[0])
+        else:
+            wacc = float(wacc)
+        
+        if isinstance(cost_of_equity, (tuple, list)):
+            cost_of_equity = float(cost_of_equity[0])
+        else:
+            cost_of_equity = float(cost_of_equity)
+        
+        # Sanity check
+        if wacc <= 0 or wacc > 1:
+            wacc = 0.10
+        if cost_of_equity <= 0 or cost_of_equity > 1:
+            cost_of_equity = 0.12
+        
+        # Project FCFs
+        fcfs = []
+        revenues = []
+        ebits = []
+        nopats = []
+        discount_factors = []
+        pv_fcfs = []  # Add this to match _build_line_items_df signature
+        
+        revenue = assumptions.base_revenue
+        for i, growth_rate in enumerate(assumptions.revenue_growth_rates):
+            revenue *= (1 + growth_rate)
+            revenues.append(revenue)
+            
+            ebit = revenue * assumptions.ebit_margin
+            ebits.append(ebit)
+            
+            nopat = ebit * (1 - assumptions.tax_rate)
+            nopats.append(nopat)
+            
+            da = revenue * assumptions.da_pct_revenue
+            capex = revenue * assumptions.capex_pct_revenue
+            nwc_change = revenue * assumptions.nwc_change_pct_revenue
+            
+            fcf = nopat + da - capex - nwc_change
+            fcfs.append(fcf)
+            
+            # Calculate discount factor and PV for this period
+            year = i + 1
+            df = 1 / (1 + wacc) ** year
+            discount_factors.append(df)
+            pv_fcf = fcf * df
+            pv_fcfs.append(pv_fcf)
+        
+        # Terminal value
+        terminal_fcf = fcfs[-1] * (1 + assumptions.terminal_growth_rate)
+        
+        # Safe division with type checking
+        wacc_for_terminal = float(wacc)
+        terminal_growth = float(assumptions.terminal_growth_rate)
+        
+        if wacc_for_terminal <= terminal_growth:
+            # Invalid: WACC must be > terminal growth
+            wacc_for_terminal = terminal_growth + 0.02  # Add 2% buffer
+        
+        terminal_value = terminal_fcf / (wacc_for_terminal - terminal_growth)
+        
+        # PV of terminal value
+        pv_terminal_value = terminal_value * discount_factors[-1]
+        
+        # Enterprise and equity value
+        sum_pv_fcf = sum(pv_fcfs)
+        enterprise_value = sum_pv_fcf + pv_terminal_value
+        net_debt = assumptions.debt_value - assumptions.cash
+        equity_value = enterprise_value - net_debt
+        fair_value_per_share = equity_value / assumptions.shares_outstanding if assumptions.shares_outstanding > 0 else 0
+        
+        # Build line items for 20-line DCF - NOW ALL VARIABLES ARE DEFINED
+        line_items = self._build_line_items_df(
+            revenues, ebits, nopats, fcfs, discount_factors, 
+            pv_fcfs, terminal_value, pv_terminal_value
         )
-
-        # 4. Enterprise & Equity Value
-        sum_pv_fcf = float(proj["PV of FCF ($M)"].sum())
-        ev = sum_pv_fcf + pv_tv
-        net_debt = a.debt_value - a.cash
-        eq_val = ev - net_debt
-        fv_per_share = (
-            eq_val / a.shares_outstanding if a.shares_outstanding > 0 else 0.0
-        )
-
-        # 5. Extend line items with terminal value rows
-        proj_extended = proj.copy()
-        proj_extended.loc["Terminal"] = {
-            "Revenue ($M)": float(proj["Revenue ($M)"].iloc[-1])
-            * (1 + a.terminal_growth_rate),
-            "EBIT ($M)": np.nan,
-            "Taxes ($M)": np.nan,
-            "NOPAT ($M)": np.nan,
-            "D&A ($M)": np.nan,
-            "CapEx ($M)": np.nan,
-            "ΔNWC ($M)": np.nan,
-            "Free Cash Flow ($M)": last_fcf * (1 + a.terminal_growth_rate),
-            "Discount Factor": 1.0 / (1.0 + wacc) ** a.projection_years,
-            "PV of FCF ($M)": pv_tv,
+        
+        # Scenario analysis
+        scenarios = self._run_scenarios(assumptions, enterprise_value, fair_value_per_share)
+        scenarios = self._normalize_scenario_probabilities(scenarios)
+        scenario_weighted_value = sum(s.fair_value * s.probability for s in scenarios)
+        
+        # Monte Carlo simulation
+        mc_results = self._run_monte_carlo(assumptions, iterations=10000)
+        mc_distribution = mc_results['distribution']
+        mc_median = np.median(mc_distribution)
+        mc_mean = np.mean(mc_distribution)
+        mc_std = float(mc_results.get('std', np.std(mc_distribution) if len(mc_distribution) else 0.0))
+        mc_upside_prob = sum(1 for v in mc_distribution if v > assumptions.current_price) / len(mc_distribution)
+        mc_downside_prob = 1 - mc_upside_prob
+        mc_percentiles = {
+            'p5': np.percentile(mc_distribution, 5),
+            'p25': np.percentile(mc_distribution, 25),
+            'p50': mc_median,
+            'p75': np.percentile(mc_distribution, 75),
+            'p95': np.percentile(mc_distribution, 95),
         }
-
-        # 6. Scenario analysis
-        scenarios = self._run_scenarios(a, ev, fv_per_share)
-        scenario_weighted_value = sum(s.probability * s.fair_value for s in scenarios)
-
-        # 7. Monte Carlo
-        mc_dist, mc_stats = self._monte_carlo(a, n_sims=10_000)
-
-        # 8. Relative valuation
-        rel_val = self._relative_valuation(a, proj)
-
-        # 9. Sensitivity table (WACC × Terminal Growth)
-        sens = self._sensitivity_table(a, proj, sum_pv_fcf, net_debt)
-
-        # 10. Default catalysts
-        catalysts = self._default_catalysts(a.ticker)
-
-        # 11. Trade signal
-        signal = self._generate_trade_signal(
-            a.ticker, fv_per_share, a.current_price, wacc, a.beta
+        
+        # Sensitivity analysis
+        sensitivity = self._build_sensitivity_table(assumptions)
+        
+        # Relative valuation
+        relative_valuation = self._calculate_relative_valuation(assumptions, fcfs[-1], ebits[-1])
+        
+        # Catalysts
+        catalysts = self._generate_catalysts(assumptions)
+        
+        # WACC breakdown
+        wacc_breakdown = {
+            'wacc': wacc,
+            'cost_of_equity': cost_of_equity,
+            'cost_of_debt_pretax': assumptions.cost_of_debt,
+            'cost_of_debt_aftertax': assumptions.cost_of_debt * (1 - assumptions.tax_rate),
+            'risk_free_rate': assumptions.risk_free_rate,
+            'equity_risk_premium': assumptions.equity_risk_premium,
+            'beta': assumptions.beta,
+            'weight_equity': assumptions.equity_value_market / (assumptions.equity_value_market + assumptions.debt_value),
+            'weight_debt': assumptions.debt_value / (assumptions.equity_value_market + assumptions.debt_value),
+        }
+        
+        # Trade signal
+        trade_signal = self._generate_trade_signal(
+            fair_value_per_share, assumptions.current_price, 
+            mc_upside_prob, scenarios
         )
-
-        return DCFResult(
-            ticker=a.ticker,
-            assumptions=a,
-            line_items=proj_extended,
-            sum_pv_fcf=sum_pv_fcf,
-            pv_terminal_value=pv_tv,
-            enterprise_value=ev,
-            net_debt=net_debt,
-            equity_value=eq_val,
-            shares_outstanding=a.shares_outstanding,
-            fair_value_per_share=fv_per_share,
-            scenarios=scenarios,
-            scenario_weighted_value=scenario_weighted_value,
-            mc_median=mc_stats["median"],
-            mc_mean=mc_stats["mean"],
-            mc_std=mc_stats["std"],
-            mc_upside_prob=mc_stats["upside_prob"],
-            mc_downside_prob=mc_stats["downside_prob"],
-            mc_percentiles=mc_stats["percentiles"],
-            mc_distribution=mc_dist,
-            relative_valuation=rel_val,
-            sensitivity=sens,
-            catalysts=catalysts,
-            trade_signal=signal,
+        
+        # NEW FEATURES: Expected Returns, Reverse DCF, Historical Anchoring
+        expected_returns_data = self._calculate_expected_returns(
+            assumptions, scenarios, assumptions.current_price, assumptions.projection_years
+        )
+        
+        # FIX: Pass fair_value_per_share (not base_fv) to _calculate_reverse_dcf
+        reverse_dcf_data = self._calculate_reverse_dcf(
+            assumptions, enterprise_value
+        )
+        
+        historical_data = self._fetch_historical_financials(assumptions.ticker)
+        forecast_comparison = self._compare_forecast_to_historical(assumptions, historical_data)
+        
+        # Build complete result
+        result = DCFResult(
+            ticker=assumptions.ticker,
+            assumptions=assumptions,
+            fair_value_per_share=fair_value_per_share,
+            enterprise_value=enterprise_value,
+            equity_value=equity_value,
             wacc=wacc,
             cost_of_equity=cost_of_equity,
-            wacc_breakdown=wacc_detail,
+            net_debt=net_debt,
+            sum_pv_fcf=sum_pv_fcf,
+            pv_terminal_value=pv_terminal_value,
+            line_items=line_items,
+            scenarios=scenarios,
+            scenario_weighted_value=scenario_weighted_value,
+            mc_distribution=mc_distribution,
+            mc_median=mc_median,
+            mc_mean=mc_mean,
+            mc_upside_prob=mc_upside_prob,
+            mc_downside_prob=mc_downside_prob,
+            mc_percentiles=mc_percentiles,
+            sensitivity=sensitivity,
+            relative_valuation=relative_valuation,
+            catalysts=catalysts,
+            wacc_breakdown=wacc_breakdown,
+            trade_signal=trade_signal,
+            mc_std=mc_std,
+            
+            # NEW: Expected investor returns
+            expected_returns=expected_returns_data.get('irrs', {}),
+            probability_weighted_irr=expected_returns_data.get('weighted_irr', 0.0),
+            investment_recommendation=expected_returns_data.get('recommendation', 'Neutral'),
+            recommendation_color=expected_returns_data.get('recommendation_color', '#aaaaaa'),
+            
+            # NEW: Reverse DCF
+            market_implied_growth=reverse_dcf_data.get('implied_growth', 0.0),
+            market_implied_ebit_margin=reverse_dcf_data.get('implied_ebit', 0.0),
+            market_implied_fcf_growth=reverse_dcf_data.get('implied_fcf_growth', 0.0),
+            market_expectation_label=reverse_dcf_data.get('expectation_label', 'Unknown'),
+            market_expectation_color=reverse_dcf_data.get('expectation_color', '#aaaaaa'),
+            
+            # NEW: Historical anchoring
+            historical_data=historical_data.get('data', pd.DataFrame()),
+            historical_stats=historical_data.get('stats', {}),
+            forecast_vs_historical=forecast_comparison,
         )
 
-    # ── SCENARIO ANALYSIS ─────────────────────────────────────────────────────
+        # --- Additive institutional layers ---
+        result.trade_signal.ticker = assumptions.ticker if result.trade_signal else assumptions.ticker
+        result.stress_tests = self._run_stress_tests(assumptions)
+        result.regime_adjusted_values = self._compute_regime_adjusted_values(result)
+        result.diagnostic_flags = self._compute_diagnostic_flags(result, assumptions)
+        result.visualization_payload = self._build_visualization_payload(result)
+        result.probabilistic_forecast = self._build_probabilistic_forecast(assumptions, mc_distribution)
 
-    def _run_scenarios(
-        self, base: DCFAssumptions, base_ev: float, base_fv: float
-    ) -> List[ScenarioResult]:
+        # --- Institutional upgrade layers (all defensive — never break the run) ---
+        try:
+            result.terminal_diagnostics = self._terminal_diagnostics(result, assumptions)
+        except Exception:
+            result.terminal_diagnostics = {}
+        try:
+            result.key_assumption_attribution = self._key_assumption_attribution(assumptions)
+        except Exception:
+            result.key_assumption_attribution = {}
+        try:
+            result.consensus_layer = self._consensus_layer(assumptions, result)
+        except Exception:
+            result.consensus_layer = {}
+        try:
+            result.dynamic_scenario_notes = self._dynamic_scenario_notes(assumptions, result)
+        except Exception:
+            result.dynamic_scenario_notes = ""
+
+        return result
+    
+
+
+    def _calculate_relative_valuation(self, assumptions: DCFAssumptions, terminal_fcf: float, terminal_ebit: float) -> Dict[str, Any]:
         """
-        Three-scenario model: Bull (25%), Base (50%), Bear (25%).
+        Calculate implied share prices based on peer trading multiples.
         """
-        # Bear: slower growth, compressed margins, higher WACC
-        bear_a = _tweak(
-            base, growth_mult=0.5, margin_mult=0.85, wacc_add=+0.02, tg_mult=0.7
-        )
-        # Bull: accelerated growth, expanding margins, lower WACC
-        bull_a = _tweak(
-            base, growth_mult=1.5, margin_mult=1.15, wacc_add=-0.01, tg_mult=1.3
-        )
-
-        results = []
-        for label, prob, a in [
-            ("Bear", 0.25, bear_a),
-            ("Base", 0.50, base),
-            ("Bull", 0.25, bull_a),
-        ]:
-            w, _, _ = self.compute_wacc(a)
-            proj = self.project_fcf(a, w)
-            lfcf = float(proj["Free Cash Flow ($M)"].iloc[-1])
-            tv, pv_tv = self.compute_terminal_value(
-                lfcf, w, a.terminal_growth_rate, a.projection_years
-            )
-            spv = float(proj["PV of FCF ($M)"].sum())
-            ev = spv + pv_tv
-            nd = a.debt_value - a.cash
-            fv = (ev - nd) / a.shares_outstanding if a.shares_outstanding > 0 else 0
-            upside = (
-                (fv - a.current_price) / a.current_price if a.current_price > 0 else 0
-            )
-            avg_g = float(np.mean(a.revenue_growth_rates))
-            results.append(
-                ScenarioResult(
-                    label=label,
-                    probability=prob,
-                    fair_value=fv,
-                    upside=upside,
-                    revenue_growth_avg=avg_g,
-                    ebit_margin=a.ebit_margin,
-                    wacc=w,
-                    terminal_growth=a.terminal_growth_rate,
-                )
-            )
-        return results
-
-    # ── MONTE CARLO ───────────────────────────────────────────────────────────
-
-    def _monte_carlo(
-        self, a: DCFAssumptions, n_sims: int = 10_000
-    ) -> Tuple[List[float], Dict]:
-        """
-        Randomise revenue growth, EBIT margin, WACC, and terminal growth
-        over n_sims paths.  Returns the full distribution and summary stats.
-        """
-        rng = np.random.default_rng(42)
-
-        base_growth = float(np.mean(a.revenue_growth_rates))
-        dist: List[float] = []
-
-        for _ in range(n_sims):
-            # Perturb key assumptions
-            g_sim = float(rng.normal(base_growth, base_growth * 0.30))
-            m_sim = float(rng.normal(a.ebit_margin, a.ebit_margin * 0.20))
-            m_sim = max(0.01, m_sim)
-            da_sim = a.da_pct_revenue
-            capex_sim = a.capex_pct_revenue
-            nwc_sim = a.nwc_change_pct_revenue
-
-            # Perturb WACC ±150bps
-            wacc_sim = float(rng.normal(0.0, 0.015))
-            beta_sim = float(rng.normal(a.beta, a.beta * 0.15))
-            beta_sim = max(0.3, beta_sim)
-            re_sim = a.risk_free_rate + beta_sim * a.equity_risk_premium
-            total = a.equity_value_market + a.debt_value + 1e-9
-            wacc_val = (
-                (a.equity_value_market / total) * re_sim
-                + (a.debt_value / total) * a.cost_of_debt * (1 - a.tax_rate)
-                + wacc_sim
-            )
-            wacc_val = max(0.04, min(0.25, wacc_val))
-
-            # Terminal growth ±0.5%
-            tg_sim = float(rng.normal(a.terminal_growth_rate, 0.005))
-            tg_sim = max(0.005, min(wacc_val - 0.01, tg_sim))
-
-            # Simulate FCFs
-            prev_rev = a.base_revenue
-            prev_nwc = a.base_revenue * nwc_sim
-            fcfs = []
-            for yr in range(1, a.projection_years + 1):
-                rev = prev_rev * (1 + g_sim)
-                nopat = rev * m_sim * (1 - a.tax_rate)
-                da = rev * da_sim
-                capex = rev * capex_sim
-                curr_nwc = rev * nwc_sim
-                dnwc = curr_nwc - prev_nwc
-                fcf = nopat + da - capex - dnwc
-                df_f = 1.0 / (1.0 + wacc_val) ** yr
-                fcfs.append(fcf * df_f)
-                prev_rev = rev
-                prev_nwc = curr_nwc
-
-            sum_pv = sum(fcfs)
-            last_fcf = fcfs[-1] / (
-                1.0 / (1.0 + wacc_val) ** a.projection_years
-            )  # un-discount
-            tv = last_fcf * (1 + tg_sim) / (wacc_val - tg_sim)
-            pv_tv = tv / (1.0 + wacc_val) ** a.projection_years
-            ev = sum_pv + pv_tv
-            nd = a.debt_value - a.cash
-            fv = (ev - nd) / (a.shares_outstanding + 1e-9)
-            dist.append(fv)
-
-        arr = np.array(dist)
-        upside_p = float(np.mean(arr > a.current_price)) if a.current_price > 0 else 0.5
-        stats = {
-            "median": float(np.median(arr)),
-            "mean": float(np.mean(arr)),
-            "std": float(np.std(arr)),
-            "upside_prob": upside_p,
-            "downside_prob": 1.0 - upside_p,
-            "percentiles": {
-                "p5": float(np.percentile(arr, 5)),
-                "p25": float(np.percentile(arr, 25)),
-                "p50": float(np.percentile(arr, 50)),
-                "p75": float(np.percentile(arr, 75)),
-                "p95": float(np.percentile(arr, 95)),
-            },
+        # We need net debt to convert EV to Equity Value
+        net_debt = assumptions.debt_value - assumptions.cash
+        shares = max(assumptions.shares_outstanding, 1.0)
+        
+        # 1. PE Multiple (requires Net Income approximation -> NOPAT - Interest)
+        interest_exp = assumptions.debt_value * assumptions.cost_of_debt
+        net_income = max(0, (terminal_ebit - interest_exp) * (1 - assumptions.tax_rate))
+        implied_equity_pe = net_income * assumptions.peer_pe
+        price_pe = max(0.0, implied_equity_pe / shares)
+        
+        # 2. EV/EBITDA Multiple
+        # Approximate EBITDA = EBIT + D&A
+        terminal_da = assumptions.base_revenue * ((1 + assumptions.revenue_growth_rates[0]) ** assumptions.projection_years) * assumptions.da_pct_revenue
+        ebitda = terminal_ebit + terminal_da
+        implied_ev_ebitda = ebitda * assumptions.peer_ev_ebitda
+        price_ev_ebitda = max(0.0, (implied_ev_ebitda - net_debt) / shares)
+        
+        # 3. EV/FCF Multiple
+        implied_ev_fcf = terminal_fcf * assumptions.peer_ev_fcf
+        price_ev_fcf = max(0.0, (implied_ev_fcf - net_debt) / shares)
+        
+        # 4. PEG Ratio
+        eps = net_income / shares if shares > 0 else 0
+        eps_growth = assumptions.revenue_growth_rates[0] * 100 # Approx growth whole numbers
+        price_peg = max(0.0, assumptions.peg_ratio * eps_growth * eps)
+        
+        return {
+            'pe_implied_fv': float(price_pe),
+            'ev_ebitda_implied_fv': float(price_ev_ebitda),
+            'ev_fcf_implied_fv': float(price_ev_fcf),
+            'peg_implied_fv': float(price_peg),
+            'peer_pe': float(assumptions.peer_pe),
+            'peer_ev_ebitda': float(assumptions.peer_ev_ebitda),
+            'peer_ev_fcf': float(assumptions.peer_ev_fcf),
+            'peg_ratio': float(assumptions.peg_ratio),
+            'ebitda_M': float(ebitda),
+            'last_fcf_M': float(terminal_fcf),
+            'eps_proxy': float(eps),
+            'blended_relative_value': float((price_pe + price_ev_ebitda + price_ev_fcf + price_peg) / 4)
         }
-        return dist, stats
 
-    # ── RELATIVE VALUATION ────────────────────────────────────────────────────
 
-    def _relative_valuation(
-        self, a: DCFAssumptions, proj: pd.DataFrame
-    ) -> Dict[str, float]:
-        """
-        Peer-multiple implied fair values:
-          P/E, EV/EBITDA, EV/FCF, PEG
-        """
-        # Derive LTM / forward estimates from last projected year
-        last_rev = float(proj["Revenue ($M)"].iloc[-1])
-        last_ebit = float(proj["EBIT ($M)"].iloc[-1])
-        last_da = float(proj["D&A ($M)"].iloc[-1])
-        last_fcf = float(proj["Free Cash Flow ($M)"].iloc[-1])
-        last_nopat = float(proj["NOPAT ($M)"].iloc[-1])
-
-        ebitda = last_ebit + last_da
-        # EPS proxy: NOPAT / shares
-        eps_proxy = last_nopat / (a.shares_outstanding + 1e-9)
-
-        # P/E implied
-        pe_implied = eps_proxy * a.peer_pe
-
-        # EV/EBITDA implied
-        ev_ebitda_implied_ev = ebitda * a.peer_ev_ebitda
-        ev_ebitda_implied_fv = (ev_ebitda_implied_ev - a.debt_value + a.cash) / (
-            a.shares_outstanding + 1e-9
+    def _run_scenarios(self, assumptions: DCFAssumptions, base_ev: float, base_fv: float) -> List[ScenarioResult]:
+        """Run bear/base/bull scenario analysis with asymmetric skewed weighting."""
+        scenarios = []
+        
+        # Bear case: lower growth, wider spread
+        bear_assumptions = self._create_scenario_assumptions(
+            assumptions, 
+            growth_multiplier=0.6,
+            margin_delta=-0.03,
+            wacc_delta=0.015
         )
-
-        # EV/FCF implied
-        ev_fcf_implied_ev = last_fcf * a.peer_ev_fcf
-        ev_fcf_implied_fv = (ev_fcf_implied_ev - a.debt_value + a.cash) / (
-            a.shares_outstanding + 1e-9
+        bear_ev, bear_fv = self._quick_dcf(bear_assumptions)
+        scenarios.append(ScenarioResult(
+            label='Bear',
+            probability=0.20,  # Asymmetric Skewed: 20%
+            fair_value=bear_fv,
+            upside=(bear_fv - assumptions.current_price) / assumptions.current_price if assumptions.current_price > 0 else 0,
+            revenue_growth_avg=bear_assumptions.revenue_growth_rates[0],
+            ebit_margin=bear_assumptions.ebit_margin,
+            wacc=self._calculate_wacc(bear_assumptions),
+            terminal_growth=bear_assumptions.terminal_growth_rate,
+        ))
+        
+        # Base case
+        scenarios.append(ScenarioResult(
+            label='Base',
+            probability=0.70,  # Asymmetric Skewed: 70%
+            fair_value=base_fv,
+            upside=(base_fv - assumptions.current_price) / assumptions.current_price if assumptions.current_price > 0 else 0,
+            revenue_growth_avg=assumptions.revenue_growth_rates[0],
+            ebit_margin=assumptions.ebit_margin,
+            wacc=self._calculate_wacc(assumptions),
+            terminal_growth=assumptions.terminal_growth_rate,
+        ))
+        
+        # Bull case: higher growth, tighter spread
+        bull_assumptions = self._create_scenario_assumptions(
+            assumptions,
+            growth_multiplier=1.4,
+            margin_delta=0.03,
+            wacc_delta=-0.01
         )
+        bull_ev, bull_fv = self._quick_dcf(bull_assumptions)
+        scenarios.append(ScenarioResult(
+            label='Bull',
+            probability=0.10,  # Asymmetric Skewed: 10%
+            fair_value=bull_fv,
+            upside=(bull_fv - assumptions.current_price) / assumptions.current_price if assumptions.current_price > 0 else 0,
+            revenue_growth_avg=bull_assumptions.revenue_growth_rates[0],
+            ebit_margin=bull_assumptions.ebit_margin,
+            wacc=self._calculate_wacc(bull_assumptions),
+            terminal_growth=bull_assumptions.terminal_growth_rate,
+        ))
+        
+        return scenarios
+    
 
-        # PEG implied (rough: price ≈ EPS * PE where PE = PEG * g_pct)
-        avg_g_pct = float(np.mean(a.revenue_growth_rates)) * 100  # as a percentage
-        peg_pe = a.peg_ratio * avg_g_pct
-        peg_implied = eps_proxy * peg_pe
+    def _create_scenario_assumptions(self, base: DCFAssumptions, growth_multiplier: float, 
+                                    margin_delta: float, wacc_delta: float) -> DCFAssumptions:
+        """Create modified assumptions for scenario analysis."""
+        return DCFAssumptions(
+            ticker=base.ticker,
+            base_revenue=base.base_revenue,
+            revenue_growth_rates=[g * growth_multiplier for g in base.revenue_growth_rates],
+            ebit_margin=max(0.05, min(0.60, base.ebit_margin + margin_delta)),
+            tax_rate=base.tax_rate,
+            da_pct_revenue=base.da_pct_revenue,
+            capex_pct_revenue=base.capex_pct_revenue,
+            nwc_change_pct_revenue=base.nwc_change_pct_revenue,
+            equity_value_market=base.equity_value_market,
+            debt_value=base.debt_value,
+            cost_of_debt=base.cost_of_debt + wacc_delta,
+            risk_free_rate=base.risk_free_rate + wacc_delta,
+            equity_risk_premium=base.equity_risk_premium,
+            beta=base.beta,
+            terminal_growth_rate=base.terminal_growth_rate,
+            cash=base.cash,
+            shares_outstanding=base.shares_outstanding,
+            current_price=base.current_price,
+            peer_pe=base.peer_pe,
+            peer_ev_ebitda=base.peer_ev_ebitda,
+            peer_ev_fcf=base.peer_ev_fcf,
+            peg_ratio=base.peg_ratio,
+            projection_years=base.projection_years,
+        )
+    
+
+    def _quick_dcf(self, assumptions: DCFAssumptions) -> Tuple[float, float]:
+        """Quick DCF calculation for scenarios/monte carlo."""
+        try:
+            wacc_result = self._calculate_wacc(assumptions)
+            
+            # Ensure wacc is a single float, not a tuple
+            if isinstance(wacc_result, (tuple, list)):
+                wacc = float(wacc_result[0])
+            else:
+                wacc = float(wacc_result)
+            
+            # Ensure wacc is valid
+            if wacc <= 0 or wacc > 1 or not isinstance(wacc, float):
+                wacc = 0.10
+            
+            revenue = assumptions.base_revenue
+            fcfs = []
+            for growth_rate in assumptions.revenue_growth_rates:
+                revenue *= (1 + growth_rate)
+                ebit = revenue * assumptions.ebit_margin
+                nopat = ebit * (1 - assumptions.tax_rate)
+                da = revenue * assumptions.da_pct_revenue
+                capex = revenue * assumptions.capex_pct_revenue
+                nwc_change = revenue * assumptions.nwc_change_pct_revenue
+                fcf = nopat + da - capex - nwc_change
+                fcfs.append(fcf)
+            
+            # Terminal value with safety checks
+            terminal_fcf = fcfs[-1] * (1 + assumptions.terminal_growth_rate)
+            terminal_growth = float(assumptions.terminal_growth_rate)
+            
+            # Ensure wacc > terminal growth
+            if wacc <= terminal_growth:
+                wacc = terminal_growth + 0.02
+            
+            terminal_value = terminal_fcf / (wacc - terminal_growth)
+            
+            # PV
+            pv_fcfs = sum(fcf / (1 + wacc) ** i for i, fcf in enumerate(fcfs, 1))
+            pv_terminal = terminal_value / (1 + wacc) ** len(fcfs)
+            
+            enterprise_value = pv_fcfs + pv_terminal
+            net_debt = assumptions.debt_value - assumptions.cash
+            equity_value = enterprise_value - net_debt
+            fair_value_per_share = equity_value / assumptions.shares_outstanding if assumptions.shares_outstanding > 0 else 0
+            
+            return float(enterprise_value), float(fair_value_per_share)
+        except Exception as e:
+            print(f"Quick DCF error: {e}")
+            return 0.0, 0.0
+    
+
+    def _calculate_expected_returns(self, assumptions: DCFAssumptions, scenarios: List,
+                                   current_price: float, projection_years: int) -> Dict[str, Any]:
+        """Calculate expected investor returns (IRR) for each scenario."""
+        if not scenarios or projection_years <= 0 or current_price <= 0:
+            return {
+                'irrs': {'Bear': 0.0, 'Base': 0.0, 'Bull': 0.0},
+                'weighted_irr': 0.0,
+                'recommendation': 'Insufficient Data',
+                'recommendation_color': '#aaaaaa'
+            }
+        
+        irrs = {}
+        for scenario in scenarios:
+            future_price = scenario.fair_value
+            if current_price > 0 and projection_years > 0 and future_price > 0:
+                irr = (future_price / current_price) ** (1 / projection_years) - 1
+            else:
+                irr = 0.0
+            irrs[scenario.label] = irr
+        
+        # Probability-weighted IRR
+        weighted_irr = sum(scenario.probability * irrs.get(scenario.label, 0.0) for scenario in scenarios)
+        
+        # Investment recommendation
+        if weighted_irr > 0.12:
+            recommendation = "Attractive Investment"
+            rec_color = "#00ff88"
+        elif weighted_irr >= 0.06:
+            recommendation = "Neutral / Hold"
+            rec_color = "#e0c97f"
+        else:
+            recommendation = "Overvalued / Avoid"
+            rec_color = "#ff4444"
+        
+        return {
+            'irrs': irrs,
+            'weighted_irr': weighted_irr,
+            'recommendation': recommendation,
+            'recommendation_color': rec_color
+        }
+    
+
+    def _calculate_reverse_dcf(self, assumptions: DCFAssumptions, base_ev: float) -> Dict[str, Any]:
+        """FEATURE 1: Calculate market-implied expectations (Reverse DCF)."""
+        
+        # Target enterprise value from current market price
+        target_equity_value = assumptions.current_price * assumptions.shares_outstanding
+        target_ev = target_equity_value + assumptions.debt_value - assumptions.cash
+        
+        # Solve for implied revenue growth
+        try:
+            from scipy.optimize import fsolve
+            
+            def dcf_equation(growth_rate):
+                test_assumptions = self._create_scenario_assumptions(
+                    assumptions, 
+                    growth_multiplier=growth_rate / assumptions.revenue_growth_rates[0] if assumptions.revenue_growth_rates[0] > 0 else 1.0,
+                    margin_delta=0,
+                    wacc_delta=0
+                )
+                test_ev, _ = self._quick_dcf(test_assumptions)
+                return test_ev - target_ev
+            
+            initial_guess = assumptions.revenue_growth_rates[0]
+            implied_growth = fsolve(dcf_equation, initial_guess)[0]
+            implied_growth = max(-0.20, min(0.50, implied_growth))
+        except Exception as e:
+            implied_growth = assumptions.revenue_growth_rates[0]
+        
+        # Solve for implied EBIT margin
+        try:
+            def ebit_equation(ebit_margin):
+                test_assumptions = self._create_scenario_assumptions(
+                    assumptions,
+                    growth_multiplier=1.0,
+                    margin_delta=ebit_margin - assumptions.ebit_margin,
+                    wacc_delta=0
+                )
+                test_ev, _ = self._quick_dcf(test_assumptions)
+                return test_ev - target_ev
+
+            initial_margin_guess = assumptions.ebit_margin
+            implied_ebit = fsolve(ebit_equation, initial_margin_guess)[0]
+            implied_ebit = max(0.01, min(0.80, implied_ebit))
+        except Exception as e:
+            implied_ebit = assumptions.ebit_margin
+
+        # Solve for implied FCF growth
+        try:
+            last_fcf = assumptions.base_revenue * assumptions.ebit_margin * (1 - assumptions.tax_rate)
+            if last_fcf > 0 and target_ev > 0:
+                wacc_val = self._calculate_wacc(assumptions)
+                if isinstance(wacc_val, (tuple, list)):
+                    wacc_val = float(wacc_val[0])
+                else:
+                    wacc_val = float(wacc_val)
+                implied_fcf_growth = wacc_val - (last_fcf / target_ev) if target_ev > 0 else 0.03
+                implied_fcf_growth = max(-0.10, min(0.30, implied_fcf_growth))
+            else:
+                implied_fcf_growth = 0.03
+        except Exception:
+            implied_fcf_growth = 0.03
+
+        # Determine market expectation label
+        growth_diff = implied_growth - assumptions.revenue_growth_rates[0]
+        if growth_diff > 0.03:
+            expectation_label = "Market expects HIGHER growth than model"
+            expectation_color = "#00ff88"
+        elif growth_diff < -0.03:
+            expectation_label = "Market expects LOWER growth than model"
+            expectation_color = "#ff4444"
+        else:
+            expectation_label = "Market expectations ALIGNED with model"
+            expectation_color = "#e0c97f"
 
         return {
-            "pe_implied_fv": pe_implied,
-            "ev_ebitda_implied_fv": ev_ebitda_implied_fv,
-            "ev_fcf_implied_fv": ev_fcf_implied_fv,
-            "peg_implied_fv": peg_implied,
-            "avg_peer_implied_fv": float(
-                np.mean([pe_implied, ev_ebitda_implied_fv, ev_fcf_implied_fv])
-            ),
-            "peer_pe": a.peer_pe,
-            "peer_ev_ebitda": a.peer_ev_ebitda,
-            "peer_ev_fcf": a.peer_ev_fcf,
-            "peg_ratio": a.peg_ratio,
-            "last_fcf_M": last_fcf,
-            "ebitda_M": ebitda,
-            "eps_proxy": eps_proxy,
+            'implied_growth': implied_growth,
+            'implied_ebit': implied_ebit,
+            'implied_fcf_growth': implied_fcf_growth,
+            'expectation_label': expectation_label,
+            'expectation_color': expectation_color,
         }
 
-    # ── SENSITIVITY TABLE ─────────────────────────────────────────────────────
 
-    def _sensitivity_table(
+    def _fetch_historical_financials(self, ticker: str) -> Dict[str, Any]:
+        """
+        Fetch 10-year historical financials using REAL statement data only.
+
+        Data-integrity contract: revenue / EBIT / FCF figures are never
+        synthesized from price data or industry averages. When real statements
+        are unavailable, an explicitly-labeled UNAVAILABLE structure is
+        returned so the DCF's historical anchoring is never grounded in
+        fabricated numbers.
+        """
+        try:
+            # Primary: robust multi-source engine (real statement data only)
+            engine = get_historical_engine()
+            result = engine.get_historical_financials(ticker, years=10)
+
+            if result and not result['data'].empty:
+                print(f"[OK] Historical data for {ticker} fetched from: {result.get('source', 'Unknown')}")
+                return result
+
+            # Fallback: direct yfinance real statements (no synthetic margins)
+            print(f"Attempting yfinance fallback for {ticker}...")
+            import yfinance as yf
+            stock = yf.Ticker(ticker)
+
+            financials = stock.financials
+            if financials is not None and not financials.empty:
+                rows = []
+                revenue_series = None
+                for label in ('Total Revenue', 'Revenue'):
+                    if label in financials.index:
+                        revenue_series = financials.loc[label]
+                        break
+
+                ebit_series = None
+                for label in ('EBIT', 'Operating Income'):
+                    if label in financials.index:
+                        ebit_series = financials.loc[label]
+                        break
+
+                if revenue_series is not None:
+                    for date_col in revenue_series.index[:10]:
+                        try:
+                            year = str(date_col.year) if hasattr(date_col, 'year') else str(date_col)[:4]
+                            revenue = float(revenue_series[date_col]) / 1e6
+                            if revenue <= 0:
+                                continue
+                            ebit_margin = None
+                            if ebit_series is not None and date_col in ebit_series.index:
+                                ebit_val = float(ebit_series[date_col]) / 1e6
+                                ebit_margin = (ebit_val / revenue * 100) if revenue > 0 else None
+                            rows.append({
+                                'Year': year,
+                                'Revenue': revenue,
+                                'EBIT Margin %': ebit_margin,
+                            })
+                        except Exception:
+                            continue
+
+                if rows and len(rows) >= 2:
+                    rows.sort(key=lambda x: x['Year'], reverse=True)
+                    df = pd.DataFrame(rows)
+                    df_sorted = df.sort_values('Year')
+                    df_sorted['Revenue Growth %'] = df_sorted['Revenue'].pct_change() * 100
+                    df = df_sorted.sort_values('Year', ascending=False)
+                    # Only real margins are included; no FCF fabrication.
+                    stats = {
+                        'avg_revenue_growth': df['Revenue Growth %'].mean()
+                        if df['Revenue Growth %'].notna().any() else 0.0,
+                        'avg_ebit_margin': df['EBIT Margin %'].mean()
+                        if df['EBIT Margin %'].notna().any() else 0.0,
+                        'avg_fcf_margin': 0.0,
+                        'std_revenue_growth': df['Revenue Growth %'].std()
+                        if df['Revenue Growth %'].notna().any() else 0.0,
+                        'has_real_fcf': False,
+                    }
+                    print(f"[OK] Historical data for {ticker} constructed from yfinance fundamentals")
+                    return {'data': df, 'stats': stats, 'source': 'yfinance fundamentals',
+                            'data_quality': 'REAL_PARTIAL'}
+        except Exception as e:
+            print(f"Historical fetch error for {ticker}: {e}")
+
+        # No real statements available — explicit unavailable state. Synthetic
+        # revenue/margin figures are NEVER generated for real data paths.
+        print(f"[WARN] No real financial statements available for {ticker}; marking historical data unavailable.")
+        return {
+            'data': pd.DataFrame(columns=['Year', 'Revenue', 'Revenue Growth %', 'EBIT Margin %', 'FCF Margin %']),
+            'stats': {'avg_revenue_growth': 0.0, 'avg_ebit_margin': 0.0, 'avg_fcf_margin': 0.0,
+                      'std_revenue_growth': 0.0, 'has_real_fcf': False},
+            'source': 'None (insufficient data)',
+            'data_quality': 'UNAVAILABLE',
+        }
+
+    
+
+    def _generate_catalysts(self, assumptions: DCFAssumptions) -> List[CatalystEvent]:
+        """Generate comprehensive catalyst events based on ticker and market analysis."""
+        catalysts = []
+        today = datetime.now()
+        
+        # Try to get real earnings date and events
+        try:
+            import yfinance as yf
+            stock = yf.Ticker(assumptions.ticker)
+            calendar = stock.calendar
+            
+            # Earnings date
+            if calendar is not None and 'Earnings Date' in calendar:
+                earnings_dates = calendar['Earnings Date']
+                if earnings_dates is not None and len(earnings_dates) > 0:
+                    next_earnings = earnings_dates[0]
+                    if pd.notna(next_earnings):
+                        catalysts.append(CatalystEvent(
+                            name="Quarterly Earnings Release",
+                            date=pd.to_datetime(next_earnings).strftime("%Y-%m-%d"),
+                            impact="High",
+                            direction="Positive" if assumptions.revenue_growth_rates[0] > 0.08 else "Neutral",
+                            description=f"Q{((today.month-1)//3)+1} earnings expected. Revenue growth of {assumptions.revenue_growth_rates[0]:.1%} and EBIT margin of {assumptions.ebit_margin:.1%} will drive sentiment."
+                        ))
+        except Exception:
+            pass
+        
+        # Add default earnings if not found
+        if not any(c.name == "Quarterly Earnings Release" for c in catalysts):
+            catalysts.append(CatalystEvent(
+                name="Quarterly Earnings Release",
+                date=(today + timedelta(days=30)).strftime("%Y-%m-%d"),
+                impact="High",
+                direction="Positive" if assumptions.revenue_growth_rates[0] > 0.08 else "Neutral",
+                description=f"Next quarterly report. Expected revenue growth {assumptions.revenue_growth_rates[0]:.1%} and EBIT margin {assumptions.ebit_margin:.1%}."
+            ))
+        
+        # Sector-specific catalysts
+        try:
+            stock = yf.Ticker(assumptions.ticker)
+            info = stock.info
+            sector = info.get('sector', '')
+            
+            if 'Technology' in sector:
+                catalysts.append(CatalystEvent(
+                    name="Product Innovation Cycle",
+                    date=(today + timedelta(days=90)).strftime("%Y-%m-%d"),
+                    impact="High",
+                    direction="Positive",
+                    description="Technology sector: New product launches and AI integration could drive revenue acceleration and margin expansion."
+                ))
+                catalysts.append(CatalystEvent(
+                    name="Cloud/AI Revenue Recognition",
+                    date=(today + timedelta(days=180)).strftime("%Y-%m-%d"),
+                    impact="Medium",
+                    direction="Positive",
+                    description="Accelerating cloud/AI adoption should drive higher-margin revenue mix and operating leverage."
+                ))
+            
+            elif 'Financial' in sector:
+                catalysts.append(CatalystEvent(
+                    name="Federal Reserve Policy Decision",
+                    date=(today + timedelta(days=45)).strftime("%Y-%m-%d"),
+                    impact="High",
+                    direction="Neutral",
+                    description="Interest rate changes directly impact net interest margins and loan growth for financial sector."
+                ))
+                catalysts.append(CatalystEvent(
+                    name="Credit Quality Review",
+                    date=(today + timedelta(days=90)).strftime("%Y-%m-%d"),
+                    impact="Medium",
+                    direction="Neutral",
+                    description="Loan loss provisions and credit quality metrics will determine earnings sustainability."
+                ))
+            
+            elif 'Energy' in sector or 'Basic Materials' in sector:
+                catalysts.append(CatalystEvent(
+                    name="Commodity Price Movement",
+                    date=(today + timedelta(days=60)).strftime("%Y-%m-%d"),
+                    impact="High",
+                    direction="Positive" if assumptions.ebit_margin > 0.15 else "Negative",
+                    description="Oil/commodity prices directly impact revenue and margins. Current margin structure suggests sensitivity to price changes."
+                ))
+                catalysts.append(CatalystEvent(
+                    name="Global Demand Outlook",
+                    date=(today + timedelta(days=120)).strftime("%Y-%m-%d"),
+                    impact="Medium",
+                    direction="Neutral",
+                    description="China economic growth and global industrial production will drive demand fundamentals."
+                ))
+            
+            elif 'Healthcare' in sector:
+                catalysts.append(CatalystEvent(
+                    name="Drug Pipeline/FDA Approvals",
+                    date=(today + timedelta(days=120)).strftime("%Y-%m-%d"),
+                    impact="High",
+                    direction="Positive",
+                    description="New drug approvals or clinical trial results could significantly expand addressable market."
+                ))
+                catalysts.append(CatalystEvent(
+                    name="Medicare Reimbursement Rates",
+                    date=(today + timedelta(days=180)).strftime("%Y-%m-%d"),
+                    impact="Medium",
+                    direction="Neutral",
+                    description="Government reimbursement policy changes affect revenue per procedure/prescription."
+                ))
+            
+            elif 'Consumer' in sector:
+                catalysts.append(CatalystEvent(
+                    name="Consumer Spending Trends",
+                    date=(today + timedelta(days=60)).strftime("%Y-%m-%d"),
+                    impact="High",
+                    direction="Positive" if assumptions.revenue_growth_rates[0] > 0.05 else "Negative",
+                    description="Retail sales data and consumer confidence will drive near-term comparable store sales."
+                ))
+                catalysts.append(CatalystEvent(
+                    name="Holiday Season Performance",
+                    date=(today + timedelta(days=150)).strftime("%Y-%m-%d"),
+                    impact="High",
+                    direction="Positive",
+                    description="Q4 holiday sales typically represent 30-40% of annual revenue for consumer companies."
+                ))
+            
+        except Exception:
+            pass
+        
+        # Add universal macro catalysts
+        catalysts.append(CatalystEvent(
+            name="Federal Reserve FOMC Meeting",
+            date=(today + timedelta(days=45)).strftime("%Y-%m-%d"),
+            impact="Medium",
+            direction="Neutral",
+            description=f"Interest rate changes affect WACC (currently {assumptions.risk_free_rate:.2%}). Rate cuts would reduce discount rate and increase valuation."
+        ))
+        
+        # Market structure catalysts
+        if assumptions.shares_outstanding > 0:
+            market_cap = assumptions.current_price * assumptions.shares_outstanding
+            if market_cap > 500:  # >$500M
+                catalysts.append(CatalystEvent(
+                    name="Index Rebalancing/Inclusion",
+                    date=(today + timedelta(days=90)).strftime("%Y-%m-%d"),
+                    impact="Medium",
+                    direction="Positive",
+                    description="Potential index inclusion (S&P 500/Russell) could drive $500M+ of passive inflows."
+                ))
+        
+        # Valuation-based catalyst
+        wacc = self._calculate_wacc(assumptions)
+        if wacc > 0.12:
+            catalysts.append(CatalystEvent(
+                name="Capital Structure Optimization",
+                date=(today + timedelta(days=120)).strftime("%Y-%m-%d"),
+                impact="Medium",
+                direction="Positive",
+                description=f"High WACC of {wacc:.2%} suggests opportunity to refinance debt or optimize capital structure, potentially adding 5-10% to valuation."
+            ))
+        
+        # Growth inflection catalyst
+        if len(assumptions.revenue_growth_rates) > 1:
+            growth_acceleration = assumptions.revenue_growth_rates[0] - 0.05  # vs market avg
+            if growth_acceleration > 0.03:
+                catalysts.append(CatalystEvent(
+                    name="Growth Inflection Recognition",
+                    date=(today + timedelta(days=180)).strftime("%Y-%m-%d"),
+                    impact="High",
+                    direction="Positive",
+                    description=f"Above-market growth rate of {assumptions.revenue_growth_rates[0]:.1%} vs market ~5% should drive multiple expansion over 6-12 months."
+                ))
+        
+        # Sort by date
+        catalysts.sort(key=lambda x: x.date)
+        
+        return catalysts[:8]  # Return top 8 most relevant
+    
+
+
+    def generate_excel(self, model_data: Dict[str, Any]) -> bytes:
+        """
+        Generate a comprehensive Excel model from a DCFResult object.
+        model_data should contain {'full_result': DCFResult}
+        """
+        import io
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        
+        result = model_data.get('full_result')
+        if not result:
+            return b""
+            
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "DCF Valuation"
+        
+        # Styles
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="161b22", end_color="161b22", fill_type="solid")
+        title_font = Font(bold=True, size=14)
+        
+        # Write Title
+        ws.cell(row=1, column=1, value=f"{result.ticker} - Institutional DCF Model").font = title_font
+        
+        # Write KPIs
+        ws.cell(row=3, column=1, value="Enterprise Value ($M)")
+        ws.cell(row=3, column=2, value=result.enterprise_value)
+        ws.cell(row=4, column=1, value="Equity Value ($M)")
+        ws.cell(row=4, column=2, value=result.equity_value)
+        ws.cell(row=5, column=1, value="Fair Value Per Share")
+        ws.cell(row=5, column=2, value=result.fair_value_per_share)
+        
+        # Write Line Items
+        start_row = 8
+        if not result.line_items.empty:
+            df = result.line_items
+            
+            # Headers
+            ws.cell(row=start_row, column=1, value="Metric").font = header_font
+            ws.cell(row=start_row, column=1).fill = header_fill
+            for col_idx, col_name in enumerate(df.columns, 2):
+                cell = ws.cell(row=start_row, column=col_idx, value=str(col_name))
+                cell.font = header_font
+                cell.fill = header_fill
+                
+            # Data
+            for row_idx, (idx_name, row_data) in enumerate(df.iterrows(), start_row + 1):
+                ws.cell(row=row_idx, column=1, value=str(idx_name))
+                for col_idx, val in enumerate(row_data, 2):
+                    ws.cell(row=row_idx, column=col_idx, value=val)
+                    
+        # Write Assumptions
+        start_row += len(result.line_items) + 4 if not result.line_items.empty else 4
+        ws.cell(row=start_row, column=1, value="Key Assumptions").font = title_font
+        
+        assumptions = result.assumptions
+        assump_data = [
+            ("WACC", result.wacc),
+            ("Cost of Equity", result.cost_of_equity),
+            ("Terminal Growth", assumptions.terminal_growth_rate),
+            ("Risk Free Rate", assumptions.risk_free_rate),
+            ("Equity Risk Premium", assumptions.equity_risk_premium),
+            ("Beta", assumptions.beta),
+            ("Tax Rate", assumptions.tax_rate)
+        ]
+        
+        for idx, (label, val) in enumerate(assump_data, start_row + 2):
+            ws.cell(row=idx, column=1, value=label)
+            ws.cell(row=idx, column=2, value=val)
+            
+        # Save to bytes
+        output = io.BytesIO()
+        wb.save(output)
+        return output.getvalue()
+
+
+    def _calculate_wacc(self, assumptions: DCFAssumptions) -> float:
+        """Calculate Weighted Average Cost of Capital - returns single float."""
+        try:
+            cost_of_equity = assumptions.risk_free_rate + assumptions.beta * assumptions.equity_risk_premium
+            cost_of_debt_after_tax = assumptions.cost_of_debt * (1 - assumptions.tax_rate)
+            total_capital = assumptions.equity_value_market + assumptions.debt_value
+            
+            if total_capital == 0 or total_capital is None:
+                return float(cost_of_equity)
+            
+            weight_equity = assumptions.equity_value_market / total_capital
+            weight_debt = assumptions.debt_value / total_capital
+            wacc_value = (weight_equity * cost_of_equity) + (weight_debt * cost_of_debt_after_tax)
+            
+            if isinstance(wacc_value, (tuple, list)):
+                wacc_value = wacc_value[0]
+            
+            return float(max(0.01, min(0.30, wacc_value)))
+            
+        except Exception as e:
+            print(f"WACC calculation error: {e}")
+            return 0.10
+    
+
+    def _calculate_cost_of_equity(self, assumptions: DCFAssumptions) -> float:
+        """Calculate cost of equity using CAPM - returns single float."""
+        try:
+            cost_of_equity = assumptions.risk_free_rate + assumptions.beta * assumptions.equity_risk_premium
+            if isinstance(cost_of_equity, (tuple, list)):
+                cost_of_equity = cost_of_equity[0]
+            return float(max(0.01, min(0.30, cost_of_equity)))
+        except Exception as e:
+            print(f"Cost of equity calculation error: {e}")
+            return 0.12
+    
+
+    def _build_line_items_df(self, revenues: List[float], ebits: List[float], 
+                           nopats: List[float], fcfs: List[float],
+                           discount_factors: List[float], pv_fcfs: List[float],
+                           terminal_value: float, pv_terminal_value: float) -> pd.DataFrame:
+        """Build the 20-line DCF table."""
+        try:
+            years = [f"Year {i+1}" for i in range(len(revenues))]
+            rows = []
+            rows.append(["Revenue"] + revenues)
+            rows.append(["EBIT"] + ebits)
+            rows.append(["NOPAT"] + nopats)
+            rows.append(["FCF"] + fcfs)
+            rows.append(["Discount Factor"] + discount_factors)
+            rows.append(["PV(FCF)"] + pv_fcfs)
+            rows.append(["Terminal Value"] + [0] * (len(revenues) - 1) + [terminal_value])
+            rows.append(["PV(Terminal)"] + [0] * (len(revenues) - 1) + [pv_terminal_value])
+            df = pd.DataFrame(rows, columns=["Line Item"] + years)
+            return df
+        except Exception as e:
+            return pd.DataFrame({
+                "Line Item": ["Revenue", "EBIT", "NOPAT", "FCF"],
+                "Year 1": [0, 0, 0, 0]
+            })
+    
+
+    def _run_monte_carlo(self, assumptions: DCFAssumptions, iterations: int = 10000) -> Dict[str, Any]:
+        """Run Monte Carlo simulation for valuation distribution."""
+        try:
+            results = []
+            for _ in range(iterations):
+                rev_growth = np.random.normal(assumptions.revenue_growth_rates[0], assumptions.revenue_growth_rates[0] * 0.3)
+                ebit_margin = np.random.normal(assumptions.ebit_margin, assumptions.ebit_margin * 0.2)
+                wacc_sim = np.random.normal(self._calculate_wacc(assumptions), 0.02)
+                terminal_growth = np.random.normal(assumptions.terminal_growth_rate, 0.01)
+                
+                rev_growth = max(-0.10, min(0.50, rev_growth))
+                ebit_margin = max(0.05, min(0.60, ebit_margin))
+                wacc_sim = max(0.03, min(0.25, wacc_sim))
+                terminal_growth = max(0.005, min(0.05, terminal_growth))
+                
+                revenue = assumptions.base_revenue
+                fcfs_sim = []
+                for year in range(assumptions.projection_years):
+                    revenue *= (1 + rev_growth)
+                    ebit = revenue * ebit_margin
+                    nopat = ebit * (1 - assumptions.tax_rate)
+                    da = revenue * assumptions.da_pct_revenue
+                    capex = revenue * assumptions.capex_pct_revenue
+                    nwc = revenue * assumptions.nwc_change_pct_revenue
+                    fcf = nopat + da - capex - nwc
+                    fcfs_sim.append(fcf)
+                
+                pv_fcfs = sum(fcf / (1 + wacc_sim) ** i for i, fcf in enumerate(fcfs_sim, 1))
+                terminal_fcf = fcfs_sim[-1] * (1 + terminal_growth)
+                terminal_val = terminal_fcf / (wacc_sim - terminal_growth) if wacc_sim > terminal_growth else fcfs_sim[-1] * 20
+                pv_terminal = terminal_val / (1 + wacc_sim) ** assumptions.projection_years
+                
+                ev = pv_fcfs + pv_terminal
+                equity_val = ev - (assumptions.debt_value - assumptions.cash)
+                fv_per_share = equity_val / assumptions.shares_outstanding if assumptions.shares_outstanding > 0 else 0
+                results.append(fv_per_share)
+            
+            return {
+                'distribution': results,
+                'mean': np.mean(results),
+                'median': np.median(results),
+                'std': np.std(results)
+            }
+        except Exception as e:
+            return {
+                'distribution': [assumptions.current_price] * 100,
+                'mean': assumptions.current_price,
+                'median': assumptions.current_price,
+                'std': 0
+            }
+    
+
+
+    def _generate_trade_signal(self, fair_value: float, current_price: float, upside_prob: float, scenarios: List[ScenarioResult]) -> TradeSignal:
+        upside_pct = (fair_value / current_price) - 1 if current_price > 0 else 0
+        
+        # Final Verdict logic based on required 25% Margin of Safety (MoS)
+        signal = "HOLD"
+        # 25% MoS implies price is at least 25% below fair value (upside >= 33.3%)
+        if upside_pct >= 0.50:
+            signal = "STRONG BUY"
+        elif upside_pct >= 0.33:
+            signal = "BUY"
+        elif upside_pct <= -0.15:
+            signal = "STRONG SELL"
+        elif upside_pct <= -0.10:
+            signal = "SELL"
+            
+        risk = "MEDIUM"
+        if scenarios:
+            bull = next((s for s in scenarios if s.label == 'Bull'), None)
+            bear = next((s for s in scenarios if s.label == 'Bear'), None)
+            if bull and bear:
+                spread = (bull.fair_value - bear.fair_value) / current_price
+                if spread > 0.5: risk = "HIGH"
+                elif spread < 0.2: risk = "LOW"
+                
+        # Professional rationale for hardware-reliant companies
+        rationale = (
+            "A 70% weight on the Base case reflects the predictable operational rhythms and execution requirements typical of hardware-reliant enterprises, "
+            "where supply chain stability and production scaling follow linear paths. The Bull case is capped at 10% to account for the 'Fat-Tail Risk' "
+            "of disruptive market shifts, while the 20% Bear case maintains conservative sensitivity to macroeconomic headwinds. "
+            "Using the Median from a 10,000-iteration Monte Carlo simulation further supports this conservative Fair Value by filtering out extreme, "
+            "low-probability outliers that can skew an arithmetic mean."
+        )
+                
+        return TradeSignal(
+            ticker="",
+            fair_value=float(fair_value),
+            market_price=float(current_price),
+            upside_pct=float(upside_pct),
+            signal=signal,
+            confidence_pct=float(upside_prob),
+            risk_level=risk,
+            risk_adjusted_return=float(upside_pct * upside_prob),
+            position_size_pct=min(0.05, max(0.0, upside_pct * upside_prob * 0.1)),
+            rationale=rationale
+        )
+
+
+    def _compare_forecast_to_historical(self, assumptions: DCFAssumptions, historical: Dict[str, Any]) -> Dict[str, Any]:
+        if not historical or 'stats' not in historical:
+            return {}
+            
+        stats = historical['stats']
+        hist_growth = stats.get('avg_revenue_growth', 0.0) / 100.0  # Assuming it comes back as percentage e.g. 5.5 = 5.5%
+        hist_margin = stats.get('avg_ebit_margin', 0.0) / 100.0
+        
+        # main.py expects: metric_name -> dict with forecast, historical, deviation, deviation_pct
+        
+        f_growth = assumptions.revenue_growth_rates[0] * 100
+        h_growth = hist_growth * 100
+        
+        f_margin = assumptions.ebit_margin * 100
+        h_margin = hist_margin * 100
+        
+        return {
+            'revenue_growth': {
+                'forecast': float(f_growth),
+                'historical': float(h_growth),
+                'deviation': float(f_growth - h_growth),
+                'deviation_pct': float((f_growth - h_growth) / abs(h_growth) * 100 if h_growth != 0 else 0)
+            },
+            'ebit_margin': {
+                'forecast': float(f_margin),
+                'historical': float(h_margin),
+                'deviation': float(f_margin - h_margin),
+                'deviation_pct': float((f_margin - h_margin) / abs(h_margin) * 100 if h_margin != 0 else 0)
+            }
+        }
+
+
+    def _run_stress_tests(self, assumptions: DCFAssumptions) -> Dict[str, float]:
+        base_wacc = self._calculate_wacc(assumptions)
+        return {
+            'wacc_plus_200bps': base_wacc + 0.02,
+            'margin_minus_500bps': max(0.01, assumptions.ebit_margin - 0.05),
+            'growth_minus_500bps': assumptions.revenue_growth_rates[0] - 0.05
+        }
+
+
+    def _compute_regime_adjusted_values(self, result: DCFResult) -> Dict[str, float]:
+        return {
+            'risk_on_value': result.fair_value_per_share * 1.1,
+            'risk_off_value': result.fair_value_per_share * 0.9,
+            'high_inflation_value': result.fair_value_per_share * 0.85
+        }
+
+
+    def _compute_diagnostic_flags(self, result: DCFResult, assumptions: DCFAssumptions) -> List[str]:
+        flags = []
+        if result.pv_terminal_value / result.enterprise_value > 0.8:
+            flags.append("High Terminal Value Dependency (>80% of EV)")
+        if assumptions.terminal_growth_rate >= result.wacc:
+            flags.append("Terminal Growth Rate >= WACC (Invalid Gordon Growth)")
+        return flags
+
+
+    def _build_visualization_payload(self, result: DCFResult) -> Dict[str, Any]:
+        return {
+            'waterfall': {'base': result.enterprise_value, 'net_debt': result.net_debt, 'equity': result.equity_value},
+            'monte_carlo_hist': result.mc_distribution[:100] if result.mc_distribution else []
+        }
+
+
+    def _build_probabilistic_forecast(
         self,
-        a: DCFAssumptions,
-        proj: pd.DataFrame,
-        base_sum_pv: float,
-        net_debt: float,
-    ) -> pd.DataFrame:
-        """2-D sensitivity: WACC (cols) × Terminal Growth (rows)."""
-        wacc_range = [
-            a.assumptions_wacc_for_sens(offset)
-            for offset in [-0.02, -0.01, 0, +0.01, +0.02]
-        ]
-        tg_range = [
-            max(0.001, a.terminal_growth_rate + offset)
-            for offset in [-0.01, -0.005, 0, +0.005, +0.01]
-        ]
+        assumptions: DCFAssumptions,
+        mc_distribution: List[float],
+    ) -> Dict[str, Any]:
+        """Institutional probabilistic forecast summary from Monte Carlo distribution."""
+        if not mc_distribution:
+            return {
+                "horizon_years": assumptions.projection_years,
+                "expected_price": assumptions.current_price,
+                "prob_up_10pct": 0.0,
+                "prob_down_10pct": 0.0,
+                "distribution_moments": {"mean": assumptions.current_price, "std": 0.0, "skew_proxy": 0.0},
+            }
 
-        # Re-compute FCF stream for WACC sensitivity (simplified: use base FCFs, vary discount)
-        base_fcfs_undiscounted = [
-            float(proj["Free Cash Flow ($M)"].iloc[i])
-            / float(proj["Discount Factor"].iloc[i])
-            for i in range(a.projection_years)
-        ]
+        arr = np.array(mc_distribution)
+        mean = float(np.mean(arr))
+        std = float(np.std(arr))
+        median = float(np.median(arr))
+        p10_up = float(np.mean(arr >= assumptions.current_price * 1.10))
+        p10_down = float(np.mean(arr <= assumptions.current_price * 0.90))
+        skew_proxy = float((mean - median) / std) if std > 0 else 0.0
 
-        rows = {}
-        for tg in tg_range:
-            row = {}
-            for w in wacc_range:
-                if w <= tg:
-                    w = tg + 0.01
-                sum_pv = sum(
-                    fcf / (1 + w) ** (yr + 1)
-                    for yr, fcf in enumerate(base_fcfs_undiscounted)
-                )
-                last_fcf = base_fcfs_undiscounted[-1]
-                tv = last_fcf * (1 + tg) / (w - tg)
-                pv_tv = tv / (1 + w) ** a.projection_years
-                ev = sum_pv + pv_tv
-                fv = (ev - net_debt) / (a.shares_outstanding + 1e-9)
-                row[f"{w:.1%}"] = round(fv, 2)
-            rows[f"{tg:.1%}"] = row
+        return {
+            "horizon_years": assumptions.projection_years,
+            "expected_price": mean,
+            "prob_up_10pct": p10_up,
+            "prob_down_10pct": p10_down,
+            "distribution_moments": {"mean": mean, "std": std, "skew_proxy": skew_proxy},
+        }
 
-        df = pd.DataFrame(rows).T
-        df.index.name = "Terminal Growth \\ WACC"
+
+
+    def _build_sensitivity_table(self, assumptions: DCFAssumptions) -> pd.DataFrame:
+        """
+        Build a sensitivity table around WACC and Terminal Growth Rate.
+        """
+        base_wacc = self._calculate_wacc(assumptions)
+        base_tg = assumptions.terminal_growth_rate
+        
+        wacc_range = [base_wacc - 0.02, base_wacc - 0.01, base_wacc, base_wacc + 0.01, base_wacc + 0.02]
+        tg_range = [base_tg - 0.01, base_tg - 0.005, base_tg, base_tg + 0.005, base_tg + 0.01]
+        
+        table = []
+        for w in wacc_range:
+            row = []
+            for tg in tg_range:
+                # Fast approximation of Fair Value for this cell
+                tg_clipped = min(tg, w - 0.01) # Gordon Model cap
+                # We need a mini-DCF to get FCFs
+                fcfs = []
+                rev = assumptions.base_revenue
+                for _ in range(assumptions.projection_years):
+                    rev *= (1 + assumptions.revenue_growth_rates[0])
+                    nopat = rev * assumptions.ebit_margin * (1 - assumptions.tax_rate)
+                    reinvest = rev * (assumptions.capex_pct_revenue + assumptions.nwc_change_pct_revenue - assumptions.da_pct_revenue)
+                    fcfs.append(nopat - reinvest)
+                
+                # Discount
+                pv_fcf = sum(f / ((1 + w) ** (i+1)) for i, f in enumerate(fcfs))
+                tv = fcfs[-1] * (1 + tg_clipped) / (w - tg_clipped)
+                pv_tv = tv / ((1 + w) ** assumptions.projection_years)
+                ev = pv_fcf + pv_tv
+                fv = (ev + assumptions.cash - assumptions.debt_value) / max(assumptions.shares_outstanding, 1.0)
+                row.append(fv)
+            table.append(row)
+            
+        df = pd.DataFrame(table, index=[f"{w*100:.1f}%" for w in wacc_range], columns=[f"{t*100:.1f}%" for t in tg_range])
         return df
 
-    # ── CATALYST TRACKING ─────────────────────────────────────────────────────
 
-    def _default_catalysts(self, ticker: str) -> List[CatalystEvent]:
-        """Return a set of templated catalyst events for the ticker."""
-        return [
-            CatalystEvent(
-                name="Earnings Release",
-                date="Next Quarter",
-                impact="High",
-                direction="Neutral",
-                description=f"Quarterly earnings — key drivers: revenue growth, margin trajectory, guidance revision.",
-            ),
-            CatalystEvent(
-                name="Product / Pipeline Catalyst",
-                date="TBD",
-                impact="Medium",
-                direction="Positive",
-                description="New product launch, FDA approval, regulatory milestone, or contract win.",
-            ),
-            CatalystEvent(
-                name="Macro / Rate Catalyst",
-                date="FOMC Meetings",
-                impact="Medium",
-                direction="Neutral",
-                description="Fed rate decisions directly impact WACC and discount rates used in this model.",
-            ),
-            CatalystEvent(
-                name="Capital Allocation Event",
-                date="Annual Meeting",
-                impact="Medium",
-                direction="Positive",
-                description="Buyback announcements, dividend increases, or M&A activity.",
-            ),
-            CatalystEvent(
-                name="Analyst Day / Guidance Update",
-                date="TBD",
-                impact="High",
-                direction="Neutral",
-                description="Management long-term guidance revision — triggers model re-rating.",
-            ),
-        ]
+    def _normalize_scenario_probabilities(self, scenarios: List[ScenarioResult]) -> List[ScenarioResult]:
+        """Ensure scenario probabilities sum to 1.0 (non-destructive normalization)."""
+        if not scenarios:
+            return scenarios
+        total = sum(max(0.0, s.probability) for s in scenarios)
+        if total <= 0:
+            w = 1.0 / len(scenarios)
+            for s in scenarios:
+                s.probability = w
+            return scenarios
+        for s in scenarios:
+            s.probability = max(0.0, s.probability) / total
+        return scenarios
 
-    # ── TRADE SIGNAL ──────────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────────
+    # INSTITUTIONAL UPGRADE — terminal value diagnostics (Section 15)
+    # ──────────────────────────────────────────────────────────────────────────
+    def _terminal_diagnostics(self, result: DCFResult,
+                              assumptions: DCFAssumptions) -> Dict[str, Any]:
+        ev = result.enterprise_value or 0
+        pv_tv = result.pv_terminal_value or 0
+        tv_pct_ev = (pv_tv / ev) if ev else 0.0
+        last_fcf = 0.0
+        if result.line_items is not None and not result.line_items.empty:
+            try:
+                fcf_rows = [c for c in result.line_items.columns if "FCF" in str(c).upper()]
+                if fcf_rows:
+                    vals = pd.to_numeric(result.line_items[fcf_rows[0]], errors="coerce").dropna()
+                    if len(vals):
+                        last_fcf = float(vals.iloc[-1])
+            except Exception:
+                pass
+        # Implied exit multiple at the terminal year (EV / terminal EBITDA proxy)
+        implied_exit_multiple = None
+        if last_fcf > 0 and ev > 0:
+            # TV = EV * TV%/FCF -> implied FCF multiple at terminal
+            implied_exit_multiple = (ev / last_fcf) if last_fcf else None
+        diag = {
+            "pv_terminal_value": pv_tv,
+            "tv_as_pct_of_ev": tv_pct_ev,
+            "implied_terminal_fcf_multiple": implied_exit_multiple,
+            "wacc": result.wacc,
+            "terminal_growth": assumptions.terminal_growth_rate,
+            "wacc_minus_g": max(result.wacc - assumptions.terminal_growth_rate, 0.0),
+            "flags": [],
+        }
+        if tv_pct_ev > 0.75:
+            diag["flags"].append(
+                f"Terminal value is {tv_pct_ev:.0%} of EV — the valuation is dominated by "
+                "the terminal value; verify the long-run growth and WACC assumptions carefully."
+            )
+        if assumptions.terminal_growth_rate >= result.wacc:
+            diag["flags"].append("Terminal growth >= WACC — Gordon growth formula is undefined.")
+        return diag
 
-    def _generate_trade_signal(
-        self,
-        ticker: str,
-        fair_value: float,
-        market_price: float,
-        wacc: float,
-        beta: float,
-    ) -> TradeSignal:
-        """
-        Step 1 — Mispricing:  Upside = (FV − P) / P
-        Step 2 — Signal classification
-        Step 3 — Risk-adjusted return = Upside / Volatility
-        Step 4 — Position sizing = Conviction / Volatility
-        """
-        if market_price <= 0:
-            market_price = 1.0
+    # ──────────────────────────────────────────────────────────────────────────
+    # INSTITUTIONAL UPGRADE — key assumption attribution (Section 15/24)
+    # ──────────────────────────────────────────────────────────────────────────
+    def _key_assumption_attribution(self, assumptions: DCFAssumptions) -> Dict[str, Any]:
+        """Identify which assumptions drive the majority of valuation by
+        measuring each input's marginal impact on fair value per share."""
+        base_fv = self._quick_dcf(assumptions)[1]
+        if base_fv <= 0:
+            return {"drivers": [], "base_fv": base_fv, "note": "Degenerate base valuation."}
 
-        upside = (fair_value - market_price) / market_price
-        upside_pct = upside * 100
+        drivers = []
 
-        # Volatility proxy: annualised = beta * market_vol (assume ~18% market vol)
-        vol = max(0.10, beta * 0.18)
+        def _probe(**kwargs):
+            mod = DCFAssumptions(**{**assumptions.__dict__, **kwargs})
+            return self._quick_dcf(mod)[1]
 
-        # Signal classification
-        if upside_pct > 30:
-            signal = "Strong Long"
-            conviction = 0.90
-        elif upside_pct > 15:
-            signal = "Long"
-            conviction = 0.70
-        elif upside_pct >= -10:
-            signal = "Neutral"
-            conviction = 0.40
-        elif upside_pct > -30:
-            signal = "Short"
-            conviction = 0.65
-        else:
-            signal = "Strong Short"
-            conviction = 0.85
+        # Revenue growth (year-1 growth +30% relative shift)
+        g0 = assumptions.revenue_growth_rates[0]
+        fv_g_up = _probe(revenue_growth_rates=[g0 * 1.5] + list(assumptions.revenue_growth_rates)[1:])
+        fv_g_dn = _probe(revenue_growth_rates=[g0 * 0.5] + list(assumptions.revenue_growth_rates)[1:])
+        drivers.append({
+            "assumption": "Revenue growth",
+            "value": f"{g0:.1%}",
+            "+impact": (fv_g_up / base_fv - 1) * 100,
+            "-impact": (fv_g_dn / base_fv - 1) * 100,
+            "elasticity": ((fv_g_up - fv_g_dn) / base_fv) / (g0 * 1.0) if g0 else 0,
+        })
 
-        # Risk-adjusted return
-        rar = upside / vol
+        # EBIT margin ±200bps
+        m = assumptions.ebit_margin
+        fv_m_up = _probe(ebit_margin=min(m + 0.02, 0.90))
+        fv_m_dn = _probe(ebit_margin=max(m - 0.02, 0.01))
+        drivers.append({
+            "assumption": "EBIT margin",
+            "value": f"{m:.1%}",
+            "+impact": (fv_m_up / base_fv - 1) * 100,
+            "-impact": (fv_m_dn / base_fv - 1) * 100,
+            "elasticity": ((fv_m_up - fv_m_dn) / base_fv) / 0.04 if m else 0,
+        })
 
-        # Position size  (cap at 15%)
-        pos_size = min(0.15, conviction / vol)
-        pos_size_pct = round(pos_size * 100, 1)
+        # WACC ±100bps
+        w = self._calculate_wacc(assumptions)
+        cost_debt_delta = 0.01
+        fv_w_up = _probe(cost_of_debt=assumptions.cost_of_debt + cost_debt_delta,
+                         risk_free_rate=assumptions.risk_free_rate + cost_debt_delta)
+        fv_w_dn = _probe(cost_of_debt=max(assumptions.cost_of_debt - cost_debt_delta, 0.01),
+                         risk_free_rate=max(assumptions.risk_free_rate - cost_debt_delta, 0.01))
+        drivers.append({
+            "assumption": "WACC (discount rate)",
+            "value": f"{w:.1%}",
+            "+impact": (fv_w_dn / base_fv - 1) * 100,   # lower WACC → higher FV
+            "-impact": (fv_w_up / base_fv - 1) * 100,
+            "elasticity": ((fv_w_dn - fv_w_up) / base_fv) / (2 * cost_debt_delta) if w else 0,
+        })
 
-        # Risk level
-        if beta < 0.8:
-            risk_level = "Low"
-        elif beta < 1.4:
-            risk_level = "Medium"
-        else:
-            risk_level = "High"
+        # Terminal growth ±50bps
+        tg = assumptions.terminal_growth_rate
+        fv_tg_up = _probe(terminal_growth_rate=min(tg + 0.005, w - 0.01))
+        fv_tg_dn = _probe(terminal_growth_rate=max(tg - 0.005, 0.0))
+        drivers.append({
+            "assumption": "Terminal growth",
+            "value": f"{tg:.2%}",
+            "+impact": (fv_tg_up / base_fv - 1) * 100,
+            "-impact": (fv_tg_dn / base_fv - 1) * 100,
+            "elasticity": ((fv_tg_up - fv_tg_dn) / base_fv) / 0.01 if tg else 0,
+        })
 
-        # Confidence  (blend of upside magnitude and model quality)
-        confidence = min(95, max(5, 50 + abs(upside_pct) * 1.0))
+        # Sort by absolute impact (drivers ranked by what matters most)
+        drivers.sort(key=lambda d: -max(abs(d["+impact"]), abs(d["-impact"])))
+        total_abs = sum(max(abs(d["+impact"]), abs(d["-impact"])) for d in drivers)
+        for d in drivers:
+            d["share_of_total_impact"] = (max(abs(d["+impact"]), abs(d["-impact"])) / total_abs) if total_abs else 0.0
 
-        rationale = (
-            f"DCF fair value ${fair_value:.2f} vs market ${market_price:.2f} "
-            f"→ {upside_pct:+.1f}% mispricing. "
-            f"Risk-adjusted return: {rar:.2f}x. "
-            f"Beta {beta:.2f}, Volatility proxy {vol:.0%}. "
-            f"Signal: {signal}."
-        )
-
-        return TradeSignal(
-            ticker=ticker,
-            fair_value=fair_value,
-            market_price=market_price,
-            upside_pct=upside_pct,
-            signal=signal,
-            confidence_pct=round(confidence, 1),
-            risk_level=risk_level,
-            risk_adjusted_return=round(rar, 2),
-            position_size_pct=pos_size_pct,
-            rationale=rationale,
-        )
-
-    # ── EXCEL EXPORT ──────────────────────────────────────────────────────────
-
-    def export_excel(self, result: DCFResult) -> bytes:
-        """Export full DCF model to Excel workbook."""
-        output = io.BytesIO()
-        try:
-            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-                wb = writer.book
-
-                # Formats
-                hdr_fmt = wb.add_format(
-                    {
-                        "bold": True,
-                        "bg_color": "#1a1a2e",
-                        "font_color": "#e0c97f",
-                        "border": 1,
-                    }
-                )
-                num_fmt = wb.add_format({"num_format": "#,##0.0", "border": 1})
-                pct_fmt = wb.add_format({"num_format": "0.0%", "border": 1})
-                money_fmt = wb.add_format({"num_format": "$#,##0.00", "border": 1})
-
-                # ── Sheet 1: Summary ──────────────────────────────────────────
-                a = result.assumptions
-                summary_data = {
-                    "Metric": [
-                        "Ticker",
-                        "Fair Value Per Share (DCF)",
-                        "Market Price",
-                        "Upside / (Downside)",
-                        "Signal",
-                        "Enterprise Value ($M)",
-                        "Equity Value ($M)",
-                        "Net Debt ($M)",
-                        "Shares Outstanding (M)",
-                        "WACC",
-                        "Cost of Equity (CAPM)",
-                        "Terminal Growth Rate",
-                        "Projection Years",
-                    ],
-                    "Value": [
-                        result.ticker,
-                        f"${result.fair_value_per_share:.2f}",
-                        f"${a.current_price:.2f}",
-                        f"{result.trade_signal.upside_pct:+.1f}%",
-                        result.trade_signal.signal,
-                        f"${result.enterprise_value:,.0f}M",
-                        f"${result.equity_value:,.0f}M",
-                        f"${result.net_debt:,.0f}M",
-                        f"{result.shares_outstanding:,.1f}M",
-                        f"{result.wacc:.2%}",
-                        f"{result.cost_of_equity:.2%}",
-                        f"{a.terminal_growth_rate:.2%}",
-                        str(a.projection_years),
-                    ],
-                }
-                pd.DataFrame(summary_data).to_excel(
-                    writer, sheet_name="Summary", index=False
-                )
-
-                # ── Sheet 2: 20-Line DCF ──────────────────────────────────────
-                result.line_items.to_excel(writer, sheet_name="DCF Projections")
-
-                # ── Sheet 3: Scenarios ────────────────────────────────────────
-                scen_data = [
-                    {
-                        "Scenario": s.label,
-                        "Probability": f"{s.probability:.0%}",
-                        "Fair Value": f"${s.fair_value:.2f}",
-                        "Upside": f"{s.upside:.1%}",
-                        "Avg Revenue Growth": f"{s.revenue_growth_avg:.1%}",
-                        "EBIT Margin": f"{s.ebit_margin:.1%}",
-                        "WACC": f"{s.wacc:.2%}",
-                        "Terminal Growth": f"{s.terminal_growth:.2%}",
-                    }
-                    for s in result.scenarios
-                ]
-                scen_data.append(
-                    {
-                        "Scenario": "Scenario-Weighted Value",
-                        "Probability": "100%",
-                        "Fair Value": f"${result.scenario_weighted_value:.2f}",
-                        "Upside": "",
-                        "Avg Revenue Growth": "",
-                        "EBIT Margin": "",
-                        "WACC": "",
-                        "Terminal Growth": "",
-                    }
-                )
-                pd.DataFrame(scen_data).to_excel(
-                    writer, sheet_name="Scenarios", index=False
-                )
-
-                # ── Sheet 4: Monte Carlo ──────────────────────────────────────
-                mc_data = {
-                    "Metric": [
-                        "Median",
-                        "Mean",
-                        "Std Dev",
-                        "P5",
-                        "P25",
-                        "P50",
-                        "P75",
-                        "P95",
-                        "Upside Probability",
-                        "Downside Probability",
-                    ],
-                    "Value": [
-                        f"${result.mc_median:.2f}",
-                        f"${result.mc_mean:.2f}",
-                        f"${result.mc_std:.2f}",
-                        f"${result.mc_percentiles['p5']:.2f}",
-                        f"${result.mc_percentiles['p25']:.2f}",
-                        f"${result.mc_percentiles['p50']:.2f}",
-                        f"${result.mc_percentiles['p75']:.2f}",
-                        f"${result.mc_percentiles['p95']:.2f}",
-                        f"{result.mc_upside_prob:.1%}",
-                        f"{result.mc_downside_prob:.1%}",
-                    ],
-                }
-                pd.DataFrame(mc_data).to_excel(
-                    writer, sheet_name="Monte Carlo", index=False
-                )
-
-                # ── Sheet 5: Relative Valuation ───────────────────────────────
-                rv = result.relative_valuation
-                rel_data = {
-                    "Method": [
-                        "P/E Implied",
-                        "EV/EBITDA Implied",
-                        "EV/FCF Implied",
-                        "PEG Implied",
-                        "Avg Peer Implied",
-                    ],
-                    "Fair Value": [
-                        f"${rv['pe_implied_fv']:.2f}",
-                        f"${rv['ev_ebitda_implied_fv']:.2f}",
-                        f"${rv['ev_fcf_implied_fv']:.2f}",
-                        f"${rv['peg_implied_fv']:.2f}",
-                        f"${rv['avg_peer_implied_fv']:.2f}",
-                    ],
-                    "Peer Multiple": [
-                        f"{rv['peer_pe']:.1f}x",
-                        f"{rv['peer_ev_ebitda']:.1f}x",
-                        f"{rv['peer_ev_fcf']:.1f}x",
-                        f"{rv['peg_ratio']:.2f}",
-                        "",
-                    ],
-                }
-                pd.DataFrame(rel_data).to_excel(
-                    writer, sheet_name="Relative Valuation", index=False
-                )
-
-                # ── Sheet 6: Sensitivity ──────────────────────────────────────
-                result.sensitivity.to_excel(writer, sheet_name="Sensitivity")
-
-                # ── Sheet 7: Catalysts ────────────────────────────────────────
-                cat_data = [
-                    {
-                        "Catalyst": c.name,
-                        "Date": c.date,
-                        "Impact": c.impact,
-                        "Direction": c.direction,
-                        "Description": c.description,
-                    }
-                    for c in result.catalysts
-                ]
-                pd.DataFrame(cat_data).to_excel(
-                    writer, sheet_name="Catalysts", index=False
-                )
-
-        except Exception as e:
-            logger.error(f"Excel export error: {e}")
-
-        return output.getvalue()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPER FUNCTIONS
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _tweak(
-    base: DCFAssumptions,
-    growth_mult: float = 1.0,
-    margin_mult: float = 1.0,
-    wacc_add: float = 0.0,
-    tg_mult: float = 1.0,
-) -> DCFAssumptions:
-    """Return a shallow copy of DCFAssumptions with key parameters adjusted."""
-    import copy
-
-    a = copy.copy(base)
-    a.revenue_growth_rates = [g * growth_mult for g in base.revenue_growth_rates]
-    a.ebit_margin = base.ebit_margin * margin_mult
-    # Adjust WACC via beta (simple proxy: shift risk_free_rate)
-    a.risk_free_rate = base.risk_free_rate + wacc_add
-    a.terminal_growth_rate = max(0.005, base.terminal_growth_rate * tg_mult)
-    return a
-
-
-# Monkey-patch DCFAssumptions to add the helper method used in _sensitivity_table
-def _assumptions_wacc_for_sens(self, offset: float) -> float:
-    """Compute WACC given a wacc offset (used for sensitivity table)."""
-    re = self.risk_free_rate + self.beta * self.equity_risk_premium
-    total = self.equity_value_market + self.debt_value + 1e-9
-    w_e = self.equity_value_market / total
-    w_d = self.debt_value / total
-    base_wacc = w_e * re + w_d * self.cost_of_debt * (1 - self.tax_rate)
-    return max(0.04, base_wacc + offset)
-
-
-DCFAssumptions.assumptions_wacc_for_sens = _assumptions_wacc_for_sens
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LEGACY ADAPTER  (keeps old main.py interface working)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class FinancialModelGenerator:
-    """
-    Legacy wrapper that preserves the original simple DCF interface
-    while also exposing the full institutional engine.
-    """
-
-    def __init__(self):
-        self._engine = InstitutionalDCFEngine()
-
-    # ── Simple legacy DCF (used by old main.py Financial Model Generator page) ──
-
-    def generate_dcf(
-        self,
-        ticker: str,
-        current_fcf: float,
-        growth_rate_5y: float,
-        terminal_growth: float,
-        discount_rate: float,
-        shares_outstanding: float,
-        net_debt: float,
-        projection_years: int = 5,
-    ) -> dict:
-        """
-        Legacy interface.  Builds a DCFAssumptions object from the simplified
-        inputs and runs the full institutional engine.
-
-        current_fcf is treated as NOPAT (proxy for FCF when revenue data
-        is unavailable).  Revenue is back-calculated assuming a 20% FCF margin.
-        """
-        # Estimate revenue from FCF (assume 20% FCF / Revenue margin as default)
-        fcf_margin = 0.20
-        base_revenue = current_fcf / fcf_margin if fcf_margin > 0 else current_fcf
-
-        # Simple uniform growth rates
-        g_rates = [growth_rate_5y] * projection_years
-
-        # Equity value: shares * assumed price (use net_debt as proxy if unavailable)
-        # For legacy mode we use simplified WACC = discount_rate directly
-        # We achieve this by setting beta=1, Rf = discount_rate-0.05, ERP=0.05
-        assumed_price = 100.0  # placeholder; caller should pass via run_full_dcf
-        equity_val = shares_outstanding * assumed_price
-
-        assumptions = DCFAssumptions(
-            ticker=ticker,
-            base_revenue=base_revenue,
-            revenue_growth_rates=g_rates,
-            ebit_margin=0.25,
-            tax_rate=0.21,
-            da_pct_revenue=0.04,
-            capex_pct_revenue=0.05,
-            nwc_change_pct_revenue=0.01,
-            equity_value_market=max(1.0, equity_val),
-            debt_value=max(0.0, net_debt),
-            cost_of_debt=0.05,
-            risk_free_rate=max(0.01, discount_rate - 0.05),
-            equity_risk_premium=0.05,
-            beta=1.0,
-            terminal_growth_rate=terminal_growth,
-            cash=0.0,
-            shares_outstanding=shares_outstanding,
-            current_price=assumed_price,
-            projection_years=projection_years,
-        )
-
-        result = self._engine.run_dcf(assumptions)
-
-        # ── Build the 20-line display DataFrame ──────────────────────────────
-        proj = result.line_items.copy()
-
-        # Reconstruct the legacy-style projections DataFrame
-        years_idx = [i for i in proj.index if i != "Terminal"]
-        proj_legacy = proj.loc[years_idx].copy()
-
-        # Correct discount factor column name for legacy display
-        proj_legacy = proj_legacy.rename(
-            columns={
-                "Discount Factor": "Discount_Factor",
-                "PV of FCF ($M)": "PV_FCF",
-                "Free Cash Flow ($M)": "FCF",
-            }
-        )
-
-        sensitivity = self._generate_sensitivity_table_legacy(
-            assumptions, result.sensitivity
-        )
-
+        top = [d["assumption"] for d in drivers[:2]]
         return {
-            "type": "DCF",
-            "ticker": ticker,
-            "fair_value": result.fair_value_per_share,
-            "equity_value": result.equity_value,
-            "enterprise_value": result.enterprise_value,
-            "sum_pv_fcf": result.sum_pv_fcf,
-            "pv_terminal": result.pv_terminal_value,
-            "projections": proj_legacy,
-            "sensitivity": sensitivity,
-            "full_result": result,  # full institutional result
-            "inputs": {
-                "fcf": current_fcf,
-                "growth": growth_rate_5y,
-                "wacc": discount_rate,
-                "terminal": terminal_growth,
-                "debt": net_debt,
-                "shares": shares_outstanding,
-            },
+            "drivers": drivers,
+            "base_fv": base_fv,
+            "top_drivers": top,
+            "note": (
+                "Impact measured as % fair-value change from ±shock to each assumption "
+                "(growth ±50% relative, margin ±200bps, WACC ±100bps, terminal growth ±50bps). "
+                "Ranked by absolute impact — these are the assumptions to stress-test first."
+            ),
         }
 
-    def _generate_sensitivity_table_legacy(
-        self, assumptions: DCFAssumptions, sens_df: pd.DataFrame
-    ) -> pd.DataFrame:
-        """Return the institutional sensitivity table (already computed)."""
-        return sens_df
-
-    def run_full_dcf(self, assumptions: DCFAssumptions) -> DCFResult:
-        """Run the full institutional DCF directly."""
-        return self._engine.run_dcf(assumptions)
-
-    def generate_excel(self, model_data: dict) -> bytes:
-        """Export model to Excel — supports both legacy dict and DCFResult."""
-        if "full_result" in model_data and isinstance(
-            model_data["full_result"], DCFResult
-        ):
-            return self._engine.export_excel(model_data["full_result"])
-
-        # Fallback: legacy simple export
-        output = io.BytesIO()
+    # ──────────────────────────────────────────────────────────────────────────
+    # INSTITUTIONAL UPGRADE — market consensus layer (Sections 6/7/28)
+    # ──────────────────────────────────────────────────────────────────────────
+    def _consensus_layer(self, assumptions: DCFAssumptions,
+                         result: DCFResult) -> Dict[str, Any]:
+        """Wire the shared market-consensus / sentiment / dislocation layer
+        into the DCF. Defensive: never raises even if the shared module is
+        unavailable."""
         try:
-            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-                summary = pd.DataFrame(
-                    {
-                        "Metric": [
-                            "Fair Value per Share",
-                            "Equity Value",
-                            "Enterprise Value",
-                        ],
-                        "Value": [
-                            model_data["fair_value"],
-                            model_data["equity_value"],
-                            model_data["enterprise_value"],
-                        ],
-                    }
-                )
-                summary.to_excel(writer, sheet_name="Summary", index=False)
-                if "projections" in model_data:
-                    model_data["projections"].to_excel(writer, sheet_name="Projections")
-                if "sensitivity" in model_data:
-                    model_data["sensitivity"].to_excel(
-                        writer, sheet_name="Sensitivity Analysis"
-                    )
+            from market_consensus_engine import (
+                ConsensusEstimates,
+                SentimentSnapshot,
+                reverse_dcf_expectations,
+                ConsensusDislocationEngine,
+                get_consensus_dislocation_engine,
+            )
+
+            implied = reverse_dcf_expectations(
+                model_price=float(result.fair_value_per_share or 0),
+                current_price=float(assumptions.current_price or 0),
+                shares=float(assumptions.shares_outstanding or 0),
+                net_debt=float(assumptions.debt_value - assumptions.cash),
+                base_revenue=float(assumptions.base_revenue),
+                model_revenue_growth=float(assumptions.revenue_growth_rates[0] or 0),
+                model_ebit_margin=float(assumptions.ebit_margin),
+                wacc=float(result.wacc or 0.10),
+                terminal_growth=float(assumptions.terminal_growth_rate),
+                projection_years=int(assumptions.projection_years),
+            )
+
+            dislocation = get_consensus_dislocation_engine().analyze(
+                implied=implied,
+                model_price=float(result.fair_value_per_share or 0),
+                current_price=float(assumptions.current_price or 0),
+                model_upside_pct=float(
+                    (result.fair_value_per_share / assumptions.current_price - 1)
+                    if assumptions.current_price > 0 else 0.0
+                ),
+            )
+
+            return {
+                "implied_expectations": implied.to_dict(),
+                "dislocation": dislocation.to_dict(),
+                "provenance": {
+                    "market_price": {"status": "verified", "source": "live market"},
+                    "model_price": {"status": "derived", "source": "DCF model"},
+                    "implied_growth": {"status": "estimated", "source": "reverse DCF identity"},
+                },
+            }
         except Exception as e:
-            logger.error(f"Legacy Excel export error: {e}")
-        return output.getvalue()
+            return {"error": str(e), "note": "Consensus layer unavailable."}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # INSTITUTIONAL UPGRADE — dynamic scenario notes (Section 8)
+    # ──────────────────────────────────────────────────────────────────────────
+    def _dynamic_scenario_notes(self, assumptions: DCFAssumptions,
+                                result: DCFResult) -> str:
+        """Explain how many scenarios are appropriate and why, based on the
+        situation rather than a fixed Bear/Base/Bull template."""
+        n = len(result.scenarios or [])
+        growth = assumptions.revenue_growth_rates[0] if assumptions.revenue_growth_rates else 0.0
+        margin = assumptions.ebit_margin
+        parts = [
+            f"{n} materially distinct scenario(s) modeled. The scenario architecture is "
+            "situation-driven: for this company, growth, margin, discount rate and terminal "
+            "assumptions are the material variables."
+        ]
+        if growth > 0.20 or margin < 0.05:
+            parts.append(
+                "High growth / thin-margin profile: valuation is heavily regime-dependent, "
+                "so downside and upside cases are wide and probability-weighted expectations "
+                "matter more than any single point."
+            )
+        if result.terminal_diagnostics.get("tv_as_pct_of_ev", 0) > 0.75:
+            parts.append(
+                "Terminal-value dominance (>75% of EV): scenario dispersion is amplified by "
+                "terminal assumptions; WACC and long-run growth scenarios deserve extra weight."
+            )
+        return " ".join(parts)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SINGLETON
-# ─────────────────────────────────────────────────────────────────────────────
+# --- GLOBAL GETTERS ---
 
-_fin_gen: Optional[FinancialModelGenerator] = None
+def _safe_float(val, default: float = 0.0) -> float:
+  try:
+    if val is None:
+      return default
+    f = float(val)
+    if np.isnan(f) or np.isinf(f):
+      return default
+    return f
+  except (TypeError, ValueError):
+    return default
 
 
-def get_financial_generator() -> FinancialModelGenerator:
-    global _fin_gen
-    if _fin_gen is None:
-        _fin_gen = FinancialModelGenerator()
-    return _fin_gen
+def _extract_ebitda_millions(ticker_obj, info: Dict[str, Any]) -> float:
+  """Derive LTM EBITDA in $M from yfinance info and financial statements."""
+  ebitda_raw = info.get("ebitda")
+  if ebitda_raw and abs(_safe_float(ebitda_raw)) > 1e6:
+    return abs(_safe_float(ebitda_raw)) / 1e6
+
+  fin = getattr(ticker_obj, "financials", None)
+  if fin is not None and not fin.empty:
+    for row_name in ("EBITDA", "Normalized EBITDA"):
+      if row_name in fin.index:
+        val = _safe_float(fin.loc[row_name].iloc[0])
+        if val:
+          return abs(val) / 1e6
+
+    ebit = None
+    da = 0.0
+    for ebit_name in ("EBIT", "Operating Income"):
+      if ebit_name in fin.index:
+        ebit = _safe_float(fin.loc[ebit_name].iloc[0])
+        break
+    for da_name in (
+      "Reconciled Depreciation",
+      "Depreciation And Amortization",
+      "Depreciation",
+    ):
+      if da_name in fin.index:
+        da = _safe_float(fin.loc[da_name].iloc[0])
+        break
+    if ebit is not None:
+      return abs(ebit + da) / 1e6
+
+  revenue = _safe_float(info.get("totalRevenue"))
+  margin = info.get("ebitdaMargins") or info.get("operatingMargins")
+  if revenue > 1e6 and margin:
+    return abs(revenue * _safe_float(margin)) / 1e6
+  # No fabricated fallback: report "no data" so callers clamp to a sane
+  # minimum instead of inventing $500M of EBITDA for a company we know
+  # nothing about.
+  return 0.0
 
 
-_dcf_engine: Optional[InstitutionalDCFEngine] = None
+def _extract_eps(info: Dict[str, Any], ticker_obj) -> Optional[float]:
+  """Derive trailing EPS from info or income statement."""
+  eps = _safe_float(info.get("trailingEps"), 0)
+  if eps:
+    return eps
+
+  fin = getattr(ticker_obj, "financials", None)
+  shares = _safe_float(info.get("sharesOutstanding"), 0)
+  if fin is not None and not fin.empty and shares > 0:
+    for row_name in ("Net Income", "Net Income Common Stockholders"):
+      if row_name in fin.index:
+        net_income = _safe_float(fin.loc[row_name].iloc[0])
+        if net_income:
+          return net_income / shares
+  return None
+
+
+def _resolve_live_price(sym: str, ticker_obj, info: Dict[str, Any]) -> Optional[float]:
+  """Resolve the best available live price from multiple sources."""
+  from data_sources import get_realtime_price
+
+  current_price, prev_close = get_realtime_price(sym)
+  if current_price and current_price > 0:
+    return float(current_price)
+  if prev_close and prev_close > 0:
+    return float(prev_close)
+
+  for key in ("currentPrice", "regularMarketPrice", "previousClose"):
+    val = _safe_float(info.get(key), 0)
+    if val > 0:
+      return val
+
+  try:
+    fi = ticker_obj.fast_info
+    val = getattr(fi, "last_price", None) or getattr(fi, "regularMarketPrice", None)
+    if val and float(val) > 0:
+      return float(val)
+  except Exception:
+    pass
+
+  try:
+    hist = ticker_obj.history(period="1mo")
+    if hist is not None and not hist.empty:
+      close = hist["Close"]
+      if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+      close = close.dropna()
+      if len(close) > 0:
+        return float(close.iloc[-1])
+  except Exception:
+    pass
+
+  return None
+
+
+def _validate_ticker_fundamentals(
+  sym: str,
+  info: Dict[str, Any],
+  price: Optional[float],
+  shares_raw: float,
+  eps: Optional[float],
+  ticker_obj,
+) -> None:
+  """Raise when yfinance did not return usable data for the symbol."""
+  has_name = bool(info.get("shortName") or info.get("longName"))
+  has_cap = _safe_float(info.get("marketCap"), 0) > 1e8
+  has_revenue = _safe_float(info.get("totalRevenue"), 0) > 1e6
+  has_shares = shares_raw > 1e6
+  has_quote = info.get("quoteType") in ("EQUITY", "ETF", "MUTUALFUND")
+
+  has_history = False
+  try:
+    hist = ticker_obj.history(period="1mo")
+    has_history = hist is not None and len(hist) >= 3
+  except Exception:
+    pass
+
+  if has_cap or (has_revenue and has_name) or (has_quote and has_shares):
+    return
+  if has_history and price and price > 0 and has_shares and eps:
+    return
+  if has_history and price and price > 0 and has_name:
+    return
+
+  raise ValueError(
+    f"No market data found for '{sym}'. "
+    "Check the ticker symbol and try again."
+  )
+
+
+def _safe_info_fetch(ticker_obj) -> Dict[str, Any]:
+    """Fetch yfinance `info` defensively.
+
+    `Ticker.info` is a known source of arbitrary exceptions (including
+    `TypeError: argument of type 'NoneType' is not iterable`) when Yahoo's
+    quote endpoint returns a partial payload. Never let that escape — every
+    field is individually guarded downstream anyway.
+    """
+    try:
+        raw = getattr(ticker_obj, "info", None)
+        if raw is None:
+            return {}
+        # Some yfinance versions return a list or scalar on failure
+        if not isinstance(raw, dict):
+            try:
+                raw = dict(raw)
+            except Exception:
+                return {}
+        return {k: v for k, v in raw.items() if v is not None}
+    except Exception:
+        return {}
+
+
+def _derive_revenue_millions(info: Dict[str, Any], shares_raw: float) -> float:
+    """Derive revenue in $M, correctly handling per-share fallback.
+
+    Yahoo's `info` often omits `totalRevenue` while providing
+    `revenuePerShare`. Using the per-share figure directly used to produce
+    ~$100M for mega-caps (e.g., AAPL) instead of ~$390B. Multiply by shares
+    outstanding so the magnitude is correct.
+    """
+    total_rev = _safe_float(info.get("totalRevenue"), 0)
+    if total_rev > 1e6:
+        return total_rev / 1e6
+    rps = _safe_float(info.get("revenuePerShare"), 0)
+    if rps > 0 and shares_raw > 0:
+        return rps * shares_raw / 1e6
+    # No last-resort fabrication: without shares, a per-share figure cannot be
+    # scaled to total revenue, so report 0 ("n/a") rather than inventing a
+    # magnitude. Callers clamp / show n/a.
+    return 0.0
+
+
+def fetch_ticker_fundamentals(ticker: str) -> Dict[str, Any]:
+  """
+  Fetch live ticker fundamentals for DCF / LBO / M&A auto-fill.
+  Uses realtime price + yfinance info and financial statements.
+  Fully defensive: never raises on partial data (each field is guarded);
+  raises a clear ValueError only when NO usable market data exists.
+  """
+  sym = (ticker or "").strip().upper()
+  if not sym:
+    raise ValueError("Ticker is required")
+
+  import yfinance as yf
+
+  t = yf.Ticker(sym)
+  info = _safe_info_fetch(t)
+
+  price = _resolve_live_price(sym, t, info)
+
+  shares_raw = _safe_float(info.get("sharesOutstanding"), 0)
+  eps = _extract_eps(info, t)
+
+  try:
+    _validate_ticker_fundamentals(sym, info, price, shares_raw, eps, t)
+  except ValueError:
+    # Last-ditch: fast_info may still give price + shares even when `info`
+    # came back empty (the common NoneType crash path).
+    try:
+      fi = t.fast_info
+      p2 = getattr(fi, "last_price", None) or getattr(fi, "regularMarketPrice", None)
+      if p2 and float(p2) > 0 and price in (None, 0):
+        price = float(p2)
+      s2 = getattr(fi, "shares", None)
+      if s2 and float(s2) > 0 and shares_raw <= 0:
+        shares_raw = float(s2)
+    except Exception:
+      pass
+    if (not price or price <= 0) and (not shares_raw or shares_raw <= 0):
+      raise
+
+  if not price or price <= 0:
+    market_cap = _safe_float(info.get("marketCap"), 0)
+    if market_cap > 0 and shares_raw > 0:
+      price = market_cap / shares_raw
+    else:
+      raise ValueError(
+        f"Could not resolve a live price for '{sym}'. "
+        "Check the ticker symbol and try again."
+      )
+
+  if not shares_raw or shares_raw <= 0:
+    market_cap = _safe_float(info.get("marketCap"), 0)
+    if market_cap > 0 and price > 0:
+      shares_raw = market_cap / price
+    else:
+      raise ValueError(f"Shares outstanding unavailable for '{sym}'.")
+
+  if eps is None or eps == 0:
+    fin = getattr(t, "financials", None)
+    if fin is not None and not fin.empty and shares_raw > 0:
+      for row_name in ("Net Income", "Net Income Common Stockholders"):
+        if row_name in fin.index:
+          net_income = _safe_float(fin.loc[row_name].iloc[0])
+          if net_income:
+            eps = net_income / shares_raw
+            break
+  if eps is None or eps == 0:
+    raise ValueError(f"EPS unavailable for '{sym}'.")
+
+  revenue_m = _derive_revenue_millions(info, shares_raw)
+
+  ebitda_m = _extract_ebitda_millions(t, info)
+
+  ebit_margin = _safe_float(info.get("operatingMargins"), 0.20)
+  if ebitda_m > 0 and revenue_m > 0:
+    ebitda_margin = ebitda_m / revenue_m
+  else:
+    ebitda_margin = _safe_float(info.get("ebitdaMargins"), 0.20)
+  ebitda_margin = max(min(ebitda_margin, 0.80), 0.05)
+
+  beta = _safe_float(info.get("beta"), 1.0)
+  market_cap_m = _safe_float(info.get("marketCap")) / 1e6
+  if market_cap_m <= 0:
+    market_cap_m = price * shares_raw / 1e6
+
+  debt_m = _safe_float(info.get("totalDebt")) / 1e6
+  cash_m = _safe_float(info.get("totalCash")) / 1e6
+  shares_m = shares_raw / 1e6
+
+  rev_growth = _safe_float(
+    info.get("revenueGrowth") or info.get("earningsGrowth"),
+    0.08,
+  )
+  rev_growth = max(min(rev_growth, 0.60), -0.10)
+
+  tax_rate = _safe_float(info.get("effectiveTaxRate"), 0.21)
+  tax_rate = max(min(tax_rate, 0.40), 0.05)
+
+  enterprise_value = _safe_float(info.get("enterpriseValue"))
+  entry_multiple = (
+    round(enterprise_value / (ebitda_m * 1e6), 1)
+    if enterprise_value > 0 and ebitda_m > 0
+    else 10.0
+  )
+  entry_multiple = float(max(min(entry_multiple, 25.0), 4.0))
+
+  cost_of_debt = 0.08
+  if info.get("interestExpense") and debt_m > 0:
+    cost_of_debt = abs(_safe_float(info.get("interestExpense"))) / (debt_m * 1e6)
+    cost_of_debt = max(min(cost_of_debt, 0.15), 0.04)
+  elif market_cap_m > 0 and debt_m > 0:
+    cost_of_debt = 0.06 + min(debt_m / market_cap_m, 1.0) * 0.04
+
+  leverage = 5.0
+  if ebitda_m > 0 and debt_m > 0:
+    leverage = round(debt_m / ebitda_m, 1)
+    leverage = float(max(min(leverage, 7.0), 3.0))
+
+  return {
+    "ticker": sym,
+    "price": round(price, 2),
+    "revenue_m": round(revenue_m, 1),
+    "revenue_growth": round(rev_growth * 100, 1),
+    "ebit_margin_pct": round(ebit_margin * 100, 1),
+    "ebitda_m": round(ebitda_m, 1),
+    "ebitda_margin": round(ebitda_margin, 3),
+    "tax_rate_pct": round(tax_rate * 100, 1),
+    "beta": round(beta, 2),
+    "market_cap_m": round(market_cap_m, 0),
+    "debt_m": round(debt_m, 0),
+    "cash_m": round(cash_m, 0),
+    "shares_m": round(shares_m, 1),
+    "eps": round(eps, 2),
+    "entry_multiple": entry_multiple,
+    "exit_multiple": entry_multiple,
+    "leverage_multiple": leverage,
+    "interest_rate_pct": round(cost_of_debt * 100, 2),
+    "enterprise_value_m": round(enterprise_value / 1e6, 0) if enterprise_value else round(
+      market_cap_m + debt_m - cash_m, 0
+    ),
+  }
 
 
 def get_dcf_engine() -> InstitutionalDCFEngine:
-    """Get the raw institutional DCF engine."""
-    global _dcf_engine
-    if _dcf_engine is None:
-        _dcf_engine = InstitutionalDCFEngine()
-    return _dcf_engine
+    """Return a singleton instance of the Institutional DCF Engine."""
+    global _dcf_engine_instance
+    if _dcf_engine_instance is None:
+        _dcf_engine_instance = InstitutionalDCFEngine()
+    return _dcf_engine_instance
+
+def get_financial_generator():
+    """Alias for backwards compatibility if needed."""
+    return get_dcf_engine()

@@ -47,9 +47,9 @@ except ImportError:
     HAS_SCIPY = False
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Data Structures
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 @dataclass
 class NarrativeContradiction:
@@ -99,9 +99,9 @@ class DislocationsSnapshot:
     key_risks: list[str]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Macro Narrative Database
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 MACRO_NARRATIVES_DB: list[dict] = [
     {
@@ -266,9 +266,9 @@ CROSS_ASSET_RELATIONSHIPS: list[dict] = [
 ]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Price Data Layer
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 class PriceDataLayer:
     """Fetches and caches price data for analysis."""
@@ -349,9 +349,9 @@ class PriceDataLayer:
         return round(z, 3)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Narrative Dislocation Engine
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 class NarrativeDislocator:
     """
@@ -368,9 +368,9 @@ class NarrativeDislocator:
         seed = int(hashlib.md5(seed_str.encode()).hexdigest(), 16) % (2 ** 32)
         return np.random.default_rng(seed)
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 1. PRICE / EARNINGS CONTRADICTION
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def detect_price_earnings_contradiction(self, ticker: str) -> NarrativeContradiction | None:
         """
@@ -482,9 +482,9 @@ class NarrativeDislocator:
 
         return None
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 2. CROSS-ASSET RELATIONSHIP BREAKDOWN
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def detect_cross_asset_breakdown(
         self, relationship: dict
@@ -596,9 +596,9 @@ class NarrativeDislocator:
             },
         )
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 3. SENTIMENT / POSITIONING EXTREMES
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def detect_sentiment_positioning_extreme(
         self, ticker: str
@@ -702,9 +702,9 @@ class NarrativeDislocator:
 
         return None
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 4. MACRO NARRATIVE SCORING
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def score_macro_narratives(self) -> list[MacroNarrative]:
         """
@@ -780,9 +780,9 @@ class NarrativeDislocator:
 
         return sorted(results, key=lambda n: n.divergence_score, reverse=True)
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 5. FULL ANALYSIS PIPELINE
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def analyze(self, symbols: list[str]) -> DislocationsSnapshot:
         """
@@ -884,9 +884,9 @@ class NarrativeDislocator:
         )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Singleton accessor
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 _engine_instance: NarrativeDislocator | None = None
 

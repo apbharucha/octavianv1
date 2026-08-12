@@ -85,6 +85,7 @@ except ImportError:
 
 from database_manager import get_database_manager
 from config import ALPHA_VANTAGE_KEY
+from api_rate_limiter import get_api_handler
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -144,6 +145,7 @@ class NewsAnalysisEngine:
     def __init__(self):
         _lazy_ensure_nltk()
         self.db_manager = get_database_manager()
+        self.api_handler = get_api_handler()
 
         # Initialize sentiment analyzer
         if NLTK_AVAILABLE:
@@ -290,6 +292,9 @@ class NewsAnalysisEngine:
                 all_articles.extend(articles)
                 self.metrics['api_calls'] += 1
                 
+                # Sleep briefly between sources to avoid rate limits
+                time.sleep(1.0)
+                
             except Exception as e:
                 logger.error(f"Error fetching from {source_name}: {e}")
         
@@ -308,16 +313,26 @@ class NewsAnalysisEngine:
         return processed_articles
 
     def _fetch_generic_rss(self) -> List[NewsArticle]:
-        """Fetch news from a set of generic RSS feeds (dependency-free)."""
+        """Fetch news from a set of generic RSS feeds with rate limiting and caching."""
         out: List[NewsArticle] = []
         try:
             cfg = self.news_sources.get('rss_feeds', {})
             feeds = cfg.get('feeds', {}) if isinstance(cfg, dict) else {}
             for label, url in feeds.items():
                 try:
-                    r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
-                    r.raise_for_status()
-                    out.extend(self._parse_rss_xml(r.text, label))
+                    response = self.api_handler.fetch_with_retry(
+                        url=url,
+                        service='rss',
+                        max_retries=2,
+                        timeout=12
+                    )
+                    
+                    if not response:
+                        logger.warning(f"Failed to fetch RSS for {label}")
+                        continue
+                    
+                    out.extend(self._parse_rss_xml(response.text, label))
+                    time.sleep(0.1)  # Additional rate limiting
                 except Exception as e:
                     logger.error(f"RSS fetch error for {label}: {e}")
         except Exception as e:
@@ -466,15 +481,18 @@ class NewsAnalysisEngine:
             return []
     
     def _fetch_reddit_finance(self) -> List[NewsArticle]:
-        """Fetch financial discussions from Reddit."""
+        """Fetch financial discussions from Reddit with proper rate limiting and retry logic."""
         try:
-            headers = {'User-Agent': 'MarketAI/1.0'}
-            response = requests.get(
-                'https://www.reddit.com/r/investing.json',
-                headers=headers,
+            response = self.api_handler.fetch_with_retry(
+                url='https://www.reddit.com/r/investing.json',
+                service='reddit',
+                max_retries=3,
                 timeout=10
             )
-            response.raise_for_status()
+            
+            if not response:
+                logger.warning("Failed to fetch Reddit data after retries")
+                return []
             
             data = response.json()
             articles = []
@@ -514,7 +532,7 @@ class NewsAnalysisEngine:
             return []
     
     def _fetch_yahoo_rss(self) -> List[NewsArticle]:
-        """Fetch news from Yahoo Finance RSS (simplified)."""
+        """Fetch news from Yahoo Finance RSS with rate limiting and caching."""
         try:
             # Use a small diverse set of "market-wide" anchors
             anchors = ['SPY', 'QQQ', 'TLT', '^VIX', 'CL=F', 'GC=F']
@@ -527,10 +545,20 @@ class NewsAnalysisEngine:
                     'region': 'US',
                     'lang': 'en-US'
                 }
-                r = requests.get(base_url, params=params, timeout=10)
-                r.raise_for_status()
+                
+                response = self.api_handler.fetch_with_retry(
+                    url=base_url,
+                    service='yahoo',
+                    params=params,
+                    max_retries=3,
+                    timeout=10
+                )
+                
+                if not response:
+                    logger.warning(f"Failed to fetch Yahoo RSS for {a}")
+                    continue
 
-                root = ET.fromstring(r.text)
+                root = ET.fromstring(response.text)
                 for item in root.findall('.//item')[:25]:
                     title = (item.findtext('title') or '').strip()
                     link = (item.findtext('link') or '').strip()
@@ -564,6 +592,9 @@ class NewsAnalysisEngine:
                         author=None,
                     )
                     articles.append(article)
+
+                # Rate limiting handled by api_handler
+                time.sleep(0.2)
 
             return articles
         except Exception as e:
@@ -987,95 +1018,144 @@ class NewsAnalysisEngine:
             return {}
     
     def get_market_whispers(self, symbol: Optional[str] = None) -> List[MarketWhisper]:
-        """Get market whispers and rumors with dynamic, data-driven insights."""
-        whispers = []
-        
-        # Get current market state if possible to make whispers more relevant
-        market_regime = "NORMAL"
-        try:
-            from integrated_market_system import get_market_system
-            system = get_market_system()
-            if hasattr(system, 'analyzer'):
-                # Try to get overall market state
-                pass 
-        except Exception:
-            pass
+        """Market whispers derived from REAL fetched news coverage.
 
-        # Expanded whisper templates with dynamic content slots
-        templates = [
-            # Earnings & Corporate
-            {'text': "Institutional accumulation detected in {sym} ahead of earnings print; major size on the bid", 'type': 'earnings', 'base_conf': 0.75},
-            {'text': "Option flow indicates smart money hedging massive downside on {sym} with OTM puts", 'type': 'market_structure', 'base_conf': 0.65},
-            {'text': "Rumors of a multi-billion dollar M&A bid for {sym} from a private equity consortium", 'type': 'merger', 'base_conf': 0.45},
-            {'text': "Insider chatter suggests {sym} supply chain issues are worse than publicly disclosed", 'type': 'product', 'base_conf': 0.7},
-            {'text': "Hedge fund 'unwinding' likely to create forced liquidation pressure on {sym} into the close", 'type': 'market_structure', 'base_conf': 0.6},
-            
-            # Macro & Sector
-            {'text': "Significant rotation out of growth into {sym} and value-oriented cyclicals", 'type': 'sector_news', 'base_conf': 0.65},
-            {'text': "Credit spread widening in {sym}'s sector signals a potential 'liquidity event'", 'type': 'macro', 'base_conf': 0.8},
-            {'text': "Regulatory 'black swan' rumor circulating for {sym} regarding antitrust compliance", 'type': 'regulatory', 'base_conf': 0.55},
-            {'text': "Large-scale 'dark pool' accumulation in {sym} suggests institutional repositioning", 'type': 'market_structure', 'base_conf': 0.75},
-            
-            # Technical/Quant
-            {'text': "Algorithmic 'stop hunting' observed at {sym} key technical levels; potential reversal imminent", 'type': 'market_structure', 'base_conf': 0.8},
-            {'text': "Gamma squeeze potential reached 'critical mass' in {sym} short-dated calls", 'type': 'market_structure', 'base_conf': 0.5},
-            {'text': "Quantitative signals pointing to a 'mean reversion' play for {sym} after recent overextension", 'type': 'market_structure', 'base_conf': 0.7},
-            {'text': "Vol-control funds expected to buy {sym} as volatility index (VIX) cools", 'type': 'macro', 'base_conf': 0.6},
-        ]
-        
-        # Target symbols (mix of user request + market leaders)
-        market_leaders = ['NVDA', 'AAPL', 'MSFT', 'TSLA', 'AMD', 'SPY', 'QQQ', 'BTC-USD', 'EUR/USD', 'GC=F', 'CL=F']
-        
-        # Add the requested symbol if provided
-        if symbol:
-            target_symbols = [symbol.upper()]
-            # Add some related symbols for variety
-            target_symbols.extend(random.sample(market_leaders, 3))
+        Every returned whisper is grounded in an actual fetched article:
+        - content = the real headline/summary
+        - source  = the real publishing outlet
+        - timestamp = the real publication time
+        - confidence = sentiment-strength × relevance (both computed from the
+          article itself, never invented)
+        - verification = 'verified' when >= 3 distinct outlets cover the same
+          symbol (corroboration), 'partially_verified' at 2, else 'unverified'
+
+        No fabricated rumors, fake sources, or invented mention counts are ever
+        produced.  When there is no real coverage the result is an empty list,
+        and the UI already renders the honest empty state.
+        """
+        whispers: List[MarketWhisper] = []
+        try:
+            articles = self.fetch_and_process_news() or []
+        except Exception as e:
+            logger.error(f"get_market_whispers: could not fetch news: {e}")
+            return []
+        if not articles:
+            return []
+
+        sym = (symbol or "").upper().strip()
+        # Symbols we focus on: the requested one (if any) plus the most-covered
+        # names in the real fetched corpus — not a hardcoded universe.
+        coverage_counts: Dict[str, int] = {}
+        for a in articles:
+            for s in (a.symbols_mentioned or []):
+                s = str(s).upper().strip()
+                if s:
+                    coverage_counts[s] = coverage_counts.get(s, 0) + 1
+        top_covered = sorted(coverage_counts, key=coverage_counts.get, reverse=True)[:8]
+        if sym:
+            target_symbols = [sym] + [s for s in top_covered if s != sym][:3]
         else:
-            target_symbols = random.sample(market_leaders, 6)
-            
-        num_whispers = np.random.randint(6, 10)
-        seen_content = set()
-        
-        for _ in range(num_whispers):
-            # Select random template
-            tmpl = random.choice(templates)
-            
-            # Select symbol from our target list
-            target_sym = random.choice(target_symbols)
-                
-            # Format text
-            content = tmpl['text'].format(sym=target_sym)
-            
-            if content in seen_content:
+            target_symbols = top_covered or []
+        if not target_symbols:
+            return []
+
+        relevant = [
+            a for a in articles
+            if a.symbols_mentioned and any(
+                str(s).upper().strip() in target_symbols for s in a.symbols_mentioned
+            )
+        ]
+        # Most recent first, cap for performance
+        relevant = sorted(
+            relevant, key=lambda a: a.published_at or datetime.min, reverse=True
+        )[:40]
+
+        for a in relevant:
+            mentioned = [
+                str(s).upper().strip() for s in (a.symbols_mentioned or [])
+                if str(s).upper().strip() in target_symbols
+            ]
+            # Corroboration: how many distinct outlets cover this symbol
+            distinct_outlets = set()
+            for other in articles:
+                if not (other.symbols_mentioned or []):
+                    continue
+                if any(str(s).upper().strip() in mentioned for s in other.symbols_mentioned):
+                    if other.source:
+                        distinct_outlets.add(other.source)
+            n_outlets = len(distinct_outlets)
+            if n_outlets >= 3:
+                verification = "verified"
+            elif n_outlets == 2:
+                verification = "partially_verified"
+            else:
+                verification = "unverified"
+
+            sentiment = float(a.sentiment_score or 0.0)
+            relevance = float(a.relevance_score or 0.5)
+            # Confidence: stronger sentiment + higher relevance => higher
+            confidence = min(0.95, max(0.2, abs(sentiment) * 0.5 + relevance * 0.5))
+
+            title = (a.title or "").strip()
+            summary = (a.summary or "").strip()
+            content = f"{title}. {summary}".strip()
+            if not content:
                 continue
-            seen_content.add(content)
-            
-            # Randomize confidence slightly around base
-            conf = min(0.98, max(0.1, tmpl['base_conf'] + np.random.uniform(-0.15, 0.15)))
-            
-            # Higher mentions for market leaders
-            base_mentions = 1000 if target_sym in market_leaders else 200
-            mentions = np.random.randint(base_mentions, base_mentions * 10)
-            
-            whisper = MarketWhisper(
-                content=content,
-                source=random.choice(['Institutional Desk', 'Alpha Scanner', 'Derivatives Flow', 'Social Intelligence', 'Insider Brief']),
-                confidence_level=conf,
-                symbols_mentioned=[target_sym],
-                whisper_type=tmpl['type'],
-                timestamp=datetime.now() - timedelta(minutes=np.random.randint(2, 240)),
-                social_mentions=mentions,
-                verification_status=np.random.choice(
-                    ['unverified', 'partially_verified', 'verified', 'debunked'],
-                    p=[0.6, 0.3, 0.1, 0.0]
+
+            # Whisper type inferred from tags/title keywords, else generic
+            wtype = self._infer_whisper_type(a)
+
+            # Real social_mentions are not available; we never fabricate a
+            # number.  coverage proxy = number of real articles on this symbol.
+            real_coverage = sum(
+                1 for other in articles
+                if (other.symbols_mentioned or []) and any(
+                    str(s).upper().strip() in mentioned for s in other.symbols_mentioned
                 )
             )
-            whispers.append(whisper)
-            
-        # Sort by confidence
-        whispers.sort(key=lambda x: x.confidence_level, reverse=True)
-        return whispers
+
+            whispers.append(MarketWhisper(
+                content=content,
+                source=a.source or "Unknown",
+                confidence_level=confidence,
+                symbols_mentioned=mentioned,
+                whisper_type=wtype,
+                timestamp=a.published_at or datetime.now(),
+                social_mentions=real_coverage,
+                verification_status=verification,
+            ))
+
+        # De-duplicate near-identical headlines
+        seen_titles: set = set()
+        unique: List[MarketWhisper] = []
+        for w in whispers:
+            key = w.content[:80].lower()
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+            unique.append(w)
+
+        unique.sort(key=lambda w: w.timestamp or datetime.min, reverse=True)
+        return unique[:15]
+
+    def _infer_whisper_type(self, article: "NewsArticle") -> str:
+        """Infer a whisper category from article tags/keywords (real content)."""
+        hay = " ".join([
+            article.title or "", article.summary or "",
+            " ".join(article.tags or []),
+        ]).lower()
+        for kw, wtype in [
+            (("earnings", "eps", "guidance", "revenue", "quarter"), "earnings"),
+            (("merger", "acquisition", "takeover", "bid", "acquir"), "merger"),
+            (("sue", "lawsuit", "regulat", "probe", "compliance", "antitrust"), "regulatory"),
+            (("product", "launch", "patent", "approval", "device"), "product"),
+            (("inflation", "fed", "rate", "treasury", "yield", "recession"), "macro"),
+            (("option", "hedge", "flow", "volatility", "gamma"), "market_structure"),
+            (("sector", "rotation", "industry", "outperform"), "sector_news"),
+        ]:
+            if any(k in hay for k in kw):
+                return wtype
+        return "other"
     
     def get_news_summary_for_symbol(self, symbol: str) -> Dict[str, Any]:
         """Get comprehensive news summary for a symbol."""

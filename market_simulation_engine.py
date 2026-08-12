@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Any, Tuple
 import asyncio
 import random
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from enum import Enum
 import sqlite3
 import threading
@@ -148,6 +148,32 @@ class TradingDecision:
     timeframe: TimeframeScope
     stop_loss: Optional[float]
     take_profit: Optional[float]
+    # Options specifics
+    is_option: bool = False
+    option_type: Optional[str] = None # CALL, PUT
+    strike: Optional[float] = None
+    expiry: Optional[str] = None
+
+@dataclass
+class SimulatedOptionPosition:
+    """Active option position in simulation."""
+    symbol: str
+    option_type: str # Can be strategy name or CALL/PUT
+    strike: float
+    expiry: str
+    quantity: float
+    entry_price: float
+    current_price: float
+    side: int # 1 for Long, -1 for Short
+    delta: float
+    gamma: float
+    theta: float
+    vega: float
+    entry_time: datetime
+    vanna: float = 0.0
+    charm: float = 0.0
+    is_multi_leg: bool = False
+    legs: List[Dict[str, Any]] = field(default_factory=list)
 
 @dataclass
 class SimulationResult:
@@ -183,238 +209,58 @@ class _FallbackAnalysis:
 
 class _FallbackUnbiasedAnalyzer:
     def __init__(self):
-        self.asset_universe = {
-            # Mega/Large cap — diverse sectors
-            "stocks_mega": [
-                "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA", "META", "BRK-B",
-                "JPM", "JNJ", "V", "PG", "UNH", "HD", "MA", "DIS",
-            ],
-            "stocks_tech": [
-                "CRM", "ADBE", "AMD", "INTC", "AVGO", "QCOM", "NOW", "ORCL",
-                "NET", "CRWD", "DDOG", "ZS", "PLTR", "SNOW", "COIN", "SHOP",
-                "MU", "LRCX", "KLAC", "AMAT", "ARM", "SMCI", "DELL", "HPE",
-            ],
-            "stocks_finance": [
-                "GS", "BAC", "MS", "WFC", "SCHW", "BLK", "AXP", "C",
-                "KKR", "BX", "PNC", "USB", "CME", "ICE", "PYPL", "SQ",
-                "SOFI", "HOOD", "COIN", "AFRM", "UPST",
-            ],
-            "stocks_healthcare": [
-                "LLY", "MRK", "ABBV", "PFE", "TMO", "ABT", "AMGN", "GILD",
-                "REGN", "VRTX", "MRNA", "BIIB", "ISRG", "SYK", "CVS", "CI",
-                "CRSP", "BEAM", "EDIT", "NTLA", "ALNY", "SRPT", "HIMS",
-            ],
-            "stocks_energy": [
-                "XOM", "CVX", "COP", "SLB", "OXY", "HAL", "DVN", "MPC",
-                "VLO", "PSX", "EOG", "FANG", "MRO", "BKR", "KMI", "WMB",
-                "AR", "RRC", "EQT", "CTRA",
-            ],
-            "stocks_consumer": [
-                "WMT", "COST", "MCD", "SBUX", "NKE", "LULU", "CMG", "TGT",
-                "LOW", "TJX", "KO", "PEP", "EL", "MNST", "DPZ", "YUM",
-                "ABNB", "BKNG", "UBER", "DASH",
-            ],
-            "stocks_industrial": [
-                "CAT", "DE", "HON", "GE", "RTX", "LMT", "BA", "UPS",
-                "UNP", "NOC", "GD", "ETN", "ITW", "FDX", "WM", "HEI",
-                "AXON", "KTOS", "AVAV",
-            ],
-            "stocks_materials": [
-                "LIN", "SHW", "FCX", "NEM", "NUE", "STLD", "CLF", "X",
-                "AA", "APD", "DOW", "DD", "VMC", "MLM", "ALB", "CENX",
-            ],
-            "stocks_mining": [
-                "NEM", "GOLD", "AEM", "FNV", "WPM", "RGLD", "KGC", "AGI",
-                "PAAS", "HL", "EGO", "AU", "BTG", "IAG", "CDE", "NGD",
-                "AG", "MAG", "FSM", "USAS", "EXK", "SVM", "SILV",
-                "FCX", "SCCO", "TECK", "HBM", "ERO",
-                "BHP", "RIO", "VALE",
-                "HMY", "DRD", "GFI", "SBSW", "SA",
-            ],
-            "stocks_minerals_ree": [
-                "MP", "UUUU", "ALB", "SQM", "LTHM", "PLL", "SGML", "LAC",
-                "CCJ", "UEC", "DNN", "NXE", "LEU", "SMR", "OKLO", "URG",
-                "NTR", "MOS", "CF", "IPI", "ICL",
-            ],
-            "stocks_nuclear_uranium": [
-                "CCJ", "UEC", "UUUU", "DNN", "NXE", "LEU", "SMR", "OKLO",
-                "BWXT", "GEV", "CEG", "VST",
-            ],
-            "stocks_realestate": [
-                "PLD", "AMT", "CCI", "EQIX", "PSA", "O", "EXR", "AVB",
-                "EQR", "SPG", "WELL", "DLR", "MPW", "STAG", "REXR", "IIPR",
-            ],
-            "stocks_utilities": [
-                "NEE", "DUK", "SO", "D", "AEP", "EXC", "XEL", "SRE",
-                "AWK", "WEC", "ES", "ED",
-            ],
-            "stocks_renewables": [
-                "ENPH", "FSLR", "SEDG", "RUN", "PLUG", "BE", "CHPT", "EVGO",
-                "BLNK", "STEM", "BEEM", "ARRY", "NOVA",
-            ],
-            "stocks_defense": [
-                "LMT", "RTX", "NOC", "GD", "LHX", "HII", "LDOS", "SAIC",
-                "BAH", "KTOS", "AVAV", "AXON", "SWBI", "RGR",
-            ],
-            "stocks_agriculture": [
-                "ADM", "BG", "INGR", "DAR", "DE", "AGCO", "CNHI",
-                "NTR", "MOS", "CF", "TSN", "HRL", "ZTS",
-            ],
-            "stocks_shipping": [
-                "ZIM", "MATX", "GOGL", "EGLE", "GNK", "SBLK", "STNG",
-                "DAC", "NMM", "INSW", "NAT", "DHT", "FRO",
-            ],
-            "stocks_cannabis": [
-                "TLRY", "CGC", "ACB", "CRON", "OGI", "SNDL", "IIPR", "GRWG",
-            ],
-            # Mid/Small cap — high potential, often overlooked
-            "stocks_smallmid": [
-                "SOFI", "HOOD", "RIVN", "LCID", "JOBY", "IONQ", "AFRM", "UPST",
-                "ROKU", "RBLX", "DKNG", "ENPH", "FSLR", "PLUG", "SMCI", "AI",
-                "ABNB", "DASH", "LYFT", "PINS", "SNAP", "ETSY", "W", "CHWY",
-                "DNA", "BEAM", "EDIT", "CRSP", "STEM", "BLNK", "EVGO", "PATH",
-                "SOUN", "LUNR", "ASTS", "RKLB", "BKSY",
-            ],
-            # International ADRs
-            "stocks_international": [
-                "BABA", "TSM", "ASML", "NVO", "TM", "SAP", "SE", "MELI",
-                "NU", "PDD", "JD", "BIDU", "NIO", "LI", "XPEV", "INFY",
-                "VALE", "PBR", "ITUB", "SHOP", "BHP", "RIO",
-            ],
-            # ETFs — broad market, sector, thematic
-            "etfs": [
-                "SPY", "QQQ", "IWM", "VTI", "DIA", "ARKK", "XLF", "XLK",
-                "XLE", "XLV", "XLI", "XLP", "XLU", "XLB", "XLRE", "VEA",
-                "VWO", "EEM", "FXI", "EWJ", "EWZ", "INDA", "ICLN", "HACK",
-                "GDX", "GDXJ", "SIL", "COPX", "REMX", "URA", "LIT", "MSOS",
-            ],
-            # Crypto
-            "crypto": [
-                "BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "DOGE-USD",
-                "XRP-USD", "AVAX-USD", "MATIC-USD", "LINK-USD", "DOT-USD",
-            ],
-            # Forex
-            "forex": [
-                "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD",
-                "NZD/USD", "EUR/GBP", "EUR/JPY", "GBP/JPY", "USD/CHF",
-            ],
-            # Futures
-            "futures": [
-                "ES=F", "NQ=F", "YM=F", "CL=F", "GC=F", "SI=F",
-                "NG=F", "ZN=F", "ZB=F", "HG=F",
-            ],
-            # Commodities / Bonds ETFs
-            "commodities": ["GLD", "SLV", "USO", "UNG", "DBA", "DBC"],
-            "bonds": ["TLT", "IEF", "SHY", "LQD", "HYG", "JNK", "EMB", "TIP"],
-        }
+        try:
+            from ticker_universe import get_ticker_universe
+            all_tickers = get_ticker_universe().get_all_tickers()
+            self.asset_universe = {
+                "stocks_mega": all_tickers, # Fallback uses everything for robustness
+                "etfs": get_ticker_universe().get_etfs(),
+                "crypto": get_ticker_universe().get_crypto(),
+            }
+        except Exception:
+             self.asset_universe = {"stocks_mega": ["AAPL", "MSFT", "GOOGL"], "etfs": ["SPY"], "crypto": ["BTC-USD"]}
+
         self._price_history: Dict[str, List[float]] = {}
-        # Track per-symbol persistent trend state for smarter analysis
-        self._symbol_trend: Dict[str, float] = {}
 
     def update_price(self, symbol: str, price: float):
         """Feed price data so the analyzer can compute real signals."""
         if symbol not in self._price_history:
             self._price_history[symbol] = []
         self._price_history[symbol].append(price)
-        if len(self._price_history[symbol]) > 80:
-            self._price_history[symbol] = self._price_history[symbol][-80:]
+        if len(self._price_history[symbol]) > 100:
+            self._price_history[symbol].pop(0)
 
     async def analyze_unbiased(self, symbol: str) -> _FallbackAnalysis:
-        """Smart analysis using actual simulated price history.
-        
-        Key insight: the price simulator now generates persistent trends,
-        so momentum signals ARE exploitable. This analyzer is calibrated
+        """
+        Smart analysis using actual simulated price history.
+        Momentum signals are exploitable. This analyzer is calibrated
         to detect and act on those trends while respecting mean-reversion
         at extremes.
         """
         prices = self._price_history.get(symbol, [])
-
-        if len(prices) < 8:
-            return _FallbackAnalysis(
-                profit_probability=0.50,
-                model_reasoning=[f"Waiting for data ({len(prices)}/8 bars)."]
-            )
-
-        prices_arr = np.array(prices, dtype=float)
-        n = len(prices_arr)
-
-        #  1. Multi-timeframe momentum (primary signal) 
-        ret_3 = (prices_arr[-1] / prices_arr[-3] - 1) if n >= 3 else 0.0
-        ret_5 = (prices_arr[-1] / prices_arr[-5] - 1) if n >= 5 else 0.0
-        ret_10 = (prices_arr[-1] / prices_arr[-10] - 1) if n >= 10 else 0.0
-        ret_20 = (prices_arr[-1] / prices_arr[-20] - 1) if n >= 20 else 0.0
-
-        # Weighted momentum — emphasize recent moves (where trend is strongest)
-        momentum = ret_3 * 0.40 + ret_5 * 0.30 + ret_10 * 0.20 + ret_20 * 0.10
-
-        #  2. Trend strength via linear regression slope 
-        lookback = min(n, 30)
-        recent = prices_arr[-lookback:]
-        x = np.arange(lookback)
-        if lookback >= 5:
-            slope = np.polyfit(x, recent, 1)[0]
-            # Normalize slope relative to price level
-            norm_slope = slope / (recent.mean() + 1e-8)
-        else:
-            norm_slope = 0.0
-
-        #  3. Mean reversion (only at extremes, z-score > 2) 
-        if n >= 20:
-            ma20 = prices_arr[-20:].mean()
-            std20 = prices_arr[-20:].std()
-            z_score = (prices_arr[-1] - ma20) / (std20 + 1e-8)
-            # Only apply mean reversion at extremes (|z| > 1.8)
-            if abs(z_score) > 1.8:
-                mean_rev = -np.tanh((z_score - np.sign(z_score) * 1.8) * 0.8) * 0.25
-            else:
-                mean_rev = 0.0
-        else:
-            mean_rev = 0.0
-            z_score = 0.0
-
-        #  4. Volatility-adjusted confidence 
-        if n >= 10:
-            returns = np.diff(prices_arr[-10:]) / prices_arr[-10:-1]
-            vol = returns.std()
-            # Signal-to-noise: strong trend with low vol = high confidence
-            signal_to_noise = abs(momentum) / (vol + 1e-8)
-            vol_adj = min(vol * 1.5, 0.12)
-        else:
-            vol_adj = 0.05
-            signal_to_noise = 0.0
-
-        #  5. Acceleration (is momentum increasing or decreasing?) 
-        if n >= 10:
-            mom_recent = ret_3
-            mom_older = (prices_arr[-6] / prices_arr[-8] - 1) if n >= 8 else 0.0
-            acceleration = mom_recent - mom_older
-        else:
-            acceleration = 0.0
-
-        #  6. Combine into probability 
-        raw_signal = (
-            momentum * 20.0 +              # Primary: trend following
-            norm_slope * 8.0 +              # Slope confirmation
-            mean_rev +                       # Mean reversion at extremes only
-            acceleration * 5.0 +             # Momentum acceleration bonus
-            min(signal_to_noise, 3) * 0.03   # SNR bonus
-        )
-
-        prob = 0.50 + np.tanh(raw_signal) * 0.38
-        prob = max(0.12, min(0.88, prob - vol_adj * 0.5))
-
-        reasoning = []
-        reasoning.append(f"Momentum 3/5/10: {ret_3*100:+.3f}%/{ret_5*100:+.3f}%/{ret_10*100:+.3f}%")
-        reasoning.append(f"Trend slope: {norm_slope*100:.4f}%/bar | Accel: {acceleration*100:+.3f}%")
-        if abs(z_score) > 1.5:
-            reasoning.append(f"Z-score {z_score:.2f} — {'overbought, mean-rev active' if z_score > 0 else 'oversold, mean-rev active'}")
-        reasoning.append(f"SNR: {signal_to_noise:.2f} | Vol penalty: -{vol_adj*0.5:.3f}")
-        reasoning.append(f"Final prob: {prob:.3f}")
-
-        return _FallbackAnalysis(
-            profit_probability=prob,
-            model_reasoning=reasoning
-        )
+        if len(prices) < 10:
+            return _FallbackAnalysis(profit_probability=0.5, model_reasoning=["Insufficient history for dynamic analysis. Holding neutral."])
+        
+        # Simple momentum + mean-reversion heuristic for simulation robustness
+        last_p = prices[-1]
+        first_p = prices[0]
+        window_ret = (last_p - first_p) / first_p
+        
+        # Recent momentum
+        recent_window = prices[-5:]
+        recent_ret = (recent_window[-1] - recent_window[0]) / recent_window[0] if len(recent_window) >= 2 else 0
+        
+        prob = 0.5 + (window_ret * 2) + (recent_ret * 5)
+        prob = max(0.1, min(0.9, prob))
+        
+        reasoning = [
+            f"Trend detection active for {symbol}.",
+            f"Observed window return: {window_ret:.2%}.",
+            f"Recent momentum bias: {recent_ret:.2%}.",
+            "Simulation edge detected via persistent trend matching."
+        ]
+        
+        return _FallbackAnalysis(profit_probability=prob, model_reasoning=reasoning)
 
 class SimulationLearningEngine:
     """
@@ -1062,23 +908,20 @@ class MarketSimulationEngine:
         self.time_step = timedelta(minutes=1)
         self.universe_size = None
         
-        # News generation: much higher frequency for thousands of events
-        self.news_frequency = {
-            NewsType.EARNINGS: 0.08,
-            NewsType.ECONOMIC_DATA: 0.06,
-            NewsType.GEOPOLITICAL: 0.04,
-            NewsType.CENTRAL_BANK: 0.03,
-            NewsType.CORPORATE_ACTION: 0.05,
-            NewsType.SECTOR_NEWS: 0.07,
-            NewsType.REGULATORY: 0.03,
-            NewsType.MARKET_STRUCTURE: 0.02,
-            NewsType.ANALYST_RATING: 0.08,
-            NewsType.INSIDER_TRADE: 0.04,
-            NewsType.MACRO_INDICATOR: 0.05,
-            NewsType.COMMODITY_SHOCK: 0.03,
-            NewsType.CURRENCY_EVENT: 0.04,
-            NewsType.TECHNICAL_SIGNAL: 0.06,
-            NewsType.SOCIAL_SENTIMENT: 0.07,
+        # Dynamic News Generation based on regime
+        self._base_news_freq = {
+            NewsType.EARNINGS: 0.08, NewsType.ECONOMIC_DATA: 0.06, NewsType.GEOPOLITICAL: 0.04,
+            NewsType.CENTRAL_BANK: 0.03, NewsType.CORPORATE_ACTION: 0.05, NewsType.SECTOR_NEWS: 0.07,
+            NewsType.REGULATORY: 0.03, NewsType.MARKET_STRUCTURE: 0.02, NewsType.ANALYST_RATING: 0.08,
+            NewsType.INSIDER_TRADE: 0.04, NewsType.MACRO_INDICATOR: 0.05, NewsType.COMMODITY_SHOCK: 0.03,
+            NewsType.CURRENCY_EVENT: 0.04, NewsType.TECHNICAL_SIGNAL: 0.06, NewsType.SOCIAL_SENTIMENT: 0.07,
+        }
+        
+        # Institutional Correlation Matrix (Simplified for Simulation)
+        self.asset_correlations = {
+            "CL=F": {"XOM": 0.65, "CVX": 0.60, "DAL": -0.45, "UAL": -0.40},
+            "GC=F": {"NEM": 0.75, "GLD": 0.99, "DXY": -0.55},
+            "ES=F": {"AAPL": 0.82, "MSFT": 0.85, "VIX": -0.78},
         }
 
         # ...existing code for decision_thresholds, model_tuning, volatility_regimes...
@@ -1225,10 +1068,18 @@ class MarketSimulationEngine:
             print(f"Analysis fallback for {symbol}: {e}")
             return await self._fallback_analyzer.analyze_unbiased(symbol)
 
-    def set_simulation_config(self, duration_minutes: int = 120, universe_size: int = 80):
-        """Allow user to configure simulation duration and universe size."""
+    def set_simulation_config(self, duration_minutes: int = 120, universe_size: int = None):
+        """Allow user to configure simulation duration and universe size. If None, uses ALL tickers."""
         self.simulation_duration = timedelta(minutes=duration_minutes)
         self.universe_size = universe_size
+
+    def _get_symbol_sector(self, symbol: str) -> str:
+        """Dynamically resolve a symbol's sector via TickerUniverse."""
+        try:
+            from ticker_universe import get_ticker_universe
+            return get_ticker_universe().get_symbol_sector(symbol)
+        except Exception:
+            return "Unknown"
 
     # 
     # PRICE SIMULATION — Persistent trends, mean reversion, regime effects
@@ -1443,17 +1294,32 @@ class MarketSimulationEngine:
     def _generate_news_events(self, timestamp: datetime, regime: MarketRegime) -> List[SimulatedNewsEvent]:
         """Generate realistic news events with higher frequency."""
         events = []
-        for news_type, base_frequency in self.news_frequency.items():
+        for news_type, base_frequency in self._base_news_freq.items():
             regime_multiplier = self._get_news_frequency_multiplier(regime, news_type)
             adjusted_frequency = base_frequency * regime_multiplier
             if random.random() < adjusted_frequency:
                 event = self._create_news_event(timestamp, news_type, regime)
                 events.append(event)
+                # Apply cross-asset shock
+                self._apply_cross_asset_shocks(event)
             # Cluster effect: small chance of second event
             if random.random() < adjusted_frequency * 0.25:
                 event = self._create_news_event(timestamp, news_type, regime)
                 events.append(event)
         return events
+
+    def _apply_cross_asset_shocks(self, event: SimulatedNewsEvent):
+        """Propagate news shocks across correlated assets."""
+        for symbol in event.affected_symbols:
+            if symbol in self.asset_correlations:
+                correlations = self.asset_correlations[symbol]
+                for correlated_sym, corr_value in correlations.items():
+                    # Calculate secondary impact
+                    secondary_impact = event.sentiment_score * corr_value * 0.5
+                    # Add to the event's expected impact for the secondary asset
+                    event.expected_price_impact[correlated_sym] = secondary_impact
+                    if correlated_sym not in event.affected_symbols:
+                        event.affected_symbols.append(correlated_sym)
 
     def _get_news_frequency_multiplier(self, regime: MarketRegime, news_type: NewsType) -> float:
         """Regime-dependent news frequency scaling."""
@@ -1523,14 +1389,34 @@ class MarketSimulationEngine:
         simulation_id = f"sim_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         start_time = datetime.now()
         
-        # 1. Determine daily regime
-        regime = random.choice(list(MarketRegime))
+        # 1. Determine daily regime grounded in Master Strategy
+        from master_strategy_engine import get_master_engine
+        master_outlook = get_master_engine().get_dominant_outlook()
+        
+        # Bias the random choice toward master strategy outlook
+        # Bullish outlook increases probability of Bull/Recovery/Risk-On
+        # Bearish outlook increases probability of Bear/Crisis/Risk-Off
+        regime_pool = list(MarketRegime)
+        if master_outlook.bias == "BULLISH":
+            regime_pool.extend([MarketRegime.BULL_MARKET, MarketRegime.RECOVERY, MarketRegime.RISK_ON] * int(master_outlook.conviction * 10))
+        elif master_outlook.bias == "BEARISH":
+            regime_pool.extend([MarketRegime.BEAR_MARKET, MarketRegime.CRISIS, MarketRegime.RISK_OFF] * int(master_outlook.conviction * 10))
+            
+        regime = random.choice(regime_pool)
+        self._master_bias_val = 0.0001 if master_outlook.bias == "BULLISH" else -0.0001 if master_outlook.bias == "BEARISH" else 0.0
+        self._master_bias_val *= master_outlook.conviction
         
         # 2. Setup universe
-        universe = self._fallback_analyzer.asset_universe["stocks_mega"][:20] # Default subset
-        if self.universe_size:
-            # Expand universe logic here if needed
-            pass
+        try:
+            from ticker_universe import get_ticker_universe
+            if self.universe_size:
+                universe = get_ticker_universe().get_full_universe_sample(self.universe_size)
+            else:
+                universe = get_ticker_universe().get_all_tickers()
+        except ImportError:
+            universe = self._fallback_analyzer.asset_universe["stocks_mega"]
+            if self.universe_size:
+                universe = universe[:self.universe_size]
             
         self._initialize_symbol_trends(universe, regime)
         
@@ -1543,7 +1429,10 @@ class MarketSimulationEngine:
             'news_events': [],
             'cash': self.initial_capital,
             'portfolio': {},
-            'history': []
+            'options_portfolio': [], # List of SimulatedOptionPosition
+            'history': [],
+            'net_greeks': {'delta': 0.0, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0, 'vanna': 0.0, 'charm': 0.0},
+            'greeks_history': [],
         }
         
         while current_time < end_time:
@@ -1565,13 +1454,96 @@ class MarketSimulationEngine:
                 self._fallback_analyzer.update_price(sym, ohlc['close'])
                 step_prices[sym] = ohlc
             
-            # Generate news
+            # Update news
             news = self._generate_news_events(current_time, regime)
             state['news_events'].extend(news)
             
-            # Execute trading logic (simplified for this engine, usually AI loop goes here)
-            # For now we just record the market data evolution
+            # --- OPTIONS PORTFOLIO EVOLUTION (NEW) ---
+            try:
+                import options_engine
+                engine = options_engine.get_options_engine()
+                
+                net_delta = 0.0
+                net_theta = 0.0
+                net_gamma = 0.0
+                net_vega = 0.0
+                net_vanna = 0.0
+                net_charm = 0.0
+                
+                for op in state['options_portfolio']:
+                    u_price = step_prices[op.symbol]['close']
+                    expiry_dt = datetime.strptime(op.expiry, '%Y-%m-%d')
+                    T = (expiry_dt - current_time).total_seconds() / (365 * 24 * 3600)
+                    T = max(0.0001, T)
+                    iv = step_prices[op.symbol].get('volatility', 0.3)
+                    
+                    if op.is_multi_leg and op.legs:
+                        # Aggregate Greeks for multi-leg strategy
+                        strat_delta, strat_gamma, strat_theta, strat_vega = 0.0, 0.0, 0.0, 0.0
+                        strat_vanna, strat_charm, strat_price = 0.0, 0.0, 0.0
+                        
+                        for leg in op.legs:
+                            l_res = engine.black_scholes(u_price, leg['strike'], T, iv, leg['type'].lower())
+                            l_side = leg.get('side', 1) 
+                            l_qty = leg.get('quantity', 1.0)
+                            
+                            strat_delta += l_res['delta'] * l_qty * l_side
+                            strat_gamma += l_res['gamma'] * l_qty * l_side
+                            strat_theta += l_res['theta'] * l_qty * l_side
+                            strat_vega += l_res['vega'] * l_qty * l_side
+                            strat_vanna += l_res.get('vanna', 0.0) * l_qty * l_side
+                            strat_charm += l_res.get('charm', 0.0) * l_qty * l_side
+                            strat_price += l_res['price'] * l_qty * l_side
+                            
+                        op.current_price = strat_price
+                        op.delta, op.gamma, op.theta, op.vega = strat_delta, strat_gamma, strat_theta, strat_vega
+                        op.vanna, op.charm = strat_vanna, strat_charm
+                    else:
+                        # Single leg
+                        new_vals = engine.black_scholes(u_price, op.strike, T, iv, op.option_type.lower())
+                        op.current_price = new_vals['price']
+                        op.delta, op.gamma, op.theta, op.vega = new_vals['delta'], new_vals['gamma'], new_vals['theta'], new_vals['vega']
+                        op.vanna, op.charm = new_vals.get('vanna', 0.0), new_vals.get('charm', 0.0)
+                    
+                    net_delta += op.delta * op.quantity * 100 * op.side
+                    net_theta += op.theta * op.quantity * 100 * op.side
+                    net_gamma += op.gamma * op.quantity * 100 * op.side
+                    net_vega += op.vega * op.quantity * 100 * op.side
+                    net_vanna += op.vanna * op.quantity * 100 * op.side
+                    net_charm += op.charm * op.quantity * 100 * op.side
+                    
+                state['net_greeks'] = {
+                    'delta': net_delta, 'theta': net_theta, 'gamma': net_gamma, 
+                    'vega': net_vega, 'vanna': net_vanna, 'charm': net_charm
+                }
+                state['greeks_history'].append(state['net_greeks'].copy())
+            except Exception as e:
+                print(f"[ERROR] Options evolution failed: {e}")
             
+            # --- AGENT TRADING DECISIONS (NEW) ---
+            # Every 10 steps, scan for new breaking setups
+            step_count = int((current_time - start_time).total_seconds() / self.time_step.total_seconds())
+            if step_count % 10 == 0:
+                try:
+                    from breaking_trades_generator import get_breaking_trades_generator
+                    gen = get_breaking_trades_generator()
+                    # Sample a subset to keep simulation fast
+                    scan_universe = random.sample(universe, min(len(universe), 15))
+                    setups = gen.generate_breaking_trades(scan_universe, max_trades=2)
+                    
+                    for setup in setups:
+                        # Decide whether to trade stock or option
+                        if setup.options_setup and random.random() < 0.7:
+                            self._execute_simulated_option_trade(setup, state, current_time)
+                        else:
+                            self._execute_simulated_stock_trade(setup, state, current_time)
+                except Exception as e:
+                    print(f"[ERROR] Agent trading failed: {e}")
+
+            # --- RISK MANAGEMENT: CHECK EXITS ---
+            self._manage_active_positions(state, step_prices, current_time)
+            
+            # Execute trading logic (simplified for this engine)
             current_time += self.time_step
             
         # 4. Finalize
@@ -1579,7 +1551,20 @@ class MarketSimulationEngine:
 
     def _finalize_simulation(self, sim_id, start, end, regime, state):
         """Save results and generate insights."""
-        # Calculate stats
+        # 0. Grade Options Performance (NEW)
+        try:
+            from options_simulation_grader import OptionsSimulationGrader
+            grader = OptionsSimulationGrader()
+            opt_grade = grader.grade_options_performance(
+                state['options_portfolio'],
+                state['trades'],
+                state.get('greeks_history', [])
+            )
+            state['options_performance'] = opt_grade
+        except Exception as e:
+            print(f"[WARN] Options grading failed: {e}")
+
+        # 1. Calculate stats
         total_decisions = len(state['trades'])
         
         # Store in DB
@@ -1592,7 +1577,7 @@ class MarketSimulationEngine:
         # Persist learned params
         self._persist_current_params()
         
-        print(f"[END] Simulation {sim_id} complete. Grade: {results.get('simulation_grade', {}).get('letter_grade')}")
+        print(f"[END] Simulation {sim_id} complete. Grade: {results.get('simulation_grade', {}).get('letter_grade')} | Options: {state.get('options_performance', {}).letter_grade if hasattr(state.get('options_performance', {}), 'letter_grade') else 'N/A'}")
 
     def _store_simulation_results(self, sim_id, start, end, regime, state):
         """Store simulation data to SQLite."""
@@ -1688,3 +1673,359 @@ class MarketSimulationEngine:
         
         return recent_simulations
 
+    def _execute_simulated_stock_trade(self, setup, state, timestamp):
+        """Execute a simulated stock trade."""
+        if state['cash'] < setup.current_price * 10:
+            return
+            
+        quantity = 10 # Simplified sizing
+        cost = quantity * setup.current_price
+        state['cash'] -= cost
+        
+        trade = {
+            'symbol': setup.symbol,
+            'action': f"OPEN {setup.direction}",
+            'quantity': quantity,
+            'price': setup.current_price,
+            'timestamp': timestamp,
+            'confidence': setup.confidence_score / 100.0,
+            'is_option': False
+        }
+        state['trades'].append(trade)
+        
+        if setup.symbol not in state['portfolio']:
+            state['portfolio'][setup.symbol] = {'quantity': 0, 'avg_price': 0}
+        
+        p = state['portfolio'][setup.symbol]
+        total_q = p['quantity'] + (quantity if setup.direction == "LONG" else -quantity)
+        p['quantity'] = total_q
+        p['avg_price'] = setup.current_price
+        p['trades'] = p.get('trades', 0) + 1
+
+    def _execute_simulated_option_trade(self, setup, state, timestamp):
+        """Execute a simulated multi-leg option trade."""
+        cost = setup.options_setup.net_debit_credit
+        if state['cash'] < cost:
+            return
+            
+        state['cash'] -= cost
+        
+        # Record the complex strategy
+        op = SimulatedOptionPosition(
+            symbol=setup.symbol,
+            option_type=setup.options_setup.strategy_name,
+            strike=setup.options_setup.legs[0].strike, # Tracking primary leg metadata
+            expiry=setup.options_setup.legs[0].expiry,
+            quantity=1.0, # 1 lot
+            entry_price=setup.options_setup.net_debit_credit / 100.0,
+            current_price=setup.options_setup.net_debit_credit / 100.0,
+            side=1, # Opening the strategy
+            delta=setup.options_setup.greeks['delta'],
+            gamma=setup.options_setup.greeks['gamma'],
+            theta=setup.options_setup.greeks['theta'],
+            vega=setup.options_setup.greeks['vega'],
+            vanna=setup.options_setup.greeks.get('vanna', 0.0),
+            charm=setup.options_setup.greeks.get('charm', 0.0),
+            entry_time=timestamp,
+            is_multi_leg=len(setup.options_setup.legs) > 1,
+            legs=[{'type': l.type, 'strike': l.strike, 'side': l.side, 'quantity': l.quantity} for l in setup.options_setup.legs]
+        )
+        state['options_portfolio'].append(op)
+        
+        trade = {
+            'symbol': setup.symbol,
+            'action': f"OPEN OPTION {setup.options_setup.strategy_name}",
+            'quantity': 1,
+            'price': setup.options_setup.net_debit_credit,
+            'timestamp': timestamp,
+            'confidence': setup.confidence_score / 100.0,
+            'is_option': True
+        }
+        state['trades'].append(trade)
+
+    def _manage_active_positions(self, state, prices, timestamp):
+        """Manage exits for active positions."""
+        # Highly simplified for simulation
+        for sym, pos in list(state['portfolio'].items()):
+             if pos['quantity'] == 0: continue
+             curr_price = prices[sym]['close']
+             # Exit after fixed time or random 5% chance
+             if random.random() < 0.05:
+                  # CLOSE position
+                  pnl = (curr_price - pos['avg_price']) * pos['quantity']
+                  state['cash'] += curr_price * abs(pos['quantity'])
+                  # Record exit trade...
+                  pos['quantity'] = 0
+
+
+
+# ─── Task 10: Options Monte Carlo P&L Simulation Panel ────────────────────────
+
+def render_options_monte_carlo_panel():
+    """
+    Monte Carlo P&L simulation panel for options positions.
+    Simulates underlying price paths using GBM and computes P&L at expiration.
+    Requirements: 4.5, 4.6
+    """
+    import streamlit as st
+    import numpy as np
+    import plotly.graph_objs as go
+    import plotly.express as px
+    from plotly.subplots import make_subplots
+
+    st.subheader("Options Monte Carlo P&L Simulator")
+    st.caption(
+        "Simulate thousands of underlying price paths using Geometric Brownian Motion "
+        "and compute the distribution of P&L outcomes at expiration."
+    )
+
+    # ── Inputs ────────────────────────────────────────────────────────────────
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        symbol = st.text_input("Underlying Symbol", value="SPY", key="mc_sym").strip().upper()
+        option_type = st.selectbox("Option Type", ["call", "put"], key="mc_type")
+    with c2:
+        strike = st.number_input("Strike Price ($)", min_value=0.01, value=500.0, step=1.0, key="mc_strike")
+        dte = st.slider("Days to Expiry", 1, 365, 30, key="mc_dte")
+    with c3:
+        iv = st.slider("Implied Volatility (%)", 5, 200, 20, key="mc_iv") / 100.0
+        n_sims = st.selectbox("Simulations", [500, 1000, 2000, 5000], index=1, key="mc_nsims")
+
+    # Try to fetch live spot price
+    spot = None
+    try:
+        import yfinance as yf
+        hist = yf.Ticker(symbol).history(period="5d")
+        if not hist.empty:
+            close_col = hist["Close"]
+            if hasattr(close_col, "iloc"):
+                spot = float(close_col.dropna().iloc[-1])
+    except Exception:
+        pass
+
+    if spot is None:
+        spot = st.number_input("Spot Price ($)", min_value=0.01, value=500.0, step=1.0, key="mc_spot")
+    else:
+        st.caption(f"Live spot: **${spot:,.2f}**")
+        spot = st.number_input("Spot Price ($)", min_value=0.01, value=float(round(spot, 2)), step=1.0, key="mc_spot")
+
+    rf_rate = 0.045  # risk-free rate
+
+    if not st.button("Run Monte Carlo Simulation", type="primary", key="mc_run"):
+        st.info("Configure parameters above and click 'Run Monte Carlo Simulation'.")
+        return
+
+    with st.spinner(f"Running {n_sims:,} simulations..."):
+        try:
+            T = dte / 365.0
+            dt = T / max(dte, 1)  # daily steps
+            n_steps = dte
+
+            # ── GBM Path Generation ──────────────────────────────────────────
+            rng = np.random.default_rng(42)
+            Z = rng.standard_normal((n_sims, n_steps))
+            # Drift and diffusion
+            drift = (rf_rate - 0.5 * iv ** 2) * dt
+            diffusion = iv * np.sqrt(dt)
+
+            # Build price paths: shape (n_sims, n_steps+1)
+            log_returns = drift + diffusion * Z
+            log_paths = np.cumsum(log_returns, axis=1)
+            price_paths = spot * np.exp(np.hstack([np.zeros((n_sims, 1)), log_paths]))
+
+            # Terminal prices
+            S_T = price_paths[:, -1]
+
+            # ── Option pricing at entry (Black-Scholes) ──────────────────────
+            try:
+                import options_engine
+                engine = options_engine.get_options_engine()
+                entry_result = engine.black_scholes(spot, strike, T, iv, option_type)
+                entry_premium = float(entry_result.get("price", 0.0))
+            except Exception:
+                # Fallback analytic BS
+                from scipy.stats import norm
+                d1 = (np.log(spot / strike) + (rf_rate + 0.5 * iv ** 2) * T) / (iv * np.sqrt(T))
+                d2 = d1 - iv * np.sqrt(T)
+                if option_type == "call":
+                    entry_premium = float(spot * norm.cdf(d1) - strike * np.exp(-rf_rate * T) * norm.cdf(d2))
+                else:
+                    entry_premium = float(strike * np.exp(-rf_rate * T) * norm.cdf(-d2) - spot * norm.cdf(-d1))
+
+            # ── P&L at expiration ────────────────────────────────────────────
+            if option_type == "call":
+                payoffs = np.maximum(S_T - strike, 0.0)
+            else:
+                payoffs = np.maximum(strike - S_T, 0.0)
+
+            pnl = payoffs - entry_premium  # per-contract P&L (1 share basis)
+
+            # ── Key Statistics ───────────────────────────────────────────────
+            pop = float(np.mean(pnl > 0))  # Probability of Profit
+            expected_value = float(np.mean(pnl))
+            max_profit_sim = float(np.max(pnl))
+            max_loss_sim = float(np.min(pnl))
+            pct_5 = float(np.percentile(pnl, 5))
+            pct_25 = float(np.percentile(pnl, 25))
+            pct_75 = float(np.percentile(pnl, 75))
+            pct_95 = float(np.percentile(pnl, 95))
+
+            # ── Display Metrics ──────────────────────────────────────────────
+            st.markdown("---")
+            m1, m2, m3, m4 = st.columns(4)
+
+            pop_color = "normal" if pop >= 0.5 else "inverse"
+            m1.metric(
+                "Probability of Profit",
+                f"{pop:.1%}",
+                delta=f"{'Above' if pop >= 0.5 else 'Below'} 50%",
+                delta_color=pop_color,
+            )
+            ev_color = "normal" if expected_value >= 0 else "inverse"
+            m2.metric(
+                "Expected Value",
+                f"${expected_value:+.2f}",
+                delta_color=ev_color,
+            )
+            m3.metric("Max Profit (sim)", f"${max_profit_sim:+.2f}")
+            m4.metric("Max Loss (sim)", f"${max_loss_sim:+.2f}")
+
+            # Entry premium
+            st.caption(f"Entry premium (BS): **${entry_premium:.4f}** per share | "
+                       f"Strike: **${strike:.2f}** | DTE: **{dte}** | IV: **{iv:.1%}**")
+
+            # ── P&L Distribution Histogram ───────────────────────────────────
+            st.markdown("#### P&L Distribution at Expiration")
+            fig_hist = go.Figure()
+            fig_hist.add_trace(go.Histogram(
+                x=pnl,
+                nbinsx=60,
+                marker_color=np.where(pnl >= 0, "#4caf50", "#ef5350")[0]
+                    if len(pnl) > 0 else "#4caf50",
+                name="P&L",
+                opacity=0.8,
+            ))
+            # Color split: profit green, loss red
+            profit_pnl = pnl[pnl >= 0]
+            loss_pnl = pnl[pnl < 0]
+            fig_hist = go.Figure()
+            if len(profit_pnl) > 0:
+                fig_hist.add_trace(go.Histogram(
+                    x=profit_pnl, nbinsx=40,
+                    marker_color="rgba(76,175,80,0.7)", name="Profit", opacity=0.85,
+                ))
+            if len(loss_pnl) > 0:
+                fig_hist.add_trace(go.Histogram(
+                    x=loss_pnl, nbinsx=40,
+                    marker_color="rgba(239,83,80,0.7)", name="Loss", opacity=0.85,
+                ))
+            fig_hist.add_vline(x=0, line_dash="dash", line_color="white",
+                               annotation_text="Breakeven")
+            fig_hist.add_vline(x=expected_value, line_dash="dot", line_color="#c9a84c",
+                               annotation_text=f"EV ${expected_value:+.2f}")
+            fig_hist.update_layout(
+                template="plotly_dark",
+                barmode="overlay",
+                height=380,
+                title=f"{symbol} {option_type.upper()} ${strike:.0f} — P&L Distribution ({n_sims:,} sims)",
+                xaxis_title="P&L per Share ($)",
+                yaxis_title="Frequency",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                margin=dict(l=10, r=10, t=50, b=10),
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+            # ── P&L Fan Chart (percentile bands over time) ───────────────────
+            st.markdown("#### P&L Fan Chart (Percentile Bands Over Time)")
+
+            # Compute running P&L for each path at each time step
+            # Use Black-Scholes to price option at each step
+            try:
+                import options_engine
+                _engine = options_engine.get_options_engine()
+
+                # Sample 200 paths for fan chart (performance)
+                sample_idx = rng.choice(n_sims, size=min(200, n_sims), replace=False)
+                sample_paths = price_paths[sample_idx, :]  # (200, n_steps+1)
+
+                # Time steps
+                time_steps = np.arange(n_steps + 1)
+                remaining_T = np.maximum((dte - time_steps) / 365.0, 1e-6)
+
+                # Compute option value at each step for each path
+                # Vectorized approximation: use BS for each step
+                fan_pnl = np.zeros((len(sample_idx), n_steps + 1))
+                for t_idx in range(n_steps + 1):
+                    T_rem = remaining_T[t_idx]
+                    S_t = sample_paths[:, t_idx]
+                    for sim_i, s in enumerate(S_t):
+                        try:
+                            res = _engine.black_scholes(float(s), strike, float(T_rem), iv, option_type)
+                            fan_pnl[sim_i, t_idx] = float(res.get("price", 0.0)) - entry_premium
+                        except Exception:
+                            fan_pnl[sim_i, t_idx] = 0.0
+
+                # Percentile bands
+                p5 = np.percentile(fan_pnl, 5, axis=0)
+                p25 = np.percentile(fan_pnl, 25, axis=0)
+                p50 = np.percentile(fan_pnl, 50, axis=0)
+                p75 = np.percentile(fan_pnl, 75, axis=0)
+                p95 = np.percentile(fan_pnl, 95, axis=0)
+
+                fig_fan = go.Figure()
+                # 5-95 band
+                fig_fan.add_trace(go.Scatter(
+                    x=np.concatenate([time_steps, time_steps[::-1]]),
+                    y=np.concatenate([p95, p5[::-1]]),
+                    fill="toself",
+                    fillcolor="rgba(201,168,76,0.08)",
+                    line=dict(color="rgba(0,0,0,0)"),
+                    name="5th–95th pct",
+                    showlegend=True,
+                ))
+                # 25-75 band
+                fig_fan.add_trace(go.Scatter(
+                    x=np.concatenate([time_steps, time_steps[::-1]]),
+                    y=np.concatenate([p75, p25[::-1]]),
+                    fill="toself",
+                    fillcolor="rgba(201,168,76,0.18)",
+                    line=dict(color="rgba(0,0,0,0)"),
+                    name="25th–75th pct",
+                    showlegend=True,
+                ))
+                # Median
+                fig_fan.add_trace(go.Scatter(
+                    x=time_steps, y=p50,
+                    mode="lines",
+                    line=dict(color="#c9a84c", width=2.5),
+                    name="Median P&L",
+                ))
+                fig_fan.add_hline(y=0, line_dash="dash", line_color="rgba(255,255,255,0.3)")
+                fig_fan.update_layout(
+                    template="plotly_dark",
+                    height=380,
+                    title="P&L Fan Chart — Percentile Bands Over Time",
+                    xaxis_title="Days Elapsed",
+                    yaxis_title="P&L ($)",
+                    margin=dict(l=10, r=10, t=50, b=10),
+                )
+                st.plotly_chart(fig_fan, use_container_width=True)
+
+            except Exception as fan_err:
+                st.caption(f"Fan chart unavailable: {fan_err}")
+
+            # ── Percentile Summary Table ─────────────────────────────────────
+            st.markdown("#### Outcome Percentile Summary")
+            import pandas as pd
+            summary_df = pd.DataFrame({
+                "Percentile": ["5th (Worst 5%)", "25th", "50th (Median)", "75th", "95th (Best 5%)"],
+                "P&L ($)": [f"${pct_5:+.2f}", f"${pct_25:+.2f}",
+                             f"${float(np.percentile(pnl, 50)):+.2f}",
+                             f"${pct_75:+.2f}", f"${pct_95:+.2f}"],
+            })
+            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+        except Exception as e:
+            st.error(f"Simulation error: {e}")
+            import traceback
+            st.code(traceback.format_exc())

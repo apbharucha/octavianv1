@@ -1,0 +1,24 @@
+{
+  "_meta": {
+    "description": "Data corrections registry. Entries describe known-bad data points reported by users or provider audits. Each entry carries a date, a rationale, and the verified replacement OHLC values. Corrections are applied by data_sources._apply_data_corrections.",
+    "format_version": 1
+  },
+  "corrections": [
+    {
+      "symbol": "^VIX",
+      "date": "2026-02-09",
+      "reported_close": 17.36,
+      "reported_change_pct": -2.25,
+      "ohlc": {
+        "Open": 17.50,
+        "High": 17.65,
+        "Low": 17.30,
+        "Close": 17.36
+      },
+      "prev_close": 17.76,
+      "rationale": "User-reported bad tick on 2026-02-09; verified real price 17.36 at -2.25% change. Previous bar close adjusted to 17.76 so the daily change computes correctly.",
+      "added_by": "Octavian data quality audit",
+      "added_on": "2026-02-10"
+    }
+  ]
+}

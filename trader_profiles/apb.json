@@ -1,0 +1,120 @@
+{
+  "name": "apb",
+  "experience_level": "Beginner",
+  "trading_style": "Swing Trader",
+  "risk_profile": "Aggressive",
+  "asset_classes": [
+    "Forex",
+    "US Stocks"
+  ],
+  "sectors_of_interest": [],
+  "watchlist": [
+    "EUR/USD",
+    "GBP/USD",
+    "USD/JPY",
+    "AUD/USD",
+    "USD/CAD"
+  ],
+  "preferred_indicators": [
+    "RSI",
+    "MACD",
+    "Moving Averages (SMA/EMA)",
+    "VWAP",
+    "Bollinger Bands",
+    "Williams %R"
+  ],
+  "trading_goals": [
+    "Long-term wealth building",
+    "Quick profits (short-term trades)",
+    "Learning & skill development",
+    "Beat the S&P 500"
+  ],
+  "news_preferences": [
+    "Earnings reports",
+    "Fed/Central bank decisions",
+    "Macro economics",
+    "Geopolitical events",
+    "Sector rotation",
+    "Insider trading",
+    "Options flow",
+    "Short interest",
+    "IPOs & SPACs",
+    "Crypto regulation",
+    "AI/Tech developments",
+    "Commodity supply/demand"
+  ],
+  "portfolio_size": 500.0,
+  "time_horizon": "Swing (Days-Weeks)",
+  "current_holdings": "",
+  "model_sensitivity": "Medium (Balanced)",
+  "notification_rules": {
+    "price_alerts": true,
+    "regime_change": true,
+    "model_signals": true,
+    "news_impact": true
+  },
+  "capital_range": "Under $1,000",
+  "max_loss_per_trade_pct": 2.0,
+  "profit_target_pct": 5.0,
+  "preferred_session": "US Market Hours (9:30-16:00 ET)",
+  "alerts_enabled": true,
+  "show_advanced_metrics": true,
+  "dark_pool_alerts": true,
+  "options_greeks": true,
+  "ai_commentary_style": "balanced",
+  "adaptive_mode": false,
+  "learned_persona": {},
+  "created_at": "2026-03-26T10:10:53.233906",
+  "updated_at": "2026-08-03T17:49:41.656475",
+  "interaction_count": 12,
+  "queries_history": [
+    {
+      "query": "in what direction do you see crude oil futures heading towards",
+      "timestamp": "2026-06-16T09:43:08.030121"
+    },
+    {
+      "query": "with the given volatility of the crude oil future market, where do you think it will be heading next",
+      "timestamp": "2026-06-22T13:07:43.569555"
+    },
+    {
+      "query": "how does the volatitlity of the oil markets have impact on how I should approach a trade setup",
+      "timestamp": "2026-06-30T12:41:36.752463"
+    },
+    {
+      "query": "how does the volatitlity of the oil markets have impact on how I should approach a trade setup",
+      "timestamp": "2026-06-30T12:56:48.693905"
+    },
+    {
+      "query": "how does the volatitlity of the oil markets have impact on how I should approach a trade setup",
+      "timestamp": "2026-06-30T13:01:20.440723"
+    },
+    {
+      "query": "how does the volatitlity of the oil markets have impact on how I should approach a trade setup",
+      "timestamp": "2026-06-30T13:14:30.169068"
+    },
+    {
+      "query": " how does the volatitlity of the oil markets have impact on how I should approach a trade setup",
+      "timestamp": "2026-06-30T13:17:10.045544"
+    },
+    {
+      "query": "how does the volatitlity of the oil markets have impact on how I should approach a trade setup",
+      "timestamp": "2026-06-30T13:24:52.774303"
+    },
+    {
+      "query": "what is your outlook on the current oil futures market ",
+      "timestamp": "2026-08-02T08:39:01.885072"
+    },
+    {
+      "query": "CL=F options analysis and strategies",
+      "timestamp": "2026-08-02T08:40:29.153843"
+    },
+    {
+      "query": "what are some CL=F options strategies and give in-depth anaylsis behind each one",
+      "timestamp": "2026-08-02T08:41:05.736334"
+    },
+    {
+      "query": "do an intensive market scan an pick 5 new and up and coming biotech stocks, present you reasoning why you think these stocks will rise",
+      "timestamp": "2026-08-03T17:49:41.656468"
+    }
+  ]
+}

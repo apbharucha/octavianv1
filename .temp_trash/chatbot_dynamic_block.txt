@@ -1,0 +1,110 @@
+    def _generate_helpful_response(self, query: str, intents: List[str]) -> str:
+        """Generate helpful response when no symbols are found.
+
+        Example tickers are drawn live from the dynamic ticker universe so the
+        guidance always reflects the platform's current asset coverage.
+        """
+        base_response = "I'd be happy to help with your market analysis! "
+        examples = _get_asset_examples()
+        stocks = examples.get("stocks", [])
+        etfs = examples.get("etfs", [])
+        crypto = examples.get("crypto", [])
+        forex = examples.get("forex", [])
+        futures = examples.get("futures", [])
+        s0 = stocks[0] if stocks else "AAPL"
+        s1 = stocks[1] if len(stocks) > 1 else "TSLA"
+        s2 = stocks[2] if len(stocks) > 2 else "NVDA"
+        e0 = etfs[0] if etfs else "SPY"
+        e1 = etfs[1] if len(etfs) > 1 else "QQQ"
+        c0 = crypto[0] if crypto else "BTC-USD"
+        c1 = crypto[1] if len(crypto) > 1 else "ETH-USD"
+        fx0 = forex[0] if forex else "EUR/USD"
+        fx1 = forex[1] if len(forex) > 1 else "GBP/USD"
+
+        if 'prediction' in intents:
+            return base_response + f"""To provide predictions, please specify which assets you'd like me to analyze. For example:
+
+**Stock Examples:**
+- "What's your prediction for {s0}?"
+- "Should I buy {s1} stock?"
+- "Analyze {s2} for next week"
+
+**ETF Examples:**
+- "Predict {e0} movement"
+- "{e1} outlook for this month"
+
+**Crypto Examples:**
+- "Bitcoin price prediction"
+- "Analyze {c0}"
+- "{c1} forecast"
+
+**FX Examples:**
+- "{fx0} analysis"
+- "{fx1} prediction"
+"""
+        elif 'analysis' in intents:
+            return base_response + f"""I can provide comprehensive technical analysis for any asset. Please specify which one you'd like me to analyze:
+
+**Stocks:** {", ".join(stocks[:7]) or "(name any ticker)"}
+**ETFs:** {", ".join(etfs[:5]) or "(name any ticker)"}
+**Cryptocurrencies:** {", ".join(crypto[:4]) or "(name any ticker)"}
+**Forex Pairs:** {", ".join(forex[:4]) or "(name any ticker)"}
+**Futures:** {", ".join(futures[:4]) or "(name any ticker)"}
+
+Just ask: "Analyze [SYMBOL]" or "Technical analysis of [SYMBOL]"
+"""
+        elif 'comparison' in intents:
+            return base_response + f"""I can compare multiple assets for you! Please specify which assets you'd like me to compare:
+
+**Examples:**
+- "Compare {s0} vs {s1}"
+- "{s2} versus {s1} performance"
+- "{e0} vs {e1} analysis"
+- "{c0} vs {c1}"
+- "{fx0} vs {fx1}"
+
+I'll show you relative performance, correlation analysis, and detailed comparisons.
+"""
+        else:
+            return base_response + f"""Here are some things I can help you with:
+
+[SCAN] **Analysis & Predictions**
+- Technical analysis of any stock, ETF, crypto, or forex pair
+- ML-powered price predictions with confidence levels
+- Risk assessment and volatility analysis
+
+ **Visual Analytics**
+- Interactive price charts with technical indicators
+- Comparison charts for multiple assets
+- Volatility and risk visualization
+
+ **Market Insights**
+- Real-time market data and trends
+- Support/resistance levels
+- Trading recommendations
+
+**Just ask me about any symbol!** For example: "Analyze {s0}", "Bitcoin prediction", or "Compare {e0} vs {e1}"
+"""
+    def _get_query_suggestions(self) -> List[str]:
+        """Get contextual query suggestions (examples from the dynamic universe)."""
+        examples = _get_asset_examples()
+        stocks = examples.get("stocks", [])
+        etfs = examples.get("etfs", [])
+        crypto = examples.get("crypto", [])
+        forex = examples.get("forex", [])
+        s0 = stocks[0] if stocks else "AAPL"
+        s1 = stocks[1] if len(stocks) > 1 else "TSLA"
+        s2 = stocks[2] if len(stocks) > 2 else "NVDA"
+        e0 = etfs[0] if etfs else "SPY"
+        e1 = etfs[1] if len(etfs) > 1 else "QQQ"
+        c0 = crypto[0] if crypto else "BTC-USD"
+        fx0 = forex[0] if forex else "EUR/USD"
+        return [
+            f"Analyze {e0} with technical indicators",
+            f"What's your prediction for {s0}?",
+            f"Compare {s1} vs {s2} performance",
+            f"{c0} price analysis and forecast",
+            f"Show me risk analysis for {e1}",
+            f"{fx0} technical analysis",
+            "Market volatility analysis today"
+        ]

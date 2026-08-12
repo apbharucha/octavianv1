@@ -141,9 +141,35 @@ def analyze_price_chart(df, indicators_df=None):
         elif abs(current - recent_low) / recent_low < 0.02:
             analysis.append(f"[STOP] **Support:** Price near 50-day low (${recent_low:.2f}). Watch for bounce or breakdown.")
     
-    if not analysis:
-        return "Chart analysis: Standard price action with no extreme signals detected."
-    
+    # Global Integration: Full Model Outlook
+    try:
+        from quant_ensemble_model import get_quant_ensemble
+        qe = get_quant_ensemble()
+        # Note: In this context, we don't always have a symbol string passed in.
+        # But if we have DF, we can try to guess or just use the data for prediction if the model allows.
+        # For now, we'll only append if we can get a prediction.
+        q_signal = qe.predict("CHART", df)
+        
+        from market_movers import _generate_ai_insights, _calculate_technicals
+        ai_tech = _calculate_technicals(df)
+        ai_data = _generate_ai_insights("CHART", ai_tech, df)
+        
+        f_score = ai_data.get("bullish_prob", 0.5) * 100
+        q_prob = q_signal.probability * 100
+        u_score = (f_score + q_prob) / 2
+        
+        if u_score >= 80: label = "STRONG OVERWEIGHT"
+        elif u_score >= 60: label = "ACCUMULATE"
+        elif u_score >= 40: label = "NEUTRAL"
+        elif u_score >= 20: label = "REDUCE"
+        else: label = "STRONG UNDERWEIGHT"
+        
+        outlook_str = f"\n\n**FULL MODEL OUTLOOK: {label} ({u_score:.1f} Conviction)**\n"
+        outlook_str += f"Technical bias ({f_score:.0f}/100) aligned with Quant signal ({q_signal.direction} {q_prob:.0f}%)."
+        analysis.append(outlook_str)
+    except Exception:
+        pass
+
     return "\n\n".join(analysis)
 
 def analyze_rsi_chart(rsi_series):

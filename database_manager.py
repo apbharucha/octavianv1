@@ -226,6 +226,17 @@ class DatabaseManager:
                 )
             """)
             
+            # User activity logs for adaptive personalization
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_activity_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    action_type TEXT NOT NULL, -- 'page_view', 'symbol_search', 'btn_click', 'tool_usage'
+                    action_detail TEXT, -- JSON or string
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
             # Create indexes for performance
             indexes = [
                 "CREATE INDEX IF NOT EXISTS idx_market_data_symbol_time ON market_data(symbol, timestamp)",
@@ -576,6 +587,47 @@ class DatabaseManager:
     
     # ============= USER MANAGEMENT METHODS =============
     
+    def log_user_activity(self, user_id: str, action_type: str, action_detail: Any = None) -> bool:
+        """Log user interaction for adaptive personalization."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                detail_str = json.dumps(action_detail) if action_detail is not None else None
+                cursor.execute("""
+                    INSERT INTO user_activity_logs (user_id, action_type, action_detail)
+                    VALUES (?, ?, ?)
+                """, (user_id, action_type, detail_str))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error logging user activity: {e}")
+            return False
+
+    def get_user_activity(self, user_id: str, limit: int = 100) -> List[Dict]:
+        """Retrieve recent user activity logs."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT action_type, action_detail, timestamp 
+                    FROM user_activity_logs 
+                    WHERE user_id = ? 
+                    ORDER BY timestamp DESC 
+                    LIMIT ?
+                """, (user_id, limit))
+                
+                logs = []
+                for row in cursor.fetchall():
+                    logs.append({
+                        'action_type': row['action_type'],
+                        'detail': json.loads(row['action_detail']) if row['action_detail'] else None,
+                        'timestamp': row['timestamp']
+                    })
+                return logs
+        except Exception as e:
+            logger.error(f"Error retrieving user activity: {e}")
+            return []
+
     def create_user_profile(self, user_id: str, preferences: Dict[str, Any]) -> bool:
         """Create or update user profile."""
         try:

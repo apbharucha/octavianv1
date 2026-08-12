@@ -35,9 +35,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Enums & Constants
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 class Side(Enum):
@@ -132,9 +132,9 @@ AGENT_DEFAULTS: dict[AgentType, dict] = {
 }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Order & Trade Data Structures
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 @dataclass(order=True)
@@ -182,9 +182,9 @@ class MarketSnapshot:
     fundamental_value: float
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Order Book
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 class OrderBook:
@@ -370,9 +370,9 @@ class OrderBook:
         return list(self._trades_this_step)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Agent Base Class
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 class Agent:
@@ -413,9 +413,9 @@ class Agent:
         return max(0.01, mid * (1 + float(self.rng.normal(0, std_pct))))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Concrete Agent Types
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 class FundamentalistAgent(Agent):
@@ -675,9 +675,9 @@ class HFTAgent(Agent):
         return orders
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Simulation Result
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 @dataclass
@@ -774,9 +774,9 @@ class SimulationResult:
         return pd.DataFrame(rows).sort_values("Total PnL ($)", ascending=False)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Market Simulator
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 class MarketSimulator:
@@ -815,7 +815,7 @@ class MarketSimulator:
         self.rng = np.random.default_rng(seed)
         self.agent_mix = agent_mix
 
-    # ── Agent Factory ─────────────────────────────────────────────────────────
+    #  Agent Factory 
 
     def _build_agents(self) -> list[Agent]:
         agents: list[Agent] = []
@@ -865,7 +865,7 @@ class MarketSimulator:
 
         return agents
 
-    # ── Fundamental Value Process ─────────────────────────────────────────────
+    #  Fundamental Value Process 
 
     def _simulate_fundamental(self, initial: float) -> list[float]:
         """Geometric Brownian Motion for the fundamental (fair) value."""
@@ -881,7 +881,7 @@ class MarketSimulator:
             path.append(max(0.01, next_v))
         return path
 
-    # ── Event Engine ──────────────────────────────────────────────────────────
+    #  Event Engine 
 
     def _sample_event(
         self, step: int, fundamental: list[float]
@@ -907,7 +907,7 @@ class MarketSimulator:
         etype, desc, mult = events[idx]
         return etype, desc, mult
 
-    # ── Realised Volatility ───────────────────────────────────────────────────
+    #  Realised Volatility 
 
     def _realized_vol(self, price_history: list[float], window: int = 20) -> float:
         if len(price_history) < window + 1:
@@ -922,7 +922,7 @@ class MarketSimulator:
         vol = float(np.std(log_rets)) * math.sqrt(252) * 100
         return round(vol, 2)
 
-    # ── Main Run ──────────────────────────────────────────────────────────────
+    #  Main Run 
 
     def run(self, initial_price: float = 100.0) -> SimulationResult:
         """
@@ -1078,9 +1078,9 @@ class MarketSimulator:
         )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Preset Scenarios
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 SIMULATION_PRESETS: dict[str, dict] = {
     "Normal Market": {

@@ -57,14 +57,26 @@ nav_options = [
     "Symbol Analysis",
     "Chart Analysis",
     "Intelligence Center",
+    "Market Heartbeat",
+    "Institutional 13F & SEC Filings",
     "Financial Model Generator",
+    "Target Probability",
+    "Presentation Generator",
+    "Document Analyzer",
+    "Comparative Analysis",
     "Daily Briefing",
     "Quant Portal",
+    "Quant Modeling Lab",
     "Strategy Research Lab",
+    "Portfolio Analyzer",
+    "Position Optimizer",
     "Paper Trading",
     "Simulation Hub",
+    "Spreadsheet Generator",
     "Trader Profile",
+    "Notification Settings",
     "Settings & Analytics",
+    "Terms of Service",
 ]
 selection = st.sidebar.radio("Navigation", nav_options, label_visibility="collapsed")
 
@@ -277,7 +289,7 @@ if selection == "Dashboard":
                     font=dict(color=COLORS["text_secondary"]),
                 ),
             )
-            st.plotly_chart(fig_indices, use_container_width=True)
+            st.plotly_chart(fig_indices, width='stretch')
 
         section_header("Quick Market Scan")
         from futures_leaderboard import futures_rank
@@ -291,7 +303,7 @@ if selection == "Dashboard":
                 st.dataframe(
                     sectors[["Sector", "TrendScore"]].head(5),
                     hide_index=True,
-                    use_container_width=True,
+                    width='stretch',
                 )
         with col2:
             st.caption("Top Futures Movers")
@@ -300,14 +312,20 @@ if selection == "Dashboard":
                 st.dataframe(
                     futures[["Contract", "TrendScore"]].head(5),
                     hide_index=True,
-                    use_container_width=True,
+                    width='stretch',
                 )
 
         # Market Movers - Top/Worst Performers
         st.markdown("---")
-        from market_movers import show_market_movers
+        from market_movers import show_market_movers, show_symbol_search
 
         show_market_movers()
+
+        # Symbol Search & Analysis — merged here from the former
+        # "Market Intelligence" page so the full market overview lives on
+        # the dashboard (no separate nav section).
+        st.markdown("---")
+        show_symbol_search()
 
     with dash_tabs[2]:
         st.subheader("Breaking Trades - High Confidence Setups")
@@ -323,27 +341,12 @@ if selection == "Dashboard":
                 try:
                     from breaking_trades_generator import BreakingTradesGenerator
 
-                    # Use full ticker universe instead of preset list
-                    try:
-                        from ticker_universe import TickerUniverse
-                        tu = TickerUniverse()
-                        # Get diverse sample from universe
-                        watchlist = tu.get_full_universe_sample(50)  # Scan 50 random tickers from universe
-                    except:
-                        # Fallback to preset list if universe not available
-                        watchlist = [
-                            "AAPL", "MSFT", "GOOGL", "NVDA", "TSLA",
-                            "META", "AMZN", "SPY", "QQQ", "AMD",
-                            "NFLX", "DIS", "V", "MA", "JPM",
-                            "UNH", "HD", "PG", "COST", "BA",
-                            "MS", "GS", "BLK", "SCHW", "C",
-                            "XOM", "CVX", "COP", "SLB", "EOG",
-                            "PFE", "JNJ", "UNP", "LIN", "NEE",
-                            "AMT", "PLD", "CCI", "EQIX", "PSA",
-                            "MCO", "SPGI", "AXP", "USB", "TFC",
-                            "BKNG", "CME", "ICE", "SCHD", "VTI",
-                            "VOO", "IVV", "VEA", "VWO", "BND"
-                        ]
+                    # Use the live multi-asset universe — never a preset list.
+                    # The universe self-expands and caches, so the watchlist always
+                    # reflects the currently supported instruments.
+                    from ticker_universe import get_ticker_universe
+                    tu = get_ticker_universe()
+                    watchlist = tu.get_full_universe_sample(80)  # Diverse 80-ticker scan
 
                     gen = BreakingTradesGenerator(min_confidence=55.0)
                     breaking_trades = gen.generate_breaking_trades(
@@ -553,20 +556,8 @@ elif selection == "Market Scanner":
     show_market_scanner()
 
 elif selection == "Symbol Analysis":
-    st.title("Symbol Analysis")
-    analysis_type = st.radio(
-        "Analysis Mode",
-        ["Deep Dive (Single Symbol)", "Quant Terminal (Multi-Asset)"],
-        horizontal=True,
-    )
-    if analysis_type == "Deep Dive (Single Symbol)":
-        from custom_dashboard import show_custom_dashboard
-
-        show_custom_dashboard()
-    else:
-        from quant_terminal import show_quant_terminal
-
-        show_quant_terminal()
+    from custom_dashboard import show_custom_dashboard
+    show_custom_dashboard()
 
 elif selection == "Chart Analysis":
     st.title("Chart Image Analysis")
@@ -603,7 +594,7 @@ elif selection == "Intelligence Center":
 
             ct = get_counter_trend_analyzer()
 
-            # ── Narrative Overview Table ───────────────────────────────────────
+            #  Narrative Overview Table 
             st.markdown("### Macro Narrative Divergence Tracker")
             st.caption(
                 "Consensus Score = how strongly the market believes the narrative (0–100). "
@@ -640,13 +631,13 @@ elif selection == "Intelligence Center":
                             "Status",
                         ]
                     ],
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                 )
 
             st.markdown("---")
 
-            # ── Active Counter-Trend Signals ──────────────────────────────────
+            #  Active Counter-Trend Signals 
             st.markdown("### Active Counter-Trend Trade Signals")
             ct_signals = ct.generate_counter_signals(
                 divergence_threshold=18.0, min_strength=50.0
@@ -706,7 +697,7 @@ elif selection == "Intelligence Center":
 
             st.markdown("---")
 
-            # ── Narrative Contradiction Detail ────────────────────────────────
+            #  Narrative Contradiction Detail 
             st.markdown("### Narrative Contradictions Deep-Dive")
             all_narrative_objs = ct.get_all_narratives()
             selected_theme = st.selectbox(
@@ -743,7 +734,7 @@ elif selection == "Intelligence Center":
                             for s in narr_obj.supporting_data:
                                 st.markdown(f"- {s}")
 
-            # ── Full Narrative Report ─────────────────────────────────────────
+            #  Full Narrative Report 
             with st.expander("Full Narrative Report (Text)", expanded=False):
                 st.code(ct.get_narrative_report(), language=None)
 
@@ -752,666 +743,33 @@ elif selection == "Intelligence Center":
             st.info("Ensure counter_trend_analyzer.py is present in the project root.")
 
 elif selection == "Paper Trading":
-    from paper_trading_ui import show_paper_trading
+    from paper_trading_ui import show_paper_trading_dashboard
 
-    show_paper_trading()
+    show_paper_trading_dashboard()
 
 elif selection == "Simulation Hub":
     from simulation_viewer import render_simulation_viewer
 
     render_simulation_viewer()
 
+elif selection == "Spreadsheet Generator":
+    from spreadsheet_generator import show_spreadsheet_generator
+
+    show_spreadsheet_generator()
+
 elif selection == "Trader Profile":
     show_profile_settings()
 
+elif selection == "Market Heartbeat":
+    from market_heartbeat_system import show_market_heartbeat_tab
+    show_market_heartbeat_tab()
+
 elif selection == "Financial Model Generator":
-    import plotly.express as px
+    # Merged Wall Street-grade modeling suite: DCF + LBO + M&A Accretion/Dilution
+    # (single home for all three models — no separate M&A / LBO page).
+    from financial_model_generator_ui import show_financial_generator
 
-    # Defensive import — clears stale .pyc cache on first ImportError then retries
-    try:
-        from financial_model_generator import (
-            DCFAssumptions,
-            get_dcf_engine,
-            get_financial_generator,
-        )
-
-        _fmg_import_ok = True
-    except ImportError:
-        # Stale __pycache__ can cause spurious ImportErrors; invalidate and retry
-        import importlib
-        import sys
-
-        for _mod in list(sys.modules.keys()):
-            if "financial_model_generator" in _mod:
-                del sys.modules[_mod]
-        try:
-            from financial_model_generator import (
-                DCFAssumptions,
-                get_dcf_engine,
-                get_financial_generator,
-            )
-
-            _fmg_import_ok = True
-        except Exception as _fmg_err:
-            _fmg_import_ok = False
-            st.error(
-                f"Could not load Financial Model Generator: `{_fmg_err}`\n\n"
-                "**Fix:** Stop Streamlit, run `find . -name '*.pyc' -delete` "
-                "in the project root, then restart."
-            )
-    except Exception as _fmg_err:
-        _fmg_import_ok = False
-        st.error(f"Financial Model Generator failed to load: `{_fmg_err}`")
-
-    if not _fmg_import_ok:
-        st.stop()
-
-    st.title("Institutional DCF Valuation Engine")
-    st.caption(
-        "Wall Street-grade model: Revenue → EBIT → NOPAT → FCF → DCF | "
-        "Monte Carlo | Scenario Analysis | Relative Valuation | Trade Signals"
-    )
-
-    # ── Ticker input + auto-fill ──────────────────────────────────────────────
-    fmg_col_ticker, fmg_col_fetch = st.columns([2, 1])
-    with fmg_col_ticker:
-        ticker = st.text_input(
-            "Ticker Symbol",
-            value=st.session_state.get("fmg_ticker", ""),
-            placeholder="e.g. MSFT, NVDA, TSLA…",
-            help="Enter any ticker. Use 'Auto-Fill from Ticker' to populate assumptions from live data.",
-        )
-    with fmg_col_fetch:
-        st.markdown("<br>", unsafe_allow_html=True)
-        do_autofill = st.button(
-            "Auto-Fill from Ticker",
-            use_container_width=True,
-            help="Fetches live financials from yfinance and populates all fields automatically.",
-        )
-
-    if do_autofill and ticker:
-        with st.spinner(f"Fetching financials for {ticker.upper()}…"):
-            try:
-                import yfinance as _yf_fmg
-
-                _t = _yf_fmg.Ticker(ticker.upper())
-                _info = _t.info or {}
-
-                # Price
-                _price = float(
-                    _info.get("currentPrice")
-                    or _info.get("regularMarketPrice")
-                    or _info.get("previousClose")
-                    or 100.0
-                )
-                # Revenue (trailing 12 months, in $M)
-                _rev_raw = _info.get("totalRevenue") or _info.get("revenuePerShare", 0)
-                _rev = (
-                    float(_rev_raw) / 1e6
-                    if _rev_raw and _rev_raw > 1e6
-                    else max(float(_rev_raw or 100), 100.0)
-                )
-                # EBIT margin
-                _ebit_m = float(_info.get("operatingMargins") or 0.20)
-                # Beta
-                _beta = float(_info.get("beta") or 1.0)
-                # Market cap ($M)
-                _mktcap = float(_info.get("marketCap") or 0) / 1e6
-                if _mktcap <= 0:
-                    _mktcap = (
-                        _price * float(_info.get("sharesOutstanding") or 1e9) / 1e6
-                    )
-                # Total debt ($M)
-                _debt = float(_info.get("totalDebt") or 0) / 1e6
-                # Cash ($M)
-                _cash_val = float(_info.get("totalCash") or 0) / 1e6
-                # Shares outstanding (M)
-                _shares = float(_info.get("sharesOutstanding") or 1e9) / 1e6
-                # Revenue growth (analyst estimate or trailing)
-                _rev_growth = float(
-                    _info.get("revenueGrowth") or _info.get("earningsGrowth") or 0.08
-                )
-                _rev_growth = max(min(_rev_growth, 0.60), -0.10)
-                # Tax rate
-                _tax = float(_info.get("effectiveTaxRate") or 0.21)
-                _tax = max(min(_tax, 0.40), 0.05)
-
-                st.session_state["fmg_ticker"] = ticker.upper()
-                st.session_state["fmg_price"] = round(_price, 2)
-                st.session_state["fmg_rev"] = round(_rev, 1)
-                st.session_state["fmg_rev_growth"] = round(_rev_growth * 100, 1)
-                st.session_state["fmg_ebit"] = round(_ebit_m * 100, 1)
-                st.session_state["fmg_tax"] = round(_tax * 100, 1)
-                st.session_state["fmg_beta"] = round(_beta, 2)
-                st.session_state["fmg_mktcap"] = round(_mktcap, 0)
-                st.session_state["fmg_debt"] = round(_debt, 0)
-                st.session_state["fmg_cash"] = round(_cash_val, 0)
-                st.session_state["fmg_shares"] = round(_shares, 1)
-                st.session_state.pop("dcf_result", None)
-                st.success(
-                    f"Auto-filled assumptions for {ticker.upper()} — review and click Run DCF."
-                )
-                st.rerun()
-            except Exception as _af_err:
-                st.warning(
-                    f"Auto-fill partial ({_af_err}). Enter assumptions manually."
-                )
-
-    # Two-column layout: inputs left, results right
-    col_input, col_main = st.columns([1, 2])
-
-    with col_input:
-        st.subheader("Revenue & Margins")
-        current_price = st.number_input(
-            "Current Market Price ($)",
-            value=float(st.session_state.get("fmg_price", 100.0)),
-            min_value=0.01,
-        )
-        base_revenue = st.number_input(
-            "Base Revenue ($M)",
-            value=float(st.session_state.get("fmg_rev", 5_000.0)),
-            step=100.0,
-        )
-        rev_growth = (
-            st.slider(
-                "Revenue Growth Rate (%)",
-                0.0,
-                50.0,
-                float(st.session_state.get("fmg_rev_growth", 8.0)),
-            )
-            / 100
-        )
-        ebit_margin = (
-            st.slider(
-                "EBIT Margin (%)",
-                0.0,
-                60.0,
-                float(st.session_state.get("fmg_ebit", 20.0)),
-            )
-            / 100
-        )
-        tax_rate = (
-            st.slider(
-                "Tax Rate (%)",
-                0.0,
-                40.0,
-                float(st.session_state.get("fmg_tax", 21.0)),
-            )
-            / 100
-        )
-
-        st.subheader("Working Capital & CapEx")
-        da_pct = st.slider("D&A (% Revenue)", 0.0, 15.0, 3.0) / 100
-        capex_pct = st.slider("CapEx (% Revenue)", 0.0, 20.0, 5.0) / 100
-        nwc_pct = st.slider("ΔNWC (% Revenue)", -5.0, 10.0, 1.0) / 100
-
-        st.subheader("WACC / CAPM")
-        risk_free = st.slider("Risk-Free Rate (%)", 2.0, 8.0, 4.25) / 100
-        erp = st.slider("Equity Risk Premium (%)", 3.0, 8.0, 5.5) / 100
-        beta = st.slider(
-            "Beta",
-            0.3,
-            3.0,
-            float(st.session_state.get("fmg_beta", 1.0)),
-            step=0.05,
-        )
-        cost_of_debt = st.slider("Cost of Debt (%)", 2.0, 10.0, 4.5) / 100
-        equity_val_market = st.number_input(
-            "Market Cap ($M)",
-            value=float(st.session_state.get("fmg_mktcap", 10_000.0)),
-            step=100.0,
-        )
-        debt_total = st.number_input(
-            "Total Debt ($M)",
-            value=float(st.session_state.get("fmg_debt", 1_000.0)),
-            step=100.0,
-        )
-        cash = st.number_input(
-            "Cash ($M)",
-            value=float(st.session_state.get("fmg_cash", 500.0)),
-            step=100.0,
-        )
-
-        st.subheader("Terminal Value & Shares")
-        terminal_growth = st.slider("Terminal Growth Rate (%)", 0.5, 5.0, 2.5) / 100
-        shares = st.number_input(
-            "Shares Outstanding (M)",
-            value=float(st.session_state.get("fmg_shares", 1_000.0)),
-            step=10.0,
-        )
-        proj_years = st.selectbox("Projection Years", [3, 5, 7, 10], index=1)
-
-        st.subheader("Peer Multiples (Relative Valuation)")
-        peer_pe = st.number_input("Peer P/E", value=25.0, step=1.0)
-        peer_ev_ebitda = st.number_input("Peer EV/EBITDA", value=15.0, step=0.5)
-        peer_ev_fcf = st.number_input("Peer EV/FCF", value=20.0, step=0.5)
-        peg = st.number_input("PEG Ratio", value=2.0, step=0.1)
-
-        run_model = st.button(
-            "Run Institutional DCF", type="primary", use_container_width=True
-        )
-
-    # ── Run engine ────────────────────────────────────────────────────────────
-    if run_model:
-        assumptions = DCFAssumptions(
-            ticker=ticker,
-            base_revenue=base_revenue,
-            revenue_growth_rates=[rev_growth] * proj_years,
-            ebit_margin=ebit_margin,
-            tax_rate=tax_rate,
-            da_pct_revenue=da_pct,
-            capex_pct_revenue=capex_pct,
-            nwc_change_pct_revenue=nwc_pct,
-            equity_value_market=equity_val_market,
-            debt_value=debt_total,
-            cost_of_debt=cost_of_debt,
-            risk_free_rate=risk_free,
-            equity_risk_premium=erp,
-            beta=beta,
-            terminal_growth_rate=terminal_growth,
-            cash=cash,
-            shares_outstanding=shares,
-            current_price=current_price,
-            peer_pe=peer_pe,
-            peer_ev_ebitda=peer_ev_ebitda,
-            peer_ev_fcf=peer_ev_fcf,
-            peg_ratio=peg,
-            projection_years=proj_years,
-        )
-        engine = get_dcf_engine()
-        with st.spinner(
-            "Running institutional DCF (including Monte Carlo 10,000 paths)..."
-        ):
-            result = engine.run_dcf(assumptions)
-        st.session_state["dcf_result"] = result
-
-    # ── Display results ───────────────────────────────────────────────────────
-    with col_main:
-        if "dcf_result" not in st.session_state:
-            st.info(
-                "Configure assumptions on the left and click **Run Institutional DCF**."
-            )
-        else:
-            result = st.session_state["dcf_result"]
-            sig = result.trade_signal
-
-            # ── Trade Signal Banner ───────────────────────────────────────────
-            sig_colors = {
-                "Strong Long": "#00ff88",
-                "Long": "#7fff7f",
-                "Neutral": "#aaaaaa",
-                "Short": "#ff9944",
-                "Strong Short": "#ff4444",
-            }
-            sig_color = sig_colors.get(sig.signal, "#ffffff")
-            st.markdown(
-                f"""
-                <div style="background:#161b22;border:1px solid {sig_color};border-radius:8px;
-                            padding:12px 16px;margin-bottom:12px;">
-                  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-                    <div>
-                      <div style="font-size:1.1rem;font-weight:700;color:{sig_color};">{sig.signal.upper()}</div>
-                      <div style="color:#aaa;font-size:0.75rem;">{result.ticker} — {sig.risk_level} Risk</div>
-                    </div>
-                    <div style="text-align:center;">
-                      <div style="font-size:1.3rem;font-weight:700;color:white;">${sig.fair_value:.2f}</div>
-                      <div style="color:#aaa;font-size:0.7rem;">Fair Value / Share</div>
-                    </div>
-                    <div style="text-align:center;">
-                      <div style="font-size:1.1rem;font-weight:700;color:{sig_color};">{sig.upside_pct:+.1f}%</div>
-                      <div style="color:#aaa;font-size:0.7rem;">vs ${sig.market_price:.2f} Mkt</div>
-                    </div>
-                    <div style="text-align:center;">
-                      <div style="font-size:1.1rem;font-weight:700;color:white;">{sig.confidence_pct:.0f}%</div>
-                      <div style="color:#aaa;font-size:0.7rem;">Confidence</div>
-                    </div>
-                  </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            # ── KPI Row ───────────────────────────────────────────────────────
-            k1, k2, k3, k4, k5 = st.columns(5)
-            k1.metric("Enterprise Value", f"${result.enterprise_value / 1000:.1f}B")
-            k2.metric("Equity Value", f"${result.equity_value / 1000:.1f}B")
-            k3.metric("WACC", f"{result.wacc:.2%}")
-            k4.metric("Cost of Equity", f"{result.cost_of_equity:.2%}")
-            k5.metric("Position Size", f"{sig.position_size_pct:.1f}%")
-
-            # ── Tabs ──────────────────────────────────────────────────────────
-            dcf_tabs = st.tabs(
-                [
-                    "20-Line DCF",
-                    "Scenarios",
-                    "Monte Carlo",
-                    "Relative Valuation",
-                    "Sensitivity",
-                    "Catalysts",
-                    "WACC Detail",
-                ]
-            )
-
-            # Tab 1: 20-Line DCF
-            with dcf_tabs[0]:
-                st.subheader("Investment Banking 20-Line DCF Template")
-                st.caption(
-                    "All values in $M. Discount Factor = 1/(1+WACC)^t — decreases each year (correct PV factor)."
-                )
-                fmt_cols = {
-                    c: "{:,.1f}"
-                    for c in result.line_items.columns
-                    if c != "Discount Factor"
-                }
-                fmt_cols["Discount Factor"] = "{:.4f}"
-                try:
-                    st.dataframe(
-                        result.line_items.style.format(fmt_cols),
-                        use_container_width=True,
-                    )
-                except Exception:
-                    st.dataframe(result.line_items, use_container_width=True)
-
-                v1, v2, v3 = st.columns(3)
-                v1.metric("Sum PV(FCF)", f"${result.sum_pv_fcf:,.0f}M")
-                v2.metric("PV(Terminal Value)", f"${result.pv_terminal_value:,.0f}M")
-                v3.metric(
-                    "TV as % of EV",
-                    f"{result.pv_terminal_value / result.enterprise_value * 100:.0f}%",
-                )
-
-                # Waterfall chart
-                wf_labels = [
-                    "PV FCFs",
-                    "PV Terminal Value",
-                    "Enterprise Value",
-                    "- Net Debt",
-                    "Equity Value",
-                ]
-                wf_values = [
-                    result.sum_pv_fcf / 1000,
-                    result.pv_terminal_value / 1000,
-                    0,
-                    -result.net_debt / 1000,
-                    0,
-                ]
-                wf_measure = ["relative", "relative", "total", "relative", "total"]
-                fig_wf = go.Figure(
-                    go.Waterfall(
-                        name="Valuation Bridge",
-                        orientation="v",
-                        measure=wf_measure,
-                        x=wf_labels,
-                        y=wf_values,
-                        connector={"line": {"color": "rgb(63, 63, 63)"}},
-                        decreasing={
-                            "marker": {"color": COLORS.get("danger", "#ff4444")}
-                        },
-                        increasing={"marker": {"color": COLORS.get("gold", "#e0c97f")}},
-                        totals={"marker": {"color": COLORS.get("lavender", "#b39ddb")}},
-                    )
-                )
-                fig_wf.update_layout(
-                    title="Valuation Bridge ($B)",
-                    template="plotly_dark",
-                    height=350,
-                    yaxis_title="Value ($B)",
-                )
-                st.plotly_chart(fig_wf, use_container_width=True)
-
-            # Tab 2: Scenarios
-            with dcf_tabs[1]:
-                st.subheader("Scenario-Weighted Valuation")
-                scen_cols = st.columns(3)
-                colors_scen = {"Bear": "#ff4444", "Base": "#e0c97f", "Bull": "#00ff88"}
-                for i, s in enumerate(result.scenarios):
-                    c = colors_scen.get(s.label, "#ffffff")
-                    with scen_cols[i]:
-                        st.markdown(
-                            f"<div style='background:#161b22;border:1px solid {c};"
-                            f"border-radius:6px;padding:10px;text-align:center;'>"
-                            f"<div style='color:{c};font-size:0.9rem;font-weight:700;'>{s.label}</div>"
-                            f"<div style='color:#aaa;font-size:0.72rem;'>P = {s.probability:.0%}</div>"
-                            f"<div style='color:white;font-size:1.3rem;font-weight:800;'>${s.fair_value:.2f}</div>"
-                            f"<div style='color:{c};font-size:0.82rem;'>{s.upside:+.1%} upside</div>"
-                            f"<hr style='border-color:#333;margin:4px 0;'/>"
-                            f"<div style='color:#aaa;font-size:0.7rem;'>Growth: {s.revenue_growth_avg:.1%} | EBIT: {s.ebit_margin:.1%}</div>"
-                            f"<div style='color:#aaa;font-size:0.7rem;'>WACC: {s.wacc:.2%}</div>"
-                            f"</div>",
-                            unsafe_allow_html=True,
-                        )
-
-                st.markdown(
-                    f"<div style='background:#1a1f2e;border:1px solid #e0c97f;"
-                    f"border-radius:6px;padding:10px;text-align:center;margin-top:10px;'>"
-                    f"<div style='color:#aaa;font-size:0.8rem;'>Probability-Weighted Fair Value</div>"
-                    f"<div style='color:#e0c97f;font-size:1.6rem;font-weight:800;'>"
-                    f"${result.scenario_weighted_value:.2f}</div>"
-                    f"<div style='color:#aaa;font-size:0.72rem;'>"
-                    f"Bear×25% + Base×50% + Bull×25%</div>"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
-
-            # Tab 3: Monte Carlo
-            with dcf_tabs[2]:
-                st.subheader("Monte Carlo Valuation (10,000 Simulations)")
-                mc1, mc2, mc3, mc4 = st.columns(4)
-                mc1.metric("Median Fair Value", f"${result.mc_median:.2f}")
-                mc2.metric("Mean Fair Value", f"${result.mc_mean:.2f}")
-                mc3.metric("Upside Probability", f"{result.mc_upside_prob:.1%}")
-                mc4.metric("Downside Probability", f"{result.mc_downside_prob:.1%}")
-
-                p = result.mc_percentiles
-                pc1, pc2, pc3, pc4, pc5 = st.columns(5)
-                pc1.metric("P5", f"${p['p5']:.2f}")
-                pc2.metric("P25", f"${p['p25']:.2f}")
-                pc3.metric("P50", f"${p['p50']:.2f}")
-                pc4.metric("P75", f"${p['p75']:.2f}")
-                pc5.metric("P95", f"${p['p95']:.2f}")
-
-                # Distribution histogram
-                if result.mc_distribution:
-                    fig_mc = px.histogram(
-                        x=result.mc_distribution,
-                        nbins=80,
-                        title="Distribution of Fair Values (Monte Carlo)",
-                        labels={"x": "Fair Value Per Share ($)"},
-                        color_discrete_sequence=["#b39ddb"],
-                    )
-                    fig_mc.add_vline(
-                        x=current_price,
-                        line_dash="dash",
-                        line_color="#ff4444",
-                        annotation_text=f"Market ${current_price:.2f}",
-                    )
-                    fig_mc.add_vline(
-                        x=result.mc_median,
-                        line_dash="dash",
-                        line_color="#00ff88",
-                        annotation_text=f"Median ${result.mc_median:.2f}",
-                    )
-                    fig_mc.update_layout(template="plotly_dark", height=400)
-                    st.plotly_chart(fig_mc, use_container_width=True)
-
-            # Tab 4: Relative Valuation
-            with dcf_tabs[3]:
-                st.subheader("Peer Comparison — Relative Valuation")
-                rv = result.relative_valuation
-                rv_methods = [
-                    "P/E Implied",
-                    "EV/EBITDA Implied",
-                    "EV/FCF Implied",
-                    "PEG Implied",
-                    "DCF (This Model)",
-                ]
-                rv_values = [
-                    rv["pe_implied_fv"],
-                    rv["ev_ebitda_implied_fv"],
-                    rv["ev_fcf_implied_fv"],
-                    rv["peg_implied_fv"],
-                    result.fair_value_per_share,
-                ]
-                rv_multiples = [
-                    f"{rv['peer_pe']:.1f}x",
-                    f"{rv['peer_ev_ebitda']:.1f}x",
-                    f"{rv['peer_ev_fcf']:.1f}x",
-                    f"{rv['peg_ratio']:.2f}",
-                    "—",
-                ]
-                rv_df = pd.DataFrame(
-                    {
-                        "Valuation Method": rv_methods,
-                        "Fair Value ($)": [f"${v:.2f}" for v in rv_values],
-                        "Peer Multiple": rv_multiples,
-                        "vs Market": [
-                            f"{(v - current_price) / current_price:+.1%}"
-                            if current_price > 0
-                            else "N/A"
-                            for v in rv_values
-                        ],
-                    }
-                )
-                st.dataframe(rv_df, use_container_width=True, hide_index=True)
-
-                fig_rv = go.Figure()
-                bar_colors = [
-                    "#00ff88" if v > current_price else "#ff4444" for v in rv_values
-                ]
-                fig_rv.add_trace(
-                    go.Bar(
-                        x=rv_methods,
-                        y=rv_values,
-                        marker_color=bar_colors,
-                        text=[f"${v:.2f}" for v in rv_values],
-                        textposition="outside",
-                    )
-                )
-                fig_rv.add_hline(
-                    y=current_price,
-                    line_dash="dash",
-                    line_color="#e0c97f",
-                    annotation_text=f"Market ${current_price:.2f}",
-                )
-                fig_rv.update_layout(
-                    title="Implied Fair Values by Method",
-                    template="plotly_dark",
-                    height=400,
-                    yaxis_title="Fair Value ($)",
-                )
-                st.plotly_chart(fig_rv, use_container_width=True)
-
-                # Key metrics
-                r1, r2, r3 = st.columns(3)
-                r1.metric("EBITDA ($M)", f"${rv['ebitda_M']:,.0f}M")
-                r2.metric("FCF ($M)", f"${rv['last_fcf_M']:,.0f}M")
-                r3.metric("EPS Proxy", f"${rv['eps_proxy']:.2f}")
-
-            # Tab 5: Sensitivity
-            with dcf_tabs[4]:
-                st.subheader("Sensitivity Analysis — Fair Value Per Share")
-                st.caption("Rows: Terminal Growth Rate | Columns: WACC")
-                try:
-                    st.dataframe(
-                        result.sensitivity.style.format("${:.2f}"),
-                        use_container_width=True,
-                    )
-                except Exception:
-                    st.dataframe(result.sensitivity, use_container_width=True)
-
-            # Tab 6: Catalysts
-            with dcf_tabs[5]:
-                st.subheader("Catalyst Tracking Dashboard")
-                impact_colors = {
-                    "High": "#ff4444",
-                    "Medium": "#e0c97f",
-                    "Low": "#aaaaaa",
-                }
-                dir_colors = {
-                    "Positive": "#00ff88",
-                    "Negative": "#ff4444",
-                    "Neutral": "#aaaaaa",
-                }
-                for cat in result.catalysts:
-                    ic = impact_colors.get(cat.impact, "#aaaaaa")
-                    dc = dir_colors.get(cat.direction, "#aaaaaa")
-                    st.markdown(
-                        f"<div style='background:#161b22;border-left:4px solid {ic};"
-                        f"border-radius:6px;padding:14px;margin:8px 0;'>"
-                        f"<div style='display:flex;justify-content:space-between;'>"
-                        f"<span style='font-weight:700;color:white;font-size:1.05rem;'>{cat.name}</span>"
-                        f"<span style='color:{ic};font-weight:600;'>{cat.impact} Impact</span>"
-                        f"</div>"
-                        f"<div style='color:#888;font-size:0.8rem;margin:4px 0;'>Date: {cat.date} | "
-                        f"<span style='color:{dc};'>{cat.direction}</span></div>"
-                        f"<div style='color:#ccc;font-size:0.9rem;'>{cat.description}</div>"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-
-            # Tab 7: WACC Detail
-            with dcf_tabs[6]:
-                st.subheader("WACC Decomposition")
-                wb = result.wacc_breakdown
-                wc1, wc2, wc3 = st.columns(3)
-                wc1.metric("WACC", f"{wb['wacc']:.2%}")
-                wc2.metric("Cost of Equity (CAPM)", f"{wb['cost_of_equity']:.2%}")
-                wc3.metric(
-                    "After-Tax Cost of Debt", f"{wb['cost_of_debt_aftertax']:.2%}"
-                )
-                wc4, wc5, wc6 = st.columns(3)
-                wc4.metric("Weight Equity", f"{wb['weight_equity']:.1%}")
-                wc5.metric("Weight Debt", f"{wb['weight_debt']:.1%}")
-                wc6.metric("Beta", f"{wb['beta']:.2f}")
-
-                st.markdown("""
-                **WACC Formula:**
-                `WACC = (E/(D+E)) × Re + (D/(D+E)) × Rd × (1 − T)`
-
-                **Cost of Equity (CAPM):**
-                `Re = Rf + β × (Rm − Rf)`
-                """)
-
-                wacc_data = {
-                    "Component": [
-                        "Risk-Free Rate (Rf)",
-                        "Equity Risk Premium (ERP)",
-                        "Beta (β)",
-                        "Cost of Equity (Re)",
-                        "Pre-Tax Cost of Debt (Rd)",
-                        "After-Tax Cost of Debt",
-                        "Weight Equity",
-                        "Weight Debt",
-                        "WACC",
-                    ],
-                    "Value": [
-                        f"{wb['risk_free_rate']:.2%}",
-                        f"{wb['equity_risk_premium']:.2%}",
-                        f"{wb['beta']:.2f}",
-                        f"{wb['cost_of_equity']:.2%}",
-                        f"{wb['cost_of_debt_pretax']:.2%}",
-                        f"{wb['cost_of_debt_aftertax']:.2%}",
-                        f"{wb['weight_equity']:.1%}",
-                        f"{wb['weight_debt']:.1%}",
-                        f"{wb['wacc']:.2%}",
-                    ],
-                }
-                st.dataframe(
-                    pd.DataFrame(wacc_data), use_container_width=True, hide_index=True
-                )
-
-            # ── Download ──────────────────────────────────────────────────────
-            st.markdown("---")
-            gen = get_financial_generator()
-            # Build a minimal model_data dict wrapping the full result
-            model_data_for_export = {"full_result": result}
-            xls_bytes = gen.generate_excel(model_data_for_export)
-            st.download_button(
-                "Download Full Institutional Model (Excel)",
-                data=xls_bytes,
-                file_name=f"{result.ticker}_Institutional_DCF.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+    show_financial_generator()
 
 elif selection == "Daily Briefing":
     import plotly.express as px
@@ -1424,7 +782,7 @@ elif selection == "Daily Briefing":
     col_gen1, col_gen2 = st.columns([1, 3])
     with col_gen1:
         if st.button(
-            "Generate Full Briefing", type="primary", use_container_width=True
+            "Generate Full Briefing", type="primary", width='stretch'
         ):
             from daily_intelligence import get_daily_engine
 
@@ -1493,7 +851,7 @@ elif selection == "Daily Briefing":
             ]
         )
 
-        # ── Tab 1: Executive Summary ─────────────────────────────────────────
+        #  Tab 1: Executive Summary 
         with db_tabs[0]:
             regime_label = es.get("regime", "Unknown")
             regime_conf = es.get("regime_confidence", 0)
@@ -1619,7 +977,7 @@ elif selection == "Daily Briefing":
             if posture.get("notes"):
                 st.info(posture["notes"])
 
-        # ── Tab 2: Global Indices ────────────────────────────────────────────
+        #  Tab 2: Global Indices 
         with db_tabs[1]:
             if indices:
                 rows = []
@@ -1661,7 +1019,7 @@ elif selection == "Daily Briefing":
                     df_idx.style.applymap(
                         color_pct, subset=["1D %", "5D %", "1M %", "3M %"]
                     ),
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                 )
 
@@ -1715,11 +1073,11 @@ elif selection == "Daily Briefing":
                     margin=dict(l=10, r=10, t=35, b=10),
                     hovermode="x unified",
                 )
-                st.plotly_chart(fig_norm, use_container_width=True)
+                st.plotly_chart(fig_norm, width='stretch')
             else:
                 st.warning("Index data unavailable.")
 
-        # ── Tab 3: Macro & Rates ─────────────────────────────────────────────
+        #  Tab 3: Macro & Rates 
         with db_tabs[2]:
             col_m1, col_m2 = st.columns(2)
 
@@ -1741,7 +1099,7 @@ elif selection == "Daily Briefing":
                             }
                         )
                     st.dataframe(
-                        pd.DataFrame(y_rows), use_container_width=True, hide_index=True
+                        pd.DataFrame(y_rows), width='stretch', hide_index=True
                     )
 
                     # Yield curve spreads
@@ -1847,7 +1205,7 @@ elif selection == "Daily Briefing":
                         unsafe_allow_html=True,
                     )
 
-        # ── Tab 4: Volatility Surface ────────────────────────────────────────
+        #  Tab 4: Volatility Surface 
         with db_tabs[3]:
             vix_meta = vix_data.get("_meta", {})
             vm1, vm2, vm3, vm4 = st.columns(4)
@@ -1890,7 +1248,7 @@ elif selection == "Daily Briefing":
                     )
             if vix_rows:
                 st.dataframe(
-                    pd.DataFrame(vix_rows), use_container_width=True, hide_index=True
+                    pd.DataFrame(vix_rows), width='stretch', hide_index=True
                 )
 
             st.markdown("#### Volatility Regime Interpretation")
@@ -1908,7 +1266,7 @@ elif selection == "Daily Briefing":
                     unsafe_allow_html=True,
                 )
 
-        # ── Tab 5: Sector Rotation ───────────────────────────────────────────
+        #  Tab 5: Sector Rotation 
         with db_tabs[4]:
             if sectors:
                 sec_rows = []
@@ -1953,7 +1311,7 @@ elif selection == "Daily Briefing":
                     sec_df.style.applymap(
                         color_pct_sec, subset=["1D %", "5D %", "1M %", "3M %"]
                     ),
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                 )
 
@@ -1984,7 +1342,7 @@ elif selection == "Daily Briefing":
                         xaxis_tickangle=-30,
                         margin=dict(l=10, r=10, t=35, b=60),
                     )
-                    st.plotly_chart(fig_sec, use_container_width=True)
+                    st.plotly_chart(fig_sec, width='stretch')
                 except Exception:
                     pass
 
@@ -2013,7 +1371,7 @@ elif selection == "Daily Briefing":
             else:
                 st.warning("Sector data unavailable.")
 
-        # ── Tab 6: FX & Commodities ──────────────────────────────────────────
+        #  Tab 6: FX & Commodities 
         with db_tabs[5]:
             col_fx, col_comm = st.columns(2)
 
@@ -2033,7 +1391,7 @@ elif selection == "Daily Briefing":
                             }
                         )
                     st.dataframe(
-                        pd.DataFrame(fx_rows), use_container_width=True, hide_index=True
+                        pd.DataFrame(fx_rows), width='stretch', hide_index=True
                     )
 
             with col_comm:
@@ -2053,7 +1411,7 @@ elif selection == "Daily Briefing":
                         )
                     st.dataframe(
                         pd.DataFrame(comm_rows),
-                        use_container_width=True,
+                        width='stretch',
                         hide_index=True,
                     )
 
@@ -2074,10 +1432,10 @@ elif selection == "Daily Briefing":
                         }
                     )
                 st.dataframe(
-                    pd.DataFrame(crypto_rows), use_container_width=True, hide_index=True
+                    pd.DataFrame(crypto_rows), width='stretch', hide_index=True
                 )
 
-        # ── Tab 7: Cross-Asset Signals ───────────────────────────────────────
+        #  Tab 7: Cross-Asset Signals 
         with db_tabs[6]:
             if cross_signals:
                 for sig_item in cross_signals:
@@ -2113,7 +1471,7 @@ elif selection == "Daily Briefing":
             else:
                 st.info("No significant cross-asset divergences detected at this time.")
 
-        # ── Tab 8: Narrative Dislocations ────────────────────────────────────
+        #  Tab 8: Narrative Dislocations 
         with db_tabs[7]:
             st.markdown("#### Narrative vs. Price Dislocation Analysis")
             st.caption(
@@ -2169,7 +1527,7 @@ elif selection == "Daily Briefing":
                     "No major narrative dislocations detected. Markets appear broadly consistent with macro fundamentals."
                 )
 
-        # ── Tab 9: Trade Ideas & Posture ─────────────────────────────────────
+        #  Tab 9: Trade Ideas & Posture 
         with db_tabs[8]:
             st.markdown("#### Actionable Trade Ideas")
             st.caption(
@@ -2219,7 +1577,6 @@ elif selection == "Daily Briefing":
                 p_cols[4].metric("Cash", posture.get("cash", "—"))
                 if posture.get("notes"):
                     st.info(posture["notes"])
-
 elif selection == "Quant Portal":
     from quant_portal import render_quant_portal
 
@@ -2235,6 +1592,56 @@ elif selection == "Settings & Analytics":
     from analytics_dashboard import show_analytics_dashboard
 
     show_analytics_dashboard()
+
+elif selection == "Institutional 13F & SEC Filings":
+    from institutional_13f_ui import render_13f_analysis_tab
+
+    render_13f_analysis_tab()
+
+elif selection == "Target Probability":
+    from target_probability_engine import show_target_probability
+
+    show_target_probability()
+
+elif selection == "Presentation Generator":
+    from presentation_generator import show_presentation_generator
+
+    show_presentation_generator()
+
+elif selection == "Document Analyzer":
+    from document_analyzer import show_document_analyzer
+
+    show_document_analyzer()
+
+elif selection == "Comparative Analysis":
+    from comparative_analysis_ui import render_comparative_analysis
+
+    render_comparative_analysis()
+
+elif selection == "Quant Modeling Lab":
+    from quant_modeling_lab import render_quant_modeling_lab
+
+    render_quant_modeling_lab()
+
+elif selection == "Portfolio Analyzer":
+    from portfolio_analyzer import show_portfolio_analyzer
+
+    show_portfolio_analyzer()
+
+elif selection == "Position Optimizer":
+    from position_optimizer_engine import render_position_optimizer_ui
+
+    render_position_optimizer_ui()
+
+elif selection == "Notification Settings":
+    from notification_settings_ui import show_notification_settings
+
+    show_notification_settings()
+
+elif selection == "Terms of Service":
+    from terms_of_service import show_terms_of_service
+
+    show_terms_of_service()
 
 # Footer
 st.sidebar.markdown("---")

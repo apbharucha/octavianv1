@@ -46,9 +46,9 @@ except ImportError:
     HAS_SCIPY = False
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Data Structures
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 @dataclass
@@ -96,9 +96,9 @@ class CrossAssetDashboard:
     summary: str
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Asset Universe
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 # Primary macro proxies
 MACRO_PROXIES = {
@@ -256,9 +256,9 @@ MACRO_REGIMES = {
 }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Data Access Layer
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 class MacroDataLayer:
@@ -285,6 +285,8 @@ class MacroDataLayer:
         if not HAS_YF:
             return None
         try:
+            # Small delay between API calls to prevent rate limiting
+            time.sleep(0.15)
             raw = yf.download(
                 ticker,
                 period=period,
@@ -380,9 +382,9 @@ class MacroDataLayer:
         return {"best_lag": best_lag, "best_corr": round(best_corr, 4)}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 # Cross-Asset Analysis Engine
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 
 class MacroCrossAssetEngine:
@@ -409,9 +411,9 @@ class MacroCrossAssetEngine:
             return float(scipy_stats.norm.cdf(val, loc=0, scale=(hi - lo) / 4) * 100)
         return float(np.clip(50 + val * 200, 0, 100))
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 1. BOND YIELDS ↔ EQUITY VALUATIONS
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def analyze_bond_equity_relationship(self) -> CrossAssetSignal:
         """
@@ -519,9 +521,9 @@ class MacroCrossAssetEngine:
             },
         )
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 2. OIL → INFLATION → INTEREST RATES CHAIN
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def analyze_oil_inflation_rates_chain(self) -> CrossAssetSignal:
         """
@@ -625,9 +627,9 @@ class MacroCrossAssetEngine:
             },
         )
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 3. USD STRENGTH ↔ COMMODITIES
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def analyze_usd_commodities_relationship(self) -> CrossAssetSignal:
         """
@@ -728,9 +730,9 @@ class MacroCrossAssetEngine:
             },
         )
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 4. LIQUIDITY → RISK ASSETS → CRYPTO FLOWS
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def analyze_liquidity_crypto_flows(self) -> CrossAssetSignal:
         """
@@ -849,9 +851,9 @@ class MacroCrossAssetEngine:
             },
         )
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 5. YIELD CURVE REGIME
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def analyze_yield_curve(self) -> CrossAssetSignal:
         """
@@ -941,9 +943,9 @@ class MacroCrossAssetEngine:
             },
         )
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 6. MACRO REGIME CLASSIFICATION
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def classify_macro_regime(self) -> MacroRegime:
         """
@@ -1024,9 +1026,9 @@ class MacroCrossAssetEngine:
         )
         return result
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 7. SECTOR ROTATION SIGNAL
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def get_sector_rotation_signal(self) -> dict:
         """
@@ -1081,9 +1083,9 @@ class MacroCrossAssetEngine:
             "theme": rotation_theme,
         }
 
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
     # 8. FULL DASHBOARD
-    # ═══════════════════════════════════════════════════════════════════════════
+    # 
 
     def build_dashboard(self) -> CrossAssetDashboard:
         """
@@ -1221,10 +1223,79 @@ class MacroCrossAssetEngine:
         
         return signals
 
+    # 
+    # INSTITUTIONAL MODULES
+    # 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+    def analyze_intermarket_causality(self, asset_a: str, asset_b: str, max_lag: int = 30) -> dict:
+        """
+        Quantify the lead-lag relationship between two assets using cross-correlation.
+        Institutional-grade causality tracking to identify which market is leading the turn.
+        """
+        try:
+            df_a = self.data.get_close(asset_a, period="2y")
+            df_b = self.data.get_close(asset_b, period="2y")
+            
+            if df_a is None or df_b is None or len(df_a) < 100 or len(df_b) < 100:
+                return {"causality": "Neutral", "lag": 0, "confidence": 0}
+
+            # Normalize and calculate returns
+            rets_a = df_a.pct_change().dropna()
+            rets_b = df_b.pct_change().dropna()
+            
+            common_idx = rets_a.index.intersection(rets_b.index)
+            rets_a = rets_a.loc[common_idx]
+            rets_b = rets_b.loc[common_idx]
+
+            corrs = [rets_a.corr(rets_b.shift(lag)) for lag in range(-max_lag, max_lag + 1)]
+            best_lag = np.argmax(np.abs(corrs)) - max_lag
+            max_corr = corrs[np.argmax(np.abs(corrs))]
+
+            return {
+                "asset_a": asset_a,
+                "asset_b": asset_b,
+                "max_correlation": float(max_corr),
+                "lag_days": int(best_lag),
+                "causality_score": float(np.abs(max_corr) * (1 - abs(best_lag)/max_lag)),
+                "is_a_leading": best_lag < 0
+            }
+        except:
+            return {"causality": "Neutral", "lag": 0, "confidence": 0}
+
+    def detect_regime_shift(self) -> dict:
+        """
+        Detects structural shifts in the macro regime using volatility and momentum differentials.
+        """
+        spy_vol = self.data.get_vol("SPY") or 15.0
+        tlt_vol = self.data.get_vol("TLT") or 10.0
+        
+        # High volatility regime indicator
+        vol_stress = (spy_vol / 15.0 + tlt_vol / 10.0) / 2.0
+        
+        # Leading indicator momentum (Copper/Gold ratio proxy)
+        copper_mom = self.data.get_momentum("CPER", 63) or 0
+        gold_mom = self.data.get_momentum("GLD", 63) or 0
+        growth_indicator = copper_mom - gold_mom
+        
+        regime = "Equilibrium"
+        if vol_stress > 1.8:
+            regime = "High-Stress Volatility Transmission"
+        elif growth_indicator > 0.05:
+            regime = "Reflationary Expansion"
+        elif growth_indicator < -0.05:
+            regime = "Deflationary Contraction"
+            
+        return {
+            "regime": regime,
+            "vol_stress": float(vol_stress),
+            "growth_indicator": float(growth_indicator),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+
+# 
 # Singleton accessor
-# ═══════════════════════════════════════════════════════════════════════════════
+# 
 
 _engine_instance: MacroCrossAssetEngine | None = None
 

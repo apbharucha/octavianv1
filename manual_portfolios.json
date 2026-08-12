@@ -1,0 +1,55 @@
+{
+    "portfolios": {
+        "963976e4-dda5-4a2d-8dde-0bd96374be5c": {
+            "name": "My Portfolio",
+            "goal": "Growth",
+            "risk_level": "Conservative",
+            "timeframe": "1 Year",
+            "target_growth": 10.0,
+            "positions": [
+                {
+                    "id": "e62f340c-2e9b-4d07-b421-9dfd8c317df8",
+                    "symbol": "UUUU",
+                    "quantity": 80.0,
+                    "entry_price": 14.8,
+                    "asset_type": "equity",
+                    "entry_time": "2026-06-16T10:02:07.694402"
+                },
+                {
+                    "id": "48056069-2764-4c51-a4fd-09e37c5ac8aa",
+                    "symbol": "AAPL",
+                    "quantity": 10.0,
+                    "entry_price": 228.2,
+                    "asset_type": "equity",
+                    "entry_time": "2026-06-16T10:02:45.565894"
+                },
+                {
+                    "id": "39f88140-f171-43cb-b04f-300ca6f008cd",
+                    "symbol": "BBIO",
+                    "quantity": 105.0,
+                    "entry_price": 56.63,
+                    "asset_type": "equity",
+                    "entry_time": "2026-06-16T10:03:16.896607"
+                },
+                {
+                    "id": "ed11d16d-bd55-4177-b637-47db1d5d3f9a",
+                    "symbol": "BTC-USD",
+                    "quantity": 1.0,
+                    "entry_price": 61000.0,
+                    "asset_type": "crypto",
+                    "entry_time": "2026-06-16T10:03:46.117072"
+                },
+                {
+                    "id": "52dc58f7-c6a8-4779-b316-20813d6ce456",
+                    "symbol": "USD/JPY",
+                    "quantity": 500.0,
+                    "entry_price": 147.947,
+                    "asset_type": "fx",
+                    "entry_time": "2026-06-16T10:04:52.481659"
+                }
+            ],
+            "history": [],
+            "created_at": "2026-06-16T10:01:35.792317"
+        }
+    }
+}

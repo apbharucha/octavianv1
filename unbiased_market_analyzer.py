@@ -10,16 +10,17 @@ Author: APB - Octavian Team
 
 import pandas as pd
 import numpy as np
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 import requests
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import warnings
 warnings.filterwarnings('ignore')
 
-from data_sources import get_stock, get_fx, get_futures_proxy
+from data_sources import get_stock, get_fx, get_futures_proxy, get_options_chain
 
 # Dynamic ticker universe
 try:
@@ -34,6 +35,28 @@ try:
     HAS_QUANT_ENSEMBLE = True
 except ImportError:
     HAS_QUANT_ENSEMBLE = False
+
+# Dynamic information weighting integration
+try:
+    from information_weighting_engine import get_weighting_engine
+    HAS_WEIGHTING = True
+except ImportError:
+    HAS_WEIGHTING = False
+
+# Safe comprehensive universe check — never crashes
+def _has_comprehensive_universe() -> bool:
+    try:
+        from comprehensive_ticker_universe import get_comprehensive_universe
+        return get_comprehensive_universe() is not None
+    except Exception:
+        return False
+
+def _get_comprehensive_universe_safe():
+    try:
+        from comprehensive_ticker_universe import get_comprehensive_universe
+        return get_comprehensive_universe()
+    except Exception:
+        return None
 
 @dataclass
 class UnbiasedAnalysis:
@@ -51,6 +74,11 @@ class UnbiasedAnalysis:
     raw_data_insights: Dict[str, Any]
     timestamp: datetime
 
+    # ── Bull / Bear / Neutral case reasoning (always generated) ─────────
+    bull_reasoning: List[str] = field(default_factory=list)
+    bear_reasoning: List[str] = field(default_factory=list)
+    neutral_reasoning: str = ""
+
 class UnbiasedMarketAnalyzer:
     """Completely unbiased market analyzer focused on pure profit maximization."""
     
@@ -64,11 +92,15 @@ class UnbiasedMarketAnalyzer:
             'technical_breakouts': 0.10,
             'statistical_edges': 0.10,
             'quant_ensemble': 0.25,
-        }
+        }  # Legacy attribute kept for reference; probability blending now uses InformationWeightingEngine
         
-        # Universe expansion - use dynamic universe if available
-        self._universe = get_ticker_universe() if HAS_UNIVERSE else None
-        self.asset_universe = self._build_comprehensive_universe()
+        # Universe expansion — safe pattern, never crashes
+        self._comprehensive_universe = _get_comprehensive_universe_safe()
+        if self._comprehensive_universe is not None:
+            self.asset_universe = self._build_comprehensive_universe_v2()
+        else:
+            self._universe = get_ticker_universe() if HAS_UNIVERSE else None
+            self.asset_universe = self._build_comprehensive_universe()
         
         # Initialize quant ensemble
         self._quant_ensemble = None
@@ -77,6 +109,42 @@ class UnbiasedMarketAnalyzer:
                 self._quant_ensemble = get_quant_ensemble()
             except Exception:
                 pass
+                
+        # Dynamic information weighting engine (regime/asset-class-aware)
+        self._weighting_engine = None
+        if HAS_WEIGHTING:
+            try:
+                from information_weighting_engine import get_weighting_engine
+                self._weighting_engine = get_weighting_engine()
+            except Exception as e:
+                print(f"Failed to load information weighting engine: {e}")
+
+        # Cached news processor (heavy to construct — reuse across calls)
+        self._news_processor = None
+
+        # Runtime state
+        self._vix_cache: Optional[float] = None
+        self._vix_ts: float = 0.0
+        self._last_data_is_proxy: bool = False
+        self._last_proxy_for: Optional[str] = None
+        self._last_weights: Optional[Dict[str, float]] = None
+        self._last_asset_class: str = "stock"
+        self._last_regime: str = "ranging"
+
+    def _build_comprehensive_universe_v2(self) -> Dict[str, List[str]]:
+        """Build comprehensive universe using 10,000+ ticker source."""
+        u = self._comprehensive_universe
+        return {
+            'stocks': u.get_stocks()[:8000],
+            'etfs': u.get_etfs(),
+            'options': self._get_options_universe(),
+            'forex': u.get_forex(),
+            'futures': u.get_futures(),
+            'crypto': u.get_crypto(),
+            'commodities': self._get_commodities_universe(),
+            'bonds': self._get_bonds_universe(),
+            'international': u.get_category('international_adrs') or self._get_international_universe(),
+        }
 
     def _build_comprehensive_universe(self) -> Dict[str, List[str]]:
         """Build comprehensive universe of ALL tradeable assets."""
@@ -158,6 +226,9 @@ class UnbiasedMarketAnalyzer:
             self.current_symbol = symbol
             data = await self._fetch_raw_data(symbol, timeframe)
             
+            # Save for downstream modules (like ai_chatbot chart generation)
+            self._last_fetched_data = data
+
             if data is None or data.empty:
                 return self._create_null_analysis(symbol)
 
@@ -193,16 +264,30 @@ class UnbiasedMarketAnalyzer:
             risk_metrics = self._calculate_pure_risk_metrics(data)
             momentum_analysis = self._analyze_momentum_unbiased(data)
             volatility_opportunities = self._identify_volatility_opportunities(data)
+            options_metrics = self._calculate_options_metrics(symbol, data) # NEW
             statistical_edges = self._find_statistical_edges(data)
             
+            # ── Multi-factor signal context (news, RSI, dynamic weights) ──
+            rsi_value = self._calculate_rsi(data['Close'])
+            news_sentiment = self._fetch_news_sentiment(symbol)  # None if unavailable
+
+            weights, asset_class, regime = self._get_dynamic_weights(momentum_analysis)
+            self._last_weights = weights
+            self._last_asset_class = asset_class
+            self._last_regime = regime
+
+            # Engine-weighted probability (quant + news + options all inside the blend)
             profit_probability = self._calculate_profit_probability(
-                profit_signals, momentum_analysis, volatility_opportunities, statistical_edges
+                profit_signals, momentum_analysis, volatility_opportunities, statistical_edges,
+                options_metrics, quant_signal, news_sentiment, weights
             )
-            
-            # Blend with quant ensemble if available (30% quant, 70% base)
-            if quant_signal is not None:
-                profit_probability = profit_probability * 0.65 + quant_signal.probability * 0.35
-            
+
+            # ── Always generate all three cases regardless of direction ──
+            bull_reasoning, bear_reasoning, neutral_reasoning = self._generate_bull_bear_neutral(
+                symbol, profit_signals, momentum_analysis, volatility_opportunities,
+                options_metrics, quant_signal, news_sentiment, rsi_value, data
+            )
+
             expected_return = self._calculate_expected_return(data, profit_signals)
             risk_adjusted_return = expected_return / max(risk_metrics['volatility'], 0.01)
             confidence_score = self._calculate_model_confidence(data, profit_signals)
@@ -225,8 +310,7 @@ class UnbiasedMarketAnalyzer:
             if quant_signal is not None:
                 model_reasoning.append(f"* QUANT ENSEMBLE: {quant_signal.direction} "
                                       f"(prob={quant_signal.probability:.1%}, conf={quant_signal.confidence:.1%})")
-                for r in quant_signal.reasoning[:3]:
-                    model_reasoning.append(f"  {r}")
+                model_reasoning.append(f"  Driving Factor: {quant_signal.driving_factor}")
             
             raw_data_insights = {
                 'price_momentum': momentum_analysis,
@@ -234,6 +318,28 @@ class UnbiasedMarketAnalyzer:
                 'volume_analysis': self._analyze_volume_patterns(data),
                 'statistical_properties': statistical_edges,
                 'market_microstructure': self._analyze_microstructure(data),
+                'options_intelligence': options_metrics, # NEW
+                'rsi': rsi_value,
+                'news_sentiment': (
+                    {'score': news_sentiment, 'note': 'Best-effort headline sentiment [-1, 1]'}
+                    if news_sentiment is not None
+                    else {'score': 0.0, 'note': 'News sentiment unavailable (no matching headlines)'}
+                ),
+                'information_weights': {
+                    'asset_class': asset_class,
+                    'market_regime': regime,
+                    'weights': weights,
+                },
+                'data_provenance': {
+                    'is_proxy': bool(getattr(self, '_last_data_is_proxy', False)),
+                    'proxy_for': getattr(self, '_last_proxy_for', None),
+                    'note': (
+                        f"Data sourced from ETF proxy ({self._last_proxy_for}) — treated as proxy, "
+                        "not direct futures data."
+                        if getattr(self, '_last_data_is_proxy', False)
+                        else "Direct instrument data"
+                    ),
+                },
             }
             if quant_signal:
                 raw_data_insights['quant_ensemble'] = {
@@ -256,7 +362,10 @@ class UnbiasedMarketAnalyzer:
                 profit_catalysts=profit_catalysts,
                 model_reasoning=model_reasoning,
                 raw_data_insights=raw_data_insights,
-                timestamp=datetime.now()
+                timestamp=datetime.now(),
+                bull_reasoning=bull_reasoning,
+                bear_reasoning=bear_reasoning,
+                neutral_reasoning=neutral_reasoning,
             )
             
             # Add signal_direction for chatbot compatibility
@@ -295,12 +404,240 @@ class UnbiasedMarketAnalyzer:
                         return df
                 return get_stock(symbol, period=timeframe)
             if '=F' in symbol:
-                return get_futures_proxy(symbol, period=timeframe)
+                return self._fetch_futures_data(symbol, timeframe)
             return get_stock(symbol, period=timeframe)
             
         except Exception as e:
             print(f"Data fetch error for {symbol}: {e}")
             return None
+
+    # ── Futures-aware data fetching ──────────────────────────────────────
+    def _fetch_futures_data(self, symbol: str, timeframe: str) -> pd.DataFrame:
+        """Fetch futures OHLCV data.
+
+        Order of preference:
+          1. Direct yfinance futures contract (e.g. CL=F, period='1y')
+          2. get_futures_proxy (direct first, then ETF proxy fallback)
+
+        When ETF-proxy data is used, the proxy flag is set so downstream
+        consumers (chatbot, UI) can label it accurately instead of treating
+        it as direct futures data.
+        """
+        self._last_data_is_proxy = False
+        self._last_proxy_for = None
+        try:
+            df = get_stock(symbol, period='1y')
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            pass
+        try:
+            df = get_futures_proxy(symbol, period=timeframe)
+            if df is not None and not df.empty:
+                self._last_data_is_proxy = True
+                self._last_proxy_for = symbol
+            return df
+        except Exception as e:
+            print(f"Futures data fetch error for {symbol}: {e}")
+            return None
+
+    def _get_vix_level(self) -> Optional[float]:
+        """Best-effort current VIX level, cached for 15 minutes."""
+        now = time.time()
+        if self._vix_cache is not None and now - self._vix_ts < 900:
+            return self._vix_cache
+        try:
+            from data_sources import get_vix
+            df = get_vix(period="6mo")
+            if df is not None and not df.empty:
+                close = df['Close']
+                if isinstance(close, pd.DataFrame):
+                    close = close.iloc[:, 0]
+                self._vix_cache = float(close.dropna().iloc[-1])
+                self._vix_ts = now
+                return self._vix_cache
+        except Exception:
+            pass
+        return None
+
+    def _get_market_bias(self) -> Optional[str]:
+        """Live market bias (BULLISH/BEARISH/NEUTRAL) from the adaptive engine."""
+        try:
+            from adaptive_reasoning_engine import get_adaptive_engine
+            regime = getattr(get_adaptive_engine(), 'market_regime', 'NEUTRAL')
+            if regime == 'BULL_TREND':
+                return 'BULLISH'
+            if regime == 'BEAR_TREND':
+                return 'BEARISH'
+            return 'NEUTRAL'
+        except Exception:
+            return None
+
+    def _get_dynamic_weights(self, momentum_analysis: Optional[Dict] = None) -> Tuple[Dict[str, float], str, str]:
+        """Return (weights, asset_class, regime) from the InformationWeightingEngine."""
+        fallback = {'price_momentum': 0.25, 'technical_signals': 0.25, 'quant_model': 0.25,
+                    'volume_confirmation': 0.10, 'options_flow': 0.05, 'macro_regime': 0.05,
+                    'news_sentiment': 0.05}
+        if self._weighting_engine is None:
+            return fallback, 'stock', 'ranging'
+        try:
+            asset_class = self._weighting_engine.infer_asset_class(getattr(self, 'current_symbol', '') or '')
+            mom20 = None
+            if momentum_analysis:
+                v = momentum_analysis.get('20d')
+                if isinstance(v, (int, float)):
+                    mom20 = float(v) * 100.0
+            regime = self._weighting_engine.infer_regime_from_market(
+                vix=self._get_vix_level(),
+                market_bias=self._get_market_bias(),
+                price_momentum_20d=mom20,
+            )
+            return self._weighting_engine.get_weights(asset_class, regime), asset_class, regime
+        except Exception:
+            return fallback, 'stock', 'ranging'
+
+    def _calculate_rsi(self, close) -> float:
+        """Wilder-style RSI (14) from a close series; 50.0 on any failure."""
+        try:
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            close = close.dropna().astype(float)
+            if len(close) < 16:
+                return 50.0
+            delta = close.diff()
+            gain = delta.where(delta > 0, 0.0).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
+            rs = gain / (loss + 1e-9)
+            rsi = 100.0 - (100.0 / (1.0 + rs))
+            val = float(rsi.iloc[-1])
+            return 50.0 if (np.isnan(val) or np.isinf(val)) else val
+        except Exception:
+            return 50.0
+
+    def _fetch_news_sentiment(self, symbol: str) -> Optional[float]:
+        """Best-effort weighted news sentiment in [-1, 1]. Returns None if unavailable.
+
+        Uses the AdvancedNewsProcessor's per-symbol sentiment analyzer, which
+        returns a credibility-weighted score within a hard timeout. The
+        processor instance is cached to avoid repeated heavy construction.
+        """
+        try:
+            if self._news_processor is None:
+                from advanced_news_processor import AdvancedNewsProcessor
+                self._news_processor = AdvancedNewsProcessor()
+            result = self._news_processor.analyze_symbol_sentiment(symbol, timeout=5)
+            if result and 'score' in result:
+                score = result.get('score')
+                if isinstance(score, (int, float)):
+                    return float(np.clip(score, -1.0, 1.0))
+        except Exception:
+            pass
+        return None
+
+    def _generate_bull_bear_neutral(self, symbol: str, profit_signals: Dict[str, float],
+                                    momentum_analysis: Dict[str, float],
+                                    volatility_opportunities: Dict[str, float],
+                                    options_metrics: Dict[str, float],
+                                    quant_signal: Any, news_sentiment: Optional[float],
+                                    rsi: float, data: pd.DataFrame) -> Tuple[List[str], List[str], str]:
+        """Always produce bull, bear, and neutral cases with concrete data points.
+
+        Sources: momentum direction, RSI zone, volume trend, quant signal
+        direction, news sentiment sign, and options skew.
+        """
+        bull: List[str] = []
+        bear: List[str] = []
+
+        mom = momentum_analysis or {}
+        mom_values = [v for v in mom.values() if isinstance(v, (int, float))]
+        mom_score = float(np.mean(mom_values)) if mom_values else 0.0
+        mom20 = mom.get('20d', 0) or 0
+        mom5 = mom.get('5d', 0) or 0
+
+        # Momentum direction
+        if isinstance(mom20, (int, float)) and mom20 > 0.02:
+            bull.append(f"20-day momentum is positive (+{mom20*100:.1f}%) — trend tailwind")
+        elif isinstance(mom20, (int, float)) and mom20 < -0.02:
+            bear.append(f"20-day momentum is negative ({mom20*100:.1f}%) — trend headwind")
+        if isinstance(mom5, (int, float)) and mom5 > 0.01:
+            bull.append(f"5-day momentum positive (+{mom5*100:.1f}%) — near-term buying pressure")
+        elif isinstance(mom5, (int, float)) and mom5 < -0.01:
+            bear.append(f"5-day momentum negative ({mom5*100:.1f}%) — near-term selling pressure")
+
+        # RSI zone
+        if rsi >= 70:
+            bear.append(f"RSI at {rsi:.0f} — overbought, extension / mean-reversion pullback risk")
+        elif rsi <= 30:
+            bull.append(f"RSI at {rsi:.0f} — oversold, bounce setup with favorable entry")
+        elif rsi >= 55:
+            bull.append(f"RSI at {rsi:.0f} — bullish momentum zone (not yet overbought)")
+        elif rsi <= 45:
+            bear.append(f"RSI at {rsi:.0f} — bearish momentum zone")
+
+        # Volume trend
+        vol_analysis = self._analyze_volume_patterns(data)
+        if vol_analysis.get('available'):
+            vol_ratio = vol_analysis.get('current_vs_average', 1.0) or 1.0
+            vol_trend = vol_analysis.get('trend')
+            if vol_ratio > 1.2 and mom_score > 0:
+                bull.append(f"Volume at {vol_ratio:.1f}x average — participation confirms the move")
+            elif vol_ratio > 1.2 and mom_score < 0:
+                bear.append(f"Volume at {vol_ratio:.1f}x average — heavy distribution during the decline")
+            elif vol_trend == 'decreasing' and mom_score > 0:
+                bear.append("Volume contracting — rally lacks conviction")
+
+        # Quant ensemble signal
+        if quant_signal is not None:
+            q_dir = getattr(quant_signal, 'direction', 'NEUTRAL')
+            q_prob = getattr(quant_signal, 'probability', 0.5) or 0.5
+            q_conf = getattr(quant_signal, 'confidence', 0.5) or 0.5
+            if q_dir == 'BULLISH':
+                bull.append(f"Quant ensemble BULLISH ({q_prob:.0%} prob, {q_conf:.0%} conf)")
+            elif q_dir == 'BEARISH':
+                bear.append(f"Quant ensemble BEARISH ({q_prob:.0%} prob, {q_conf:.0%} conf)")
+
+        # News sentiment sign
+        if news_sentiment is not None and abs(news_sentiment) > 0.15:
+            if news_sentiment > 0:
+                bull.append(f"News sentiment positive ({news_sentiment:+.2f}) — headlines supportive")
+            else:
+                bear.append(f"News sentiment negative ({news_sentiment:+.2f}) — headlines pressuring")
+
+        # Options skew
+        if options_metrics:
+            cpr = options_metrics.get('net_call_put_ratio', 1.0) or 1.0
+            if cpr > 1.3:
+                bull.append(f"Options flow call-heavy ({cpr:.2f} call/put) — leaning bullish")
+            elif cpr < 0.7:
+                bear.append(f"Options flow put-heavy ({cpr:.2f} call/put) — hedging demand elevated")
+
+        # Volatility context
+        vol_vals = [v for v in volatility_opportunities.values() if isinstance(v, (int, float))]
+        vol_score = float(np.mean(vol_vals)) if vol_vals else 0.0
+        if vol_score > 1.2:
+            bear.append(f"Volatility expansion ({vol_score:.2f}x) — larger adverse moves possible")
+        elif 0 < vol_score < 0.8:
+            bull.append(f"Compressed volatility ({vol_score:.2f}x) — positioning for expansion")
+
+        if not bull:
+            bull.append("No dominant bullish catalysts identified — upside needs fresh momentum")
+        if not bear:
+            bear.append("No dominant bearish catalysts identified — downside limited absent a shock")
+
+        # Neutral explanation
+        neutral_bits = []
+        if abs(mom_score) < 0.05:
+            neutral_bits.append("momentum is broadly flat")
+        if 45 <= rsi <= 55:
+            neutral_bits.append("RSI sits in the neutral zone")
+        if not neutral_bits:
+            neutral_bits.append("signals are mixed across timeframes")
+        neutral_reasoning = (
+            f"The setup for {symbol} is balanced: " + ", ".join(neutral_bits)
+            + ", so direction is not yet resolved. Position sizing should stay defensive."
+        )
+
+        return bull[:5], bear[:5], neutral_reasoning
     
     def _calculate_profit_signals(self, data: pd.DataFrame, fast_mode: bool = False) -> Dict[str, float]:
         """Calculate pure profit signals based on mathematical patterns."""
@@ -517,44 +854,90 @@ class UnbiasedMarketAnalyzer:
     def _calculate_profit_probability(self, profit_signals: Dict[str, float],
                                     momentum_analysis: Dict[str, float],
                                     volatility_opportunities: Dict[str, float],
-                                    statistical_edges: Dict[str, float]) -> float:
-        """Calculate overall profit probability."""
+                                    statistical_edges: Dict[str, float],
+                                    options_metrics: Dict[str, float] = None,
+                                    quant_signal: Any = None,
+                                    news_sentiment: Optional[float] = None,
+                                    weights: Optional[Dict[str, float]] = None) -> float:
+        """Calculate overall profit probability using the dynamic information-weighting engine.
+
+        Each signal component (momentum, technicals, quant, volume, options,
+        macro/vol, news) is scored in [-1, 1] and blended with regime- and
+        asset-class-aware weights from InformationWeightingEngine (falling back
+        to fixed defaults if the engine is unavailable).
+        """
         try:
-            # Weighted combination of all signals
-            weights = self.profit_focus_weights
-            
-            momentum_score = np.mean(list(momentum_analysis.values())) if momentum_analysis else 0
-            volatility_score = np.mean(list(volatility_opportunities.values())) if volatility_opportunities else 0
-            statistical_score = np.mean(list(statistical_edges.values())) if statistical_edges else 0
-            
-            # Base profit signals
-            base_signals = [
-                profit_signals.get('price_momentum', 0),
-                profit_signals.get('volume_momentum', 0),
-                profit_signals.get('breakout_probability', 0),
-                profit_signals.get('statistical_edge', 0)
-            ]
-            
-            base_score = np.mean(base_signals)
-            
-            # Ensemble impact (Massive Neural Network Models)
-            ensemble_decision = profit_signals.get('ensemble_decision', 0.0)
-            ensemble_confidence = profit_signals.get('ensemble_confidence', 0.5)
-            ensemble_impact = ensemble_decision * ensemble_confidence
-            
-            # Combined probability with Ensemble Weighting
-            profit_probability = (
-                base_score * weights['momentum'] +
-                volatility_score * weights['volatility_opportunity'] +
-                statistical_score * weights['statistical_edges'] +
-                momentum_score * weights['technical_breakouts'] +
-                ensemble_impact * 0.35  # Significant weight to the Ensemble
+            # Dynamic weights (engine-backed, with safe fallback)
+            if not weights:
+                weights, _, _ = self._get_dynamic_weights(momentum_analysis)
+            else:
+                weights = dict(weights)
+
+            momentum_score = float(np.mean(list(momentum_analysis.values()))) if momentum_analysis else 0.0
+            volatility_score = float(np.mean(list(volatility_opportunities.values()))) if volatility_opportunities else 0.0
+            statistical_score = float(np.mean(list(statistical_edges.values()))) if statistical_edges else 0.0
+            mom_sign = 1.0 if momentum_score >= 0 else -1.0
+
+            # Signed technical score (Bollinger position, mean reversion, breakout, statistical edge)
+            breakout = profit_signals.get('breakout_probability', 0.0) or 0.0
+            technical_directional = float(np.clip(
+                (profit_signals.get('bollinger_position', 0.0) or 0.0) * 0.35 +
+                (profit_signals.get('mean_reversion', 0.0) or 0.0) * 0.30 +
+                (breakout * mom_sign) * 0.20 +
+                statistical_score * 0.15,
+                -1.0, 1.0))
+
+            # Signed volume score
+            vol_break = (profit_signals.get('volume_breakout', 0.0) or 0.0) * mom_sign
+            volume_score = float(np.clip(
+                (profit_signals.get('volume_momentum', 0.0) or 0.0) * 0.6 + vol_break * 0.4,
+                -1.0, 1.0))
+
+            # Quant ensemble score (direction × probability)
+            quant_score = 0.0
+            if quant_signal is not None:
+                q_dir = getattr(quant_signal, 'direction', 'NEUTRAL')
+                q_prob = float(getattr(quant_signal, 'probability', 0.5) or 0.5)
+                quant_score = (1.0 if q_dir == 'BULLISH' else -1.0 if q_dir == 'BEARISH' else 0.0) * q_prob
+            else:
+                ensemble_impact = (profit_signals.get('ensemble_decision', 0.0) or 0.0) * \
+                                  (profit_signals.get('ensemble_confidence', 0.5) or 0.5)
+                quant_score = float(np.clip(ensemble_impact, -1.0, 1.0))
+
+            # Options intelligence impact
+            options_impact = 0.0
+            if options_metrics:
+                sentiment_bias = np.tanh((options_metrics.get('net_call_put_ratio', 1.0) - 1) * 0.5)
+                iv_rank = options_metrics.get('iv_rank', 1.0) or 1.0
+                iv_impact = 0.0
+                if iv_rank > 1.8 and abs(momentum_score) > 0.6:
+                    iv_impact = -np.sign(momentum_score) * 0.15
+                elif iv_rank < 0.6:
+                    iv_impact = np.sign(momentum_score or 0.1) * 0.05
+                options_impact = sentiment_bias * 0.1 + iv_impact
+
+            # Macro/vol component (vol expansion/contraction — signed by momentum)
+            macro_component = float(np.clip(np.sign(momentum_score or 0.1) * abs(volatility_score - 1.0), -1.0, 1.0))
+
+            # News sentiment component ([-1, 1] or neutral 0)
+            news_component = float(np.clip(news_sentiment or 0.0, -1.0, 1.0))
+
+            # Engine-weighted blend (weights sum to 1.0)
+            blended = (
+                momentum_score * weights.get('price_momentum', 0.25) +
+                technical_directional * weights.get('technical_signals', 0.25) +
+                quant_score * weights.get('quant_model', 0.25) +
+                volume_score * weights.get('volume_confirmation', 0.10) +
+                options_impact * weights.get('options_flow', 0.05) +
+                macro_component * weights.get('macro_regime', 0.05) +
+                news_component * weights.get('news_sentiment', 0.05)
             )
-            
+
             # Normalize to [0, 1]
-            return max(0, min(1, (profit_probability + 1) / 2))
-            
+            return max(0.0, min(1.0, (blended + 1.0) / 2.0))
+
         except Exception as e:
+            print(f"Profit probability calculation error: {e}")
             return 0.5
     
     def _calculate_expected_return(self, data: pd.DataFrame, profit_signals: Dict[str, float]) -> float:
@@ -663,6 +1046,49 @@ class UnbiasedMarketAnalyzer:
         
         return opportunities
     
+    def _calculate_options_metrics(self, symbol: str, data: pd.DataFrame) -> Dict[str, float]:
+        """Deep dive into options intelligence: IV Rank, Gamma, Net Premium Flow."""
+        metrics = {
+            'iv_rank': 0.5,
+            'iv_pct': 0.5,
+            'gamma_risk_level': 0.0,
+            'net_call_put_ratio': 1.0,
+            'est_option_volume': 0.0
+        }
+        
+        try:
+            # We fetch chain to get real-time IV and positioning
+            chain = get_options_chain(symbol)
+            if not chain or not chain.get('calls') or len(chain['calls']) == 0:
+                # If no chain, use HV as a proxy for the IV component
+                hv = data['Returns'].std() * np.sqrt(252)
+                metrics['iv_rank'] = hv
+                return metrics
+            
+            # ATM IV Extraction
+            calls = chain['calls']
+            current_price = data['Close'].iloc[-1]
+            atm_call = min(calls, key=lambda x: abs(x['strike'] - current_price))
+            current_iv = atm_call.get('impliedVolatility', 0)
+            
+            # IV vs HV comparison (The 'Edge' component)
+            hv = data['Returns'].std() * np.sqrt(252)
+            metrics['iv_rank'] = current_iv / hv if hv > 0 else 1.0
+            metrics['iv_pct'] = current_iv
+            
+            # Directional sentiment from volume
+            c_vol = sum(c.get('volume', 0) or 0 for c in chain['calls'])
+            p_vol = sum(p.get('volume', 0) or 0 for p in chain['puts'])
+            metrics['net_call_put_ratio'] = c_vol / (p_vol + 1e-8)
+            
+            # Gamma approximation from ATM volume concentration
+            metrics['gamma_risk_level'] = (atm_call.get('volume', 0) or 0) / (c_vol + 1e-8)
+            
+        except Exception:
+            pass
+            
+        return metrics
+
     def _find_statistical_edges(self, data: pd.DataFrame) -> Dict[str, float]:
         """Find statistical arbitrage edges."""
         edges = {}

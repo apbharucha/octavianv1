@@ -100,20 +100,20 @@ def show_overview_metrics(db_manager, time_range: str):
             )
         
         with col3:
-            avg_response_time = conv_stats.get('avg_response_time', 0)
+            avg_response_time = conv_stats.get('avg_response_time') or 0
             st.metric(
                 "Avg Response Time",
                 f"{avg_response_time:.0f}ms",
-                delta=f"-{avg_response_time//10}ms" if avg_response_time > 0 else None,
+                delta=f"-{int(avg_response_time)//10}ms" if avg_response_time and avg_response_time > 0 else None,
                 delta_color="inverse"
             )
         
         with col4:
-            avg_charts = conv_stats.get('avg_charts_per_query', 0)
+            avg_charts = conv_stats.get('avg_charts_per_query') or 0
             st.metric(
                 "Avg Charts/Query",
                 f"{avg_charts:.1f}",
-                delta=f"+{avg_charts:.1f}" if avg_charts > 0 else None
+                delta=f"+{avg_charts:.1f}" if avg_charts and avg_charts > 0 else None
             )
         
         st.markdown("---")

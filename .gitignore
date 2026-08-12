@@ -1,0 +1,29 @@
+# Secrets / env
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Python cache/build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local DB / runtime artifacts
+*.db
+*.sqlite
+*.sqlite3
+octavian_learned_params.json
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

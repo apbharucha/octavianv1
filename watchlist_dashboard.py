@@ -1,5 +1,5 @@
 """
-Octavian Watchlist Dashboard — Live monitoring and deep-dive for user's watchlist.
+Octavian Watchlist Dashboard  Live monitoring and deep-dive for user's watchlist.
 Author: APB - Octavian Team
 """
 
@@ -464,7 +464,7 @@ def _full_chart(sym: str, data: Dict, period_label: str) -> go.Figure:
 
     fig.update_layout(
         height=480, template="plotly_dark",
-        title=dict(text=f"{sym} — {period_label}", x=0.01, font=dict(size=13)),
+        title=dict(text=f"{sym}  {period_label}", x=0.01, font=dict(size=13)),
         showlegend=True, margin=dict(l=10, r=10, t=35, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=9)),
     )
@@ -483,8 +483,8 @@ def show_watchlist_dashboard():
 
     if not watchlist:
         st.info("Your watchlist is empty. Go to ** Trader Profile** to add symbols.")
-        if st.button("Go to Profile →"):
-            st.session_state["_nav_override"] = " Trader Profile"
+        if st.button("Go to Profile "):
+            st.session_state["_nav_override"] = "Trader Profile"
             st.rerun()
         return
 
@@ -554,12 +554,12 @@ def show_watchlist_dashboard():
                 f"{period} %": f"{d['period_ret']:+.2f}%",
                 "Signal": f"{sig_icon} {d['signal']}",
                 "Conf": f"{d['confidence']:.0%}",
-                "RSI": f"{m.get('rsi', 0):.0f}" if "rsi" in m else "—",
-                "Vol": f"{m.get('ann_vol', 0):.1f}%" if "ann_vol" in m else "—",
+                "RSI": f"{m.get('rsi', 0):.0f}" if "rsi" in m else "",
+                "Vol": f"{m.get('ann_vol', 0):.1f}%" if "ann_vol" in m else "",
             })
 
         df_table = pd.DataFrame(table_rows)
-        st.dataframe(df_table, use_container_width=True, hide_index=True, height=min(400, 40 + len(table_rows) * 35))
+        st.dataframe(df_table, width='stretch', hide_index=True, height=min(400, 40 + len(table_rows) * 35))
 
         # Metric cards
         st.markdown("---")
@@ -578,7 +578,7 @@ def show_watchlist_dashboard():
                             f"{d['change_1d']:+.2f}% today"
                         )
                         st.plotly_chart(_mini_sparkline(d["close"].tail(30), height=80),
-                                       use_container_width=True, key=f"spark_{d['symbol']}")
+                                       width='stretch', key=f"spark_{d['symbol']}")
 
     #  Tab 2: Charts 
     with wl_tabs[1]:
@@ -589,15 +589,15 @@ def show_watchlist_dashboard():
             selected_sym = st.selectbox("Symbol", list(all_data.keys()), key="wl_chart_sym")
             if selected_sym in all_data:
                 fig = _full_chart(selected_sym, all_data[selected_sym], period)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
 
                 # Show factors
                 d = all_data[selected_sym]
                 sig_icon = "" if d["signal"] == "BULLISH" else "" if d["signal"] == "BEARISH" else ""
-                st.markdown(f"**{sig_icon} {d['signal']}** — Confidence: {d['confidence']:.0%} | "
+                st.markdown(f"**{sig_icon} {d['signal']}**  Confidence: {d['confidence']:.0%} | "
                             f"Bull: {d['bullish_prob']:.0%} | Bear: {d['bearish_prob']:.0%}")
                 for f in d.get("factors", [])[:6]:
-                    st.caption(f"• {f}")
+                    st.caption(f" {f}")
         else:
             syms = list(all_data.keys())
             for i in range(0, len(syms), 2):
@@ -609,7 +609,7 @@ def show_watchlist_dashboard():
                         with col:
                             fig = _full_chart(sym, all_data[sym], period)
                             fig.update_layout(height=350)
-                            st.plotly_chart(fig, use_container_width=True, key=f"grid_{sym}")
+                            st.plotly_chart(fig, width='stretch', key=f"grid_{sym}")
 
     #  Tab 3: Deep Dive 
     with wl_tabs[2]:
@@ -623,7 +623,7 @@ def show_watchlist_dashboard():
 
             # Header
             sig_icon = "" if d["signal"] == "BULLISH" else "" if d["signal"] == "BEARISH" else ""
-            st.markdown(f"### {dd_sym} — {sig_icon} {d['signal']}")
+            st.markdown(f"### {dd_sym}  {sig_icon} {d['signal']}")
 
             mc1, mc2, mc3, mc4, mc5 = st.columns(5)
             with mc1:
@@ -642,24 +642,24 @@ def show_watchlist_dashboard():
             # Full chart
             fig = _full_chart(dd_sym, d, period)
             fig.update_layout(height=550)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
             # Technical details
             st.markdown("###  Technical Breakdown")
             tech_cols = st.columns(4)
             with tech_cols[0]:
-                st.metric("SMA20", f"${m.get('sma20', 0):,.2f}" if "sma20" in m else "—")
+                st.metric("SMA20", f"${m.get('sma20', 0):,.2f}" if "sma20" in m else "")
             with tech_cols[1]:
-                st.metric("SMA50", f"${m.get('sma50', 0):,.2f}" if "sma50" in m else "—")
+                st.metric("SMA50", f"${m.get('sma50', 0):,.2f}" if "sma50" in m else "")
             with tech_cols[2]:
-                st.metric("MACD Hist", f"{m.get('macd_hist', 0):.4f}" if "macd_hist" in m else "—")
+                st.metric("MACD Hist", f"{m.get('macd_hist', 0):.4f}" if "macd_hist" in m else "")
             with tech_cols[3]:
-                st.metric("Ann. Volatility", f"{m.get('ann_vol', 0):.1f}%" if "ann_vol" in m else "—")
+                st.metric("Ann. Volatility", f"{m.get('ann_vol', 0):.1f}%" if "ann_vol" in m else "")
 
             # Signal factors
             st.markdown("###  Signal Factors")
             for f in d.get("factors", []):
-                st.caption(f"• {f}")
+                st.caption(f" {f}")
 
             # Probability breakdown
             st.markdown("###  Probability Breakdown")
@@ -673,7 +673,7 @@ def show_watchlist_dashboard():
                 textposition="outside",
             ))
             prob_fig.update_layout(height=250, template="plotly_dark", yaxis_title="Probability")
-            st.plotly_chart(prob_fig, use_container_width=True)
+            st.plotly_chart(prob_fig, width='stretch')
 
             # Return distribution
             daily_rets = close.pct_change().dropna()
@@ -684,7 +684,7 @@ def show_watchlist_dashboard():
                                         color_discrete_sequence=["#636EFA"])
                 dist_fig.update_layout(template="plotly_dark", height=250,
                                        xaxis_title="Daily Return %", yaxis_title="Frequency")
-                st.plotly_chart(dist_fig, use_container_width=True)
+                st.plotly_chart(dist_fig, width='stretch')
 
             # Risk metrics
             if len(daily_rets) > 20:
@@ -732,7 +732,7 @@ def show_watchlist_dashboard():
                 hovermode="x unified", yaxis_title="Return %",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
             )
-            st.plotly_chart(fig_comp, use_container_width=True)
+            st.plotly_chart(fig_comp, width='stretch')
 
             # Correlation matrix
             if len(compare_syms) >= 2:
@@ -752,7 +752,7 @@ def show_watchlist_dashboard():
                                          color_continuous_scale="RdBu",
                                          color_continuous_midpoint=0)
                     fig_corr.update_layout(height=400, template="plotly_dark")
-                    st.plotly_chart(fig_corr, use_container_width=True)
+                    st.plotly_chart(fig_corr, width='stretch')
 
             # Summary comparison table
             st.markdown("### Comparative Metrics")
@@ -771,8 +771,8 @@ def show_watchlist_dashboard():
                         f"{period}": f"{d['period_ret']:+.2f}%",
                         "Signal": d["signal"],
                         "RSI": f"{m.get('rsi', 0):.0f}",
-                        "Vol%": f"{m.get('ann_vol', 0):.1f}" if "ann_vol" in m else "—",
+                        "Vol%": f"{m.get('ann_vol', 0):.1f}" if "ann_vol" in m else "",
                         "Sharpe": f"{sharpe:.2f}",
                     })
             if comp_rows:
-                st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(comp_rows), width='stretch', hide_index=True)

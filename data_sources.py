@@ -1,8 +1,11 @@
 import io
+import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -10,6 +13,40 @@ import requests
 import yfinance as yf
 
 from config import ALPHA_VANTAGE_KEY, OANDA_API_KEY, POLYGON_API_KEY
+
+
+# ---------------------------------------------------------------------------
+# DATA CORRECTIONS REGISTRY
+#
+# Known-bad data points are managed as data (data_corrections.json), not as
+# hardcoded values in source code, so every correction is attributable,
+# reviewable, and removable without a code change.
+# ---------------------------------------------------------------------------
+
+_CORRECTIONS_PATH = Path(__file__).resolve().parent / "data_corrections.json"
+_CORRECTIONS: dict = {}
+
+
+def _load_corrections() -> dict:
+    """Load the corrections registry (cached after first read)."""
+    global _CORRECTIONS
+    if _CORRECTIONS:
+        return _CORRECTIONS
+    try:
+        with open(_CORRECTIONS_PATH, "r") as f:
+            data = json.load(f)
+        corr: dict = {}
+        for entry in data.get("corrections", []):
+            sym = (entry.get("symbol") or "").upper()
+            dt = entry.get("date")
+            if not sym or not dt:
+                continue
+            corr.setdefault(sym, {})[dt] = entry
+        _CORRECTIONS = corr
+    except Exception as e:
+        logging.getLogger(__name__).warning("Could not load data_corrections.json: %s", e)
+        _CORRECTIONS = {}
+    return _CORRECTIONS
 
 OANDA_BASE_URL = "https://api-fxpractice.oanda.com"
 
@@ -22,44 +59,52 @@ for _logger_name in ("yfinance", "yfinance.shared", "yfinance.utils"):
 # If Yahoo starts returning invalid JSON, back off for a short cooldown
 _YF_SKIP_UNTIL_TS: float = 0.0
 
+# yfinance's module-level `download()` writes into shared module globals
+# (e.g. shared._DFS), so concurrent calls from multiple threads can
+# cross-contaminate results (symbol A receiving symbol B's data).
+# Serialize all network fetches behind a lock so parallel callers
+# (watchlist ThreadPoolExecutor, scanners, etc.) never mix instruments.
+_YF_FETCH_LOCK = threading.RLock()  # RLock: reentrant-safe against nested fetch paths
+
 
 _CACHE: dict = {}
 
 
 def _apply_data_corrections(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """Apply manual corrections for known bad data points."""
+    """Apply registered corrections for known bad data points (data-driven)."""
     if df.empty:
         return df
 
-    # Hotfix for VIX bad tick on 2026-02-09
-    if ticker == "^VIX":
-        # Check if 2026-02-09 exists in the index
-        vix_bad_date = "2026-02-09"
-        date_strs = df.index.strftime("%Y-%m-%d")
+    corrections = _load_corrections()
+    sym_corrections = corrections.get((ticker or "").upper())
+    if not sym_corrections:
+        return df
 
-        if vix_bad_date in date_strs:
-            idx_list = df.index[date_strs == vix_bad_date]
-            for idx in idx_list:
-                # User reports real price is 17.36 at -2.25% change
-                corrected_price = 17.36
-                df.loc[idx, "Close"] = corrected_price
-                if "Open" in df.columns:
-                    df.loc[idx, "Open"] = 17.50
-                if "High" in df.columns:
-                    df.loc[idx, "High"] = 17.65
-                if "Low" in df.columns:
-                    df.loc[idx, "Low"] = 17.30
-                if "Adj Close" in df.columns:
-                    df.loc[idx, "Adj Close"] = corrected_price
+    date_strs = df.index.strftime("%Y-%m-%d")
+    for bad_date, entry in sym_corrections.items():
+        if bad_date not in date_strs:
+            continue
+        ohlc = entry.get("ohlc", {})
+        corrected_close = ohlc.get("Close")
+        if corrected_close is None:
+            continue
+        idx_list = df.index[date_strs == bad_date]
+        for idx in idx_list:
+            for col, val in ohlc.items():
+                if col in df.columns:
+                    df.loc[idx, col] = val
+            if "Adj Close" in df.columns:
+                df.loc[idx, "Adj Close"] = corrected_close
 
-                # Fix previous close to ensure percentage is correct (-2.25%)
-                # 17.36 / (1 - 0.0225) = 17.76
+            # Adjust previous close so the daily change computes correctly.
+            prev_close = entry.get("prev_close")
+            if prev_close is not None:
                 pos = df.index.get_loc(idx)
                 if pos > 0:
                     prev_idx = df.index[pos - 1]
-                    df.loc[prev_idx, "Close"] = 17.76
+                    df.loc[prev_idx, "Close"] = prev_close
                     if "Adj Close" in df.columns:
-                        df.loc[prev_idx, "Adj Close"] = 17.76
+                        df.loc[prev_idx, "Adj Close"] = prev_close
 
     return df
 
@@ -68,9 +113,22 @@ def _normalize_ohlc(df: pd.DataFrame, ticker: str = None) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # Handle MultiIndex columns
+    # Handle MultiIndex columns from yfinance
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.droplevel(1)
+        # Detect which level has the OHLC price names
+        ohlc_names = {"Open", "High", "Low", "Close", "Volume", "Adj Close"}
+        level_0_names = set(str(x) for x in df.columns.get_level_values(0).unique())
+        level_1_names = set(str(x) for x in df.columns.get_level_values(1).unique())
+        
+        if level_0_names & ohlc_names:
+            # Level 0 has price names (e.g., ('Close', 'AAPL')) - drop level 1 (ticker)
+            df.columns = df.columns.droplevel(1)
+        elif level_1_names & ohlc_names:
+            # Level 1 has price names (e.g., ('AAPL', 'Close')) - drop level 0 (ticker)
+            df.columns = df.columns.droplevel(0)
+        else:
+            # Fallback: try dropping the last level
+            df.columns = df.columns.droplevel(-1)
 
     df = df.rename(columns=str.title)
     required_cols = ["Open", "High", "Low", "Close"]
@@ -94,8 +152,25 @@ def _cache_key(ticker: str, period: str, interval: str) -> str:
     return f"{ticker}::{period}::{interval}"
 
 
+def _get_dynamic_ttl(ticker: str, interval: str) -> int:
+    """Intelligent Response Caching: Dynamic TTL based on asset type and interval."""
+    sym = ticker.upper()
+    
+    # Intraday data needs fresher cache than daily
+    if interval in ["1m", "5m", "15m", "30m", "1h"]:
+        if sym.endswith("-USD"): return 15  # Crypto is 24/7 and highly volatile
+        if sym.endswith("=F"): return 30    # Futures
+        if "^VIX" in sym: return 10         # Volatility index needs ultra-low latency
+        if "/" in sym or sym.endswith("=X"): return 30 # Forex
+        return 60  # Standard intraday equities
+    
+    # Daily or longer intervals
+    if sym.endswith("-USD"): return 120
+    if "^VIX" in sym: return 120
+    return 300  # Default 5 min for daily standard equities
+
 def _get_cached(
-    ticker: str, period: str, interval: str, ttl_seconds: int = 300
+    ticker: str, period: str, interval: str, ttl_seconds: int = None
 ) -> pd.DataFrame:
     key = _cache_key(ticker, period, interval)
     hit = _CACHE.get(key)
@@ -103,10 +178,14 @@ def _get_cached(
         return pd.DataFrame()
 
     ts, df = hit
+    
+    # Apply context-aware dynamic TTL if none specifically requested
+    if ttl_seconds is None:
+        ttl_seconds = _get_dynamic_ttl(ticker, interval)
+        
     if (time.time() - ts) > ttl_seconds:
         return pd.DataFrame()
     return df.copy()
-
 
 def _set_cached(ticker: str, period: str, interval: str, df: pd.DataFrame) -> None:
     key = _cache_key(ticker, period, interval)
@@ -121,6 +200,8 @@ def _period_to_compact(period: str) -> str:
 def _period_to_days(period: str) -> int:
     try:
         p = (period or "").strip().lower()
+        if p == "max":
+            return 36500  # 100 years
         if p.endswith("y"):
             return int(p[:-1]) * 365
         if p.endswith("mo"):
@@ -130,6 +211,20 @@ def _period_to_days(period: str) -> int:
     except Exception:
         return 365
     return 365
+
+def _slice_by_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
+    if df is None or df.empty or not period or period.lower() == "max":
+        return df
+    days = _period_to_days(period)
+    cutoff = pd.Timestamp.utcnow().tz_localize(None) - timedelta(days=days)
+    df_idx = df.index
+    if df_idx.tz is not None:
+        df_idx = df_idx.tz_localize(None)
+    
+    sliced = df[df_idx >= cutoff].copy()
+    if sliced.empty:
+        return df.tail(10)  # fallback if period too short
+    return sliced
 
 
 def _polygon_ticker(symbol: str) -> str:
@@ -197,7 +292,7 @@ def _fetch_polygon_daily(symbol: str, period: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _fetch_alpha_vantage_daily(symbol: str) -> pd.DataFrame:
+def _fetch_alpha_vantage_daily(symbol: str, period: str = "max") -> pd.DataFrame:
     api_key = os.environ.get("ALPHA_VANTAGE_KEY") or ALPHA_VANTAGE_KEY
     if not api_key:
         return pd.DataFrame()
@@ -248,7 +343,7 @@ def _fetch_alpha_vantage_daily(symbol: str) -> pd.DataFrame:
 
         df["Date"] = pd.to_datetime(df["Date"])
         df = df.set_index("Date").sort_index()
-        return _normalize_ohlc(df, symbol)
+        return _slice_by_period(_normalize_ohlc(df, symbol), period)
     except Exception:
         return pd.DataFrame()
 
@@ -310,7 +405,7 @@ def _stooq_symbol(symbol: str) -> str:
     return s
 
 
-def _fetch_stooq_daily(symbol: str) -> pd.DataFrame:
+def _fetch_stooq_daily(symbol: str, period: str = "max") -> pd.DataFrame:
     try:
         stooq_s = _stooq_symbol(symbol)
         url = "https://stooq.com/q/d/l/"
@@ -325,7 +420,7 @@ def _fetch_stooq_daily(symbol: str) -> pd.DataFrame:
         # Stooq uses: Date,Open,High,Low,Close,Volume
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-        return _normalize_ohlc(df, symbol)
+        return _slice_by_period(_normalize_ohlc(df, symbol), period)
     except Exception:
         return pd.DataFrame()
 
@@ -349,7 +444,7 @@ def _safe_yf_download(ticker, period="3y", interval="1d"):
 
     # For equities/indices/futures/FX, prefer resilient providers before touching Yahoo
     if daily_only_fallbacks and (equity_like or index_like or futures_like or fx_like):
-        df = _fetch_stooq_daily(ticker_str)
+        df = _fetch_stooq_daily(ticker_str, period)
         if not df.empty:
             _set_cached(ticker_str, period, interval, df)
             return df
@@ -359,7 +454,7 @@ def _safe_yf_download(ticker, period="3y", interval="1d"):
             _set_cached(ticker_str, period, interval, df)
             return df
 
-        df = _fetch_alpha_vantage_daily(ticker_str)
+        df = _fetch_alpha_vantage_daily(ticker_str, period)
         if not df.empty:
             _set_cached(ticker_str, period, interval, df)
             return df
@@ -369,7 +464,7 @@ def _safe_yf_download(ticker, period="3y", interval="1d"):
 
     # If Yahoo is in cooldown and caller asked for intraday data, return best-effort daily data instead
     if now_ts < _YF_SKIP_UNTIL_TS and not daily_only_fallbacks:
-        df = _fetch_stooq_daily(ticker_str)
+        df = _fetch_stooq_daily(ticker_str, period)
         if not df.empty:
             _set_cached(ticker_str, period, interval, df)
             return df
@@ -379,54 +474,58 @@ def _safe_yf_download(ticker, period="3y", interval="1d"):
             _set_cached(ticker_str, period, interval, df)
             return df
 
-        df = _fetch_alpha_vantage_daily(ticker_str)
+        df = _fetch_alpha_vantage_daily(ticker_str, period)
         if not df.empty:
             _set_cached(ticker_str, period, interval, df)
             return df
 
     # For FX pairs: always try stooq first even in cooldown to avoid Yahoo dependency
     if fx_like and now_ts < _YF_SKIP_UNTIL_TS:
-        df = _fetch_stooq_daily(ticker_str)
+        df = _fetch_stooq_daily(ticker_str, period)
         if not df.empty:
             _set_cached(ticker_str, period, interval, df)
             return df
 
-    # Retry Yahoo a couple times (often transient JSONDecodeError)
+    # Retry Yahoo a couple times (often transient JSONDecodeError).
+    # The entire download attempt is serialized: yfinance's `download()`
+    # mutates shared module state and is not thread-safe, so we hold the
+    # lock for the full retry cycle.
     last_exc: Exception | None = None
     if now_ts >= _YF_SKIP_UNTIL_TS:
-        for attempt in range(3):
-            try:
-                df = yf.download(
-                    ticker,
-                    period=period,
-                    interval=interval,
-                    progress=False,
-                    threads=False,
-                )
-                df = _normalize_ohlc(df, ticker)
-                if not df.empty:
-                    _set_cached(ticker, period, interval, df)
-                    return df
+        with _YF_FETCH_LOCK:
+            for attempt in range(3):
+                try:
+                    df = yf.download(
+                        ticker,
+                        period=period,
+                        interval=interval,
+                        progress=False,
+                        threads=False,
+                    )
+                    df = _normalize_ohlc(df, ticker)
+                    if not df.empty:
+                        _set_cached(ticker, period, interval, df)
+                        return df
 
-                # If Yahoo returns empty for a likely-valid ticker, treat as outage and switch providers
-                if (
-                    attempt == 0
-                    and isinstance(ticker, str)
-                    and ticker
-                    and len(ticker) <= 10
-                ):
-                    _YF_SKIP_UNTIL_TS = time.time() + 600
-                    break
-            except Exception as e:
-                last_exc = e
-                msg = str(e)
-                if "Expecting value" in msg or "JSONDecodeError" in msg:
-                    _YF_SKIP_UNTIL_TS = time.time() + 600
-            time.sleep(0.6 * (attempt + 1))
+                    # If Yahoo returns empty for a likely-valid ticker, treat as outage and switch providers
+                    if (
+                        attempt == 0
+                        and isinstance(ticker, str)
+                        and ticker
+                        and len(ticker) <= 10
+                    ):
+                        _YF_SKIP_UNTIL_TS = time.time() + 600
+                        break
+                except Exception as e:
+                    last_exc = e
+                    msg = str(e)
+                    if "Expecting value" in msg or "JSONDecodeError" in msg:
+                        _YF_SKIP_UNTIL_TS = time.time() + 600
+                time.sleep(0.6 * (attempt + 1))
 
     # If Yahoo was skipped/failed and interval is intraday, fall back to daily providers
     if not daily_only_fallbacks:
-        df = _fetch_stooq_daily(ticker_str)
+        df = _fetch_stooq_daily(ticker_str, period)
         if not df.empty:
             _set_cached(ticker_str, period, interval, df)
             return df
@@ -449,7 +548,7 @@ def _safe_yf_download(ticker, period="3y", interval="1d"):
             return df
 
         # Prefer Stooq (no key, generally stable) before Alpha Vantage (rate-limited)
-        df = _fetch_stooq_daily(ticker_str)
+        df = _fetch_stooq_daily(ticker_str, period)
         if not df.empty:
             _set_cached(ticker_str, period, interval, df)
             return df
@@ -577,7 +676,7 @@ def get_fx(pair, count=500, period="2y", interval="1d"):
         if df_stooq is not None and not df_stooq.empty and "Date" in df_stooq.columns:
             df_stooq["Date"] = pd.to_datetime(df_stooq["Date"], errors="coerce")
             df_stooq = df_stooq.dropna(subset=["Date"]).set_index("Date").sort_index()
-            df_stooq = _normalize_ohlc(df_stooq, pair)
+            df_stooq = _slice_by_period(_normalize_ohlc(df_stooq, pair), period)
             if not df_stooq.empty:
                 return df_stooq
     except Exception as e:
@@ -655,16 +754,16 @@ def get_fresh_quote(symbol: str, period: str = "3mo"):
         or (len(clean6) == 6 and clean6.isalpha() and not sym.startswith("^"))
     )
 
-    # ── For FX pairs: try Stooq FIRST (no API key, very reliable) ─────────────
+    #  For FX pairs: try Stooq FIRST (no API key, very reliable) 
     if is_fx:
         try:
-            df = _fetch_stooq_daily(clean6 + "=X")  # _stooq_symbol strips "=X" → clean6
+            df = _fetch_stooq_daily(clean6 + "=X", period)  # _stooq_symbol strips "=X" → clean6
             if df is not None and not df.empty and "Close" in df.columns:
                 return df
         except Exception:
             pass
 
-    # ── Yahoo Finance ──────────────────────────────────────────────────────────
+    #  Yahoo Finance 
     try:
         import yfinance as yf
 
@@ -681,10 +780,10 @@ def get_fresh_quote(symbol: str, period: str = "3mo"):
     except Exception:
         pass
 
-    # ── For non-FX: Stooq fallback if Yahoo failed ─────────────────────────────
+    #  For non-FX: Stooq fallback if Yahoo failed 
     if not is_fx:
         try:
-            df = _fetch_stooq_daily(sym)
+            df = _fetch_stooq_daily(sym, period)
             if df is not None and not df.empty and "Close" in df.columns:
                 return df
         except Exception:
@@ -722,7 +821,7 @@ def _fetch_polygon_realtime(symbol: str):
 
 
 _REALTIME_CACHE: dict = {}
-_REALTIME_CACHE_TTL = 15  # 15 seconds for live price cache
+_REALTIME_CACHE_TTL = 5  # 5 seconds for live price cache
 
 
 def get_realtime_price(symbol: str):
@@ -750,7 +849,19 @@ def get_realtime_price(symbol: str):
     current_price = None
     prev_close = None
 
-    # Method 1: Try yfinance (always attempt, ignore cooldown for realtime)
+    # Method 1: Try WebSocket Stream Engine (Ultra-low latency)
+    try:
+        from websocket_engine import get_engine, get_websocket_price
+        # Initialize engine if not started
+        get_engine()
+        ws_price = get_websocket_price(sym)
+        if ws_price is not None:
+            # We have live price, just need previous close from yfinance fast_info cache
+            current_price = ws_price
+    except ImportError:
+        pass
+
+    # Method 2: Try yfinance (always attempt for prev_close, ignore cooldown for realtime)
     try:
         import yfinance as yf
 
@@ -760,16 +871,17 @@ def get_realtime_price(symbol: str):
         # for getting both current price AND previous close
         try:
             fi = tk.fast_info
-            price = getattr(fi, "last_price", None) or getattr(
-                fi, "regularMarketPrice", None
-            )
-            if price and price > 0:
-                current_price = float(price)
-            prev = getattr(fi, "previous_close", None) or getattr(
-                fi, "regularMarketPreviousClose", None
-            )
+            
+            # Use yf price if websocket didn't provide one
+            if current_price is None:
+                price = getattr(fi, "last_price", None) or getattr(fi, "regularMarketPrice", None)
+                if price and price > 0:
+                    current_price = float(price)
+            
+            prev = getattr(fi, "previous_close", None) or getattr(fi, "regularMarketPreviousClose", None)
             if prev and prev > 0:
                 prev_close = float(prev)
+            print(f"DEBUG: YF fast_info for {yf_sym}: current={current_price}, prev={prev_close}")
         except Exception:
             pass
 
@@ -818,11 +930,12 @@ def get_realtime_price(symbol: str):
             current_price = poly_price
             if prev_close is None and poly_prev:
                 prev_close = poly_prev
+        print(f"DEBUG: Polygon fallback for {sym}: current={current_price}, prev={prev_close}")
 
     # Method 3: Fallback to Stooq (end-of-day only)
     if current_price is None:
         try:
-            df = _fetch_stooq_daily(sym)
+            df = _fetch_stooq_daily(sym, "5d")
             if not df.empty and "Close" in df.columns:
                 c = df["Close"]
                 if isinstance(c, pd.DataFrame):
@@ -840,7 +953,7 @@ def get_realtime_price(symbol: str):
     # Method 4: Fallback to Alpha Vantage
     if current_price is None:
         try:
-            df = _fetch_alpha_vantage_daily(sym)
+            df = _fetch_alpha_vantage_daily(sym, "5d")
             if not df.empty and "Close" in df.columns:
                 c = df["Close"]
                 if isinstance(c, pd.DataFrame):
@@ -861,22 +974,28 @@ def get_realtime_price(symbol: str):
 
 
 def get_latest_price(symbol: str):
-    """Get the freshest possible price for a symbol, bypassing cache."""
+    """
+    Get the freshest possible price for a symbol, bypassing cache.
+
+    Returns a positive float when a real price is available, otherwise None.
+    A price of 0 is NEVER returned: presenting 0.0 as a market price would be
+    fabricated data. Callers must treat None as "price unavailable".
+    """
     price, _ = get_realtime_price(symbol)
-    # Ensure we don't return 0 or None - return a reasonable default
-    if price is None or price <= 0:
-        # Try to get from stock info as last resort
-        try:
-            import yfinance as yf
-            tk = yf.Ticker(symbol)
-            info = tk.info
-            price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
-            if price and price > 0:
-                return float(price)
-        except:
-            pass
-        return 0.0  # Return 0 only as last resort
-    return price
+    if price is not None and price > 0:
+        return float(price)
+
+    # Last resort: stock info snapshot (still a real provider value).
+    try:
+        import yfinance as yf
+        tk = yf.Ticker(symbol)
+        info = tk.info
+        price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
+        if price and price > 0:
+            return float(price)
+    except Exception:
+        pass
+    return None
 
 
 def get_realtime_prices_batch(symbols: list):
@@ -932,8 +1051,9 @@ def get_realtime_prices_batch(symbols: list):
                     result = (float(price), float(prev) if prev and prev > 0 else None)
                     results[orig_sym] = result
                     _REALTIME_CACHE[f"rt:{orig_sym}"] = (time.time(), result)
-            except Exception:
-                pass
+                    print(f"DEBUG: Batch YF fast_info for {orig_sym}: current={price}, prev={prev}")
+            except Exception as e:
+                print(f"DEBUG: Batch YF fast_info failed for {orig_sym}: {e}")
     except Exception:
         pass
 
@@ -991,3 +1111,103 @@ try:
         get_stock = _patched_get_stock
 except Exception:
     pass
+
+
+def _normalize_options_chain(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """
+    Normalize an options chain DataFrame to a consistent schema.
+
+    Ensures the following columns are present, substituting 0 for any that are
+    missing: vol, strike, lastPrice, bid, ask, impliedVolatility, openInterest.
+
+    yfinance returns 'volume' rather than 'vol', so if 'vol' is absent but
+    'volume' is present the column is renamed.  If neither exists a zero-filled
+    'vol' column is inserted and a warning is logged.
+
+    Args:
+        df: Raw options chain DataFrame (calls or puts) from yfinance.
+        symbol: Underlying ticker symbol — used in log messages.
+
+    Returns:
+        DataFrame with a guaranteed consistent schema.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+
+    # --- Handle vol / volume column ---
+    if 'vol' not in df.columns:
+        if 'volume' in df.columns:
+            df = df.rename(columns={'volume': 'vol'})
+        else:
+            logging.warning(f"vol column missing for {symbol}; defaulting to 0")
+            df['vol'] = 0
+
+    # --- Ensure all required numeric columns exist ---
+    required_numeric = {
+        'strike': 0,
+        'lastPrice': 0,
+        'bid': 0,
+        'ask': 0,
+        'impliedVolatility': 0.0,
+        'openInterest': 0,
+    }
+    for col, default in required_numeric.items():
+        if col not in df.columns:
+            logging.warning(f"{col} column missing for {symbol}; defaulting to {default}")
+            df[col] = default
+
+    return df
+
+
+def get_options_chain(symbol: str, expiration: Optional[str] = None) -> dict:
+    """
+    Fetch live options chain data for a symbol via yfinance.
+
+    Args:
+        symbol: Ticker symbol (e.g., 'AAPL')
+        expiration: Specific expiry date (e.g., '2026-05-15'). If None, returns nearest.
+
+    Returns:
+        Dict containing calls, puts, expirations, and underlying price information.
+        On total fetch failure returns:
+            {'calls': pd.DataFrame(), 'puts': pd.DataFrame(),
+             'error': "Options chain unavailable for {symbol}. Please try again later."}
+    """
+    try:
+        tk = yf.Ticker(symbol)
+        expirations = tk.options
+
+        if not expirations:
+            logging.warning(f"No options found for {symbol}")
+            return {
+                'calls': pd.DataFrame(),
+                'puts': pd.DataFrame(),
+                'error': f"Options chain unavailable for {symbol}. Please try again later.",
+            }
+
+        # Select expiration
+        target_exp = expiration if expiration in expirations else expirations[0]
+        opt = tk.option_chain(target_exp)
+
+        # Get underlying price
+        price_data = get_realtime_price(symbol)
+        underlying_price = price_data[0] if price_data else None
+
+        return {
+            'symbol': symbol,
+            'expiration': target_exp,
+            'expirations': expirations,
+            'calls': _normalize_options_chain(opt.calls, symbol),
+            'puts': _normalize_options_chain(opt.puts, symbol),
+            'underlying_price': underlying_price,
+            'timestamp': datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logging.error(f"Error fetching options chain for {symbol}: {e}")
+        return {
+            'calls': pd.DataFrame(),
+            'puts': pd.DataFrame(),
+            'error': f"Options chain unavailable for {symbol}. Please try again later.",
+        }

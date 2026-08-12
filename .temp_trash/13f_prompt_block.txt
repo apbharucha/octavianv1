@@ -1,0 +1,48 @@
+        provenance = filing.provenance_label()
+        sim_warning = ""
+        if filing.is_simulated:
+            sim_warning = (
+                "IMPORTANT: This filing is a SIMULATED ESTIMATE used for demonstration, NOT "
+                "actual SEC data. State this clearly at the top of your analysis and do not "
+                "present the figures as real holdings.\n\n"
+            )
+        prompt = f"""
+Analyze the following comprehensive SEC 13F filing for {filing.fund_name}.
+DATA PROVENANCE: {provenance}
+Report Period: {filing.report_period} | Filing Date: {filing.filing_date}
+Total AUM: ${filing.total_aum / 1e9:.1f}B
+
+{sim_warning}ASSET CLASS ALLOCATION:
+{json.dumps(filing.asset_class_allocation, indent=2)}
+
+TOP EQUITY BUYS:
+{', '.join([f"{b.action} {b.symbol} ({b.shares_changed:,} shares, ${b.value_changed/1e6:.0f}M)" for b in filing.top_buys if b.value_changed > 0])}
+
+TOP EQUITY SELLS:
+{', '.join([f"{s.action} {s.symbol} ({abs(s.shares_changed):,} shares, ${abs(s.value_changed)/1e6:.0f}M)" for s in filing.top_sells])}
+
+OPTIONS POSITIONING:
+{options_summary}
+Key option positions: {', '.join([f"{o.contract_type} {o.symbol} ${o.strike} exp {o.expiry} ({o.contracts:,} contracts)" for o in filing.option_positions[:5]])}
+
+FIXED INCOME POSITIONING:
+Weighted average duration: {filing.bond_duration:.1f} years
+Bond breakdown: {bond_summary}
+
+COMMODITY EXPOSURE:
+{commodity_summary}
+
+SECTOR ALLOCATION:
+{json.dumps(filing.sector_allocation, indent=2)}
+
+ANALYSIS TASKS:
+1. Identify the overarching macro thesis and strategy this fund is expressing.
+2. Interpret the put/call ratio of {filing.put_call_ratio:.2f} — is this hedging, speculation, or income generation?
+3. Analyze the bond duration of {filing.bond_duration:.1f} years — what does this imply about the fund's rate expectations?
+4. Interpret the commodity exposure — what macro thesis does it support?
+5. Cross-reference the report period with macro events (Fed policy, inflation, geopolitical tensions, AI narrative).
+6. Identify the most likely profitable positions and the highest-risk bets.
+7. Provide an institutional-grade synthesis of the overall positioning.
+
+Be highly analytical, signal-dense, and directional. NO EMOJIS.
+"""
