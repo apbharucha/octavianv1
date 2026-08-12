@@ -29,6 +29,17 @@ except ImportError:
     get_realtime_price = None
     get_realtime_prices_batch = None
 
+# Background task manager — lets long-running features (Breaking Trades,
+# Daily Briefing, …) keep running in worker threads while the user navigates
+# freely, with completion notifications anywhere in the app.
+from background_tasks import (
+    drain_completed,
+    get_task,
+    reopen,
+    submit_task,
+    tasks_for_session,
+)
+
 st.set_page_config(layout="wide", page_title="Octavian Terminal", page_icon="O")
 
 # Apply professional theme
@@ -82,6 +93,107 @@ selection = st.sidebar.radio("Navigation", nav_options, label_visibility="collap
 
 st.sidebar.markdown("---")
 show_trader_selection(key_suffix="_sidebar")
+
+# --- Background task plumbing ---
+import time as _time
+
+
+def _bg_session_id():
+    """Current Streamlit session id (falls back to 'default' in bare mode)."""
+    ctx = st.runtime.scriptrunner.get_script_run_ctx()
+    return getattr(ctx, "session_id", None) or "default"
+
+
+def _launch_background(name, result_key, fn, *args, **kwargs):
+    """Kick off a long-running feature on a worker thread; return task id.
+
+    The script returns immediately — the user can navigate anywhere. When
+    the task finishes, ``result_key`` is published into session state and the
+    user is toasted (see ``_check_background_tasks``).
+    """
+    sid = _bg_session_id()
+    task_id = submit_task(
+        name, fn, session_id=sid, result_key=result_key, *args, **kwargs
+    )
+    st.session_state[f"_bg_{result_key}"] = task_id
+    return task_id
+
+
+def _check_background_tasks(force_rerun=False):
+    """Publish finished background-task results and toast the user.
+
+    Called on every rerun (force_rerun=False) and from the idle poller
+    fragment (force_rerun=True, which re-renders the whole app so the page
+    showing the result updates immediately, even with zero interaction).
+    """
+    try:
+        completed = drain_completed(_bg_session_id())
+        if not completed:
+            return
+        sid = _bg_session_id()
+        for t in completed:
+            try:
+                if t["status"] == "done" and t.get("result_key"):
+                    st.session_state[t["result_key"]] = t["result"]
+                if t["status"] == "done":
+                    st.toast(f"{t['name']} complete — results are ready.", icon="✅")
+                else:
+                    st.toast(
+                        f"{t['name']} failed: {str(t.get('error'))[:100]}", icon="⚠️"
+                    )
+            except Exception as e:
+                # Delivery failed (e.g. a session-state write error) — re-queue
+                # the task so the next rerun retries instead of losing the
+                # result silently.
+                print(f"[background-tasks] delivery failed for {t['name']}: {e}")
+                reopen(sid, t["task_id"])
+        if force_rerun:
+            try:
+                st.rerun(scope="app")
+            except TypeError:
+                st.rerun()
+    except Exception as e:
+        # Notification plumbing must never break the app (e.g. bare mode).
+        print(f"[background-tasks] notification error: {e}")
+
+
+@st.fragment(run_every=15)
+def _bg_poller():
+    """Idle poller: notifies the user the moment any background process
+    finishes, even if they haven't interacted with the app."""
+    _check_background_tasks(force_rerun=True)
+
+
+def _render_background_status():
+    """Compact live status of this session's tasks in the sidebar."""
+    tasks = tasks_for_session(_bg_session_id(), limit=6)
+    if not tasks:
+        return
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Background Tasks**")
+    now = _time.time()
+    for t in reversed(tasks):
+        if t["status"] == "running":
+            st.sidebar.markdown(
+                f"<span style='color:#e0c97f'>⏳</span> {t['name']} — running "
+                f"({int(now - t['submitted_at'])}s)",
+                unsafe_allow_html=True,
+            )
+        elif t["status"] == "done":
+            st.sidebar.markdown(
+                f"<span style='color:#00ff88'>✅</span> {t['name']} — done",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.sidebar.markdown(
+                f"<span style='color:#ff6666'>⚠️</span> {t['name']} — failed",
+                unsafe_allow_html=True,
+            )
+
+
+_check_background_tasks()
+_render_background_status()
+_bg_poller()
 
 # --- Main Content Router ---
 
@@ -333,44 +445,60 @@ if selection == "Dashboard":
             "**Professional-grade trade setups with comprehensive analysis and specifications**"
         )
 
-        # Generate breaking trades
+        # Generate breaking trades — runs in the BACKGROUND so the user can
+        # keep navigating while the full-universe scan executes. The user is
+        # notified (toast + sidebar status) the moment it completes.
+        _bt_task_id = st.session_state.get("_bg_dashboard_breaking_trades")
+        _bt_task = get_task(_bt_task_id) if _bt_task_id else None
+        _bt_running = bool(_bt_task and _bt_task["status"] == "running")
+
         if st.button(
-            "Generate Breaking Trades", type="primary", key="dash_gen_breaking"
+            "Generate Breaking Trades",
+            type="primary",
+            key="dash_gen_breaking",
+            disabled=_bt_running,
         ):
-            with st.spinner("Analyzing markets for high-confidence setups..."):
-                try:
-                    # Use the singleton generator — creating a fresh
-                    # BreakingTradesGenerator per click leaked a 20-thread
-                    # ThreadPoolExecutor every time (thread exhaustion = the
-                    # "Python quit unexpectedly" crashes). The singleton also
-                    # avoids re-initializing the 9s quant ensemble.
-                    from breaking_trades_generator import get_breaking_trades_generator
-                    gen = get_breaking_trades_generator()
-                    gen.set_min_confidence(55.0)
+            def _run_breaking_trades_scan():
+                # Singleton generator — a fresh generator per click leaked a
+                # 20-thread ThreadPoolExecutor every time (thread exhaustion =
+                # the "Python quit unexpectedly" crashes). The singleton also
+                # avoids re-initializing the 9s quant ensemble.
+                from breaking_trades_generator import get_breaking_trades_generator
 
-                    # Analyze the FULL dynamic universe — never a preset list.
-                    # The universe self-expands daily (S&P 500, NASDAQ-100,
-                    # ETF-holdings expansion) and is cached, so the scan always
-                    # reflects every currently supported instrument.
-                    from ticker_universe import get_ticker_universe
-                    tu = get_ticker_universe()
-                    watchlist = tu.get_full_universe()
+                gen = get_breaking_trades_generator()
+                gen.set_min_confidence(55.0)
 
-                    breaking_trades = gen.generate_breaking_trades(
-                        watchlist, max_trades=5
-                    )
+                # Analyze the FULL dynamic universe — never a preset list.
+                # The universe self-expands daily (S&P 500, NASDAQ-100,
+                # ETF-holdings expansion) and is cached, so the scan always
+                # reflects every currently supported instrument.
+                from ticker_universe import get_ticker_universe
 
-                    if breaking_trades:
-                        st.session_state["dashboard_breaking_trades"] = breaking_trades
-                        st.success(
-                            f"Found {len(breaking_trades)} high-confidence setups!"
-                        )
-                    else:
-                        st.warning(
-                            "No high-confidence setups found at this time. Market conditions may not be favorable."
-                        )
-                except Exception as e:
-                    st.error(f"Error generating trades: {e}")
+                tu = get_ticker_universe()
+                watchlist = tu.get_full_universe()
+
+                return gen.generate_breaking_trades(watchlist, max_trades=5)
+
+            _launch_background(
+                "Breaking Trades scan",
+                "dashboard_breaking_trades",
+                _run_breaking_trades_scan,
+            )
+            st.toast(
+                "Breaking Trades scan started in the background — you can keep "
+                "using the app and will be notified when it completes.",
+                icon="⏳",
+            )
+            st.rerun()
+
+        if _bt_running:
+            st.info(
+                "⏳ Full-universe scan is **running in the background** — "
+                "navigate freely anywhere in the app and you'll be notified "
+                "when the results are ready."
+            )
+        elif _bt_task and _bt_task["status"] == "error":
+            st.error(f"Breaking Trades scan failed: {_bt_task.get('error')}")
 
         # Display breaking trades
         if (
@@ -786,19 +914,36 @@ elif selection == "Daily Briefing":
         "Institutional-grade daily analysis: macro regimes, cross-asset signals, narrative dislocations, and trade ideas"
     )
 
+    _brief_task_id = st.session_state.get("_bg_daily_report")
+    _brief_task = get_task(_brief_task_id) if _brief_task_id else None
+    _brief_running = bool(_brief_task and _brief_task["status"] == "running")
+
+    if _brief_running:
+        st.info(
+            "⏳ Briefing is being generated in the **background** — navigate "
+            "freely anywhere in the app and you'll be notified when it's ready."
+        )
+
     col_gen1, col_gen2 = st.columns([1, 3])
     with col_gen1:
         if st.button(
-            "Generate Full Briefing", type="primary", width='stretch'
+            "Generate Full Briefing",
+            type="primary",
+            width='stretch',
+            disabled=_brief_running,
         ):
-            from daily_intelligence import get_daily_engine
+            def _run_briefing():
+                from daily_intelligence import get_daily_engine
 
-            engine = get_daily_engine()
-            with st.spinner(
-                "Fetching global market data, yield curve, sectors, vol surface, FX, commodities, crypto…"
-            ):
-                report = engine.generate_briefing()
-                st.session_state["daily_report"] = report
+                engine = get_daily_engine()
+                return engine.generate_briefing()
+
+            _launch_background("Daily Briefing", "daily_report", _run_briefing)
+            st.toast(
+                "Briefing generation started in the background — you can keep "
+                "using the app and will be notified when it completes.",
+                icon="⏳",
+            )
             st.rerun()
     with col_gen2:
         if "daily_report" in st.session_state:
