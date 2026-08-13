@@ -51,6 +51,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+import requests  # module-level for FINRA API + easy test mocking
 
 try:
     from data_sources import get_stock, get_vix, get_realtime_price
@@ -133,9 +134,15 @@ def provenance(source: str, method: str, observed: bool, confidence: float,
 #  Configuration
 # --------------------------------------------------------------------------- #
 
-_FINRA_CDN_DAILY = "https://cdn.finra.org/equity/otc/daily/{tier}{yyyymmdd}.zip"
-_FINRA_API = "https://api.finra.org/data/group/DAPI_TEST/name/OTCE"
+_FINRA_API_BASE = "https://api.finra.org/data/group/otcmarket/name/{dataset}"
+_FINRA_PARTITIONS = "https://api.finra.org/partitions/group/otcmarket/name/{dataset}"
 _FINRA_API_KEY_ENV = "FINRA_API_KEY"
+# Symbol-level summary codes: ATS_W_SMBL / OTC_W_SMBL aggregate per-symbol
+# off-exchange volume for a week (no per-firm breakdown). Firm-level codes
+# (ATS_W_SMBL_FIRM / OTC_W_SMBL_FIRM) are heavier; we use symbol level.
+_FINRA_SMBL_CODES = ("ATS_W_SMBL", "OTC_W_SMBL")
+# Tiers the weeklySummary dataset publishes under (T1/T2/OTCE/NA).
+_FINRA_TIERS = ("T1", "T2", "OTCE", "NA")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "dark_pool_state.json")
 MIN_HISTORY = 30          # minimum bars needed for a useful ticker analysis
@@ -298,8 +305,14 @@ class DarkPoolEngine:
             self._save_state()
 
     def get_settings(self) -> dict:
+        """Settings for display. The API key is NEVER returned in full — only
+        a masked fragment, so the Settings tab can't leak it via st.json."""
+        key = self.get_finra_api_key()
         s = dict(self._state.get("settings", {}) or {})
-        s["finra_api_key_set"] = bool(self.get_finra_api_key())
+        s.pop("finra_api_key", None)
+        s["finra_api_key_set"] = bool(key)
+        s["finra_api_key_masked"] = (
+            f"{key[:4]}…{key[-4:]}" if len(key) > 8 else "****" if key else "") if key else ""
         s["finra_api_key_env"] = bool(os.environ.get(_FINRA_API_KEY_ENV, ""))
         s["finra_cache_ttl_hours"] = self._finra_cache_ttl / 3600.0
         return s
@@ -311,84 +324,159 @@ class DarkPoolEngine:
             self._cap_cache.clear()
 
     def _normalize_finra_df(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Normalize FINRA API/CDN columns to [Date, Symbol, TotalVolume].
+        """Normalize FINRA API rows to [Date, Symbol, TotalVolume, Notional, Trades].
 
-        Defensively handles both the CDN csv (Date, Symbol, ShortVolume,
-        ShortExemptVolume, TotalVolume) and API JSON variants (lowercase
-        symbol / totalVolume, etc.).
+        Defensively handles the weeklySummary API (issueSymbolIdentifier /
+        totalWeeklyShareQuantity / totalNotionalSum / totalWeeklyTradeCount /
+        weekStartDate / summaryTypeCode) and the legacy CDN csv columns.
         """
         if df is None or df.empty:
             return df
         rename = {}
         for col in df.columns:
             low = str(col).strip().lower()
-            if low in ("symbol", "symbolcode", "ticker"):
+            if low in ("symbol", "symbolcode", "ticker", "issuesymbolidentifier"):
                 rename[col] = "Symbol"
-            elif low in ("totalvolume", "volume", "tradedvolume", "offexchangevolume"):
+            elif low in ("totalvolume", "volume", "tradedvolume", "offexchangevolume",
+                         "totalweeklysharequantity"):
                 rename[col] = "TotalVolume"
-            elif low in ("date", "tradedate"):
+            elif low in ("date", "tradedate", "weekstartdate"):
                 rename[col] = "Date"
+            elif low in ("totalnotionalsum", "notional"):
+                rename[col] = "Notional"
+            elif low in ("totalweeklytradecount", "tradecount", "trades"):
+                rename[col] = "Trades"
         if rename:
             df = df.rename(columns=rename)
-        for col in ("Symbol", "TotalVolume"):
+        for col in ("Symbol", "TotalVolume", "Date"):
             if col not in df.columns:
                 df[col] = np.nan
         return df
 
-    def _fetch_finra_uncached(self, yyyymmdd: Optional[str] = None,
-                              timeout: int = 8) -> Optional[pd.DataFrame]:
-        """Raw (unmemoized) FINRA fetch. See fetch_finra_otc."""
-        import io
-        import zipfile
+    def _finra_partitions(self, dataset: str = "weeklySummary",
+                          timeout: int = 12) -> Optional[List[Tuple[str, str]]]:
+        """Available (weekStartDate, tierIdentifier) partitions from FINRA.
 
-        import requests
-
-        yyyymmdd = yyyymmdd or datetime.utcnow().strftime("%Y%m%d")
-        frames = []
-
-        # 1) API with subscription key (if configured)
+        Returns the raw partition pairs (newest first) or None if the API is
+        unreachable. Callers use this to pick a week with FULL tier coverage so
+        T1/T2/OTCE/NA symbols are never silently dropped.
+        """
         api_key = self.get_finra_api_key()
-        if api_key:
-            try:
-                r = requests.get(
-                    _FINRA_API,
-                    params={"limit": 5000, "sort": "-symbol",
-                            "compare": "no", "date": yyyymmdd},
-                    headers={"Ocp-Apim-Subscription-Key": api_key,
-                             "Accept": "application/json"},
-                    timeout=timeout)
-                if r.status_code == 200:
+        if not api_key:
+            return None
+        try:
+            r = requests.get(
+                _FINRA_PARTITIONS.format(dataset=dataset),
+                params={"getDetails": "true"},
+                headers={"Ocp-Apim-Subscription-Key": api_key,
+                         "Accept": "application/json"},
+                timeout=timeout)
+            if r.status_code != 200:
+                return None
+            payload = r.json()
+            pairs: List[Tuple[str, str]] = []
+            for entry in (payload.get("availablePartitions") or []):
+                parts = entry.get("partitions") or []
+                if len(parts) >= 2:
+                    pairs.append((str(parts[0]), str(parts[1])))
+            pairs.sort(reverse=True)
+            return pairs
+        except Exception:
+            return None
+
+    def _latest_full_week(self, pairs: List[Tuple[str, str]]) -> Optional[str]:
+        """Newest weekStartDate whose published partitions cover all tiers.
+
+        Prevents silently partial coverage: if the newest week only has a T1
+        partition (common while other tiers are still being reported), fall
+        back to the most recent week where T1/T2/OTCE/NA are all present so
+        no segment of the market is dropped.
+        """
+        by_week: Dict[str, set] = {}
+        for week, tier in pairs:
+            by_week.setdefault(week, set()).add(tier)
+        for week in sorted(by_week, reverse=True):
+            if all(t in by_week[week] for t in _FINRA_TIERS):
+                return week
+        return sorted(by_week, reverse=True)[0] if by_week else None
+
+    def _fetch_finra_uncached(self, week_start: Optional[str] = None,
+                              timeout: int = 20) -> Optional[pd.DataFrame]:
+        """Raw (unmemoized) FINRA fetch via the official OTC market API.
+
+        Uses the FINRA OTC Transparency weeklySummary dataset (group
+        otcmarket), filtered to the most recent published week with full tier
+        coverage (T1/T2/OTCE/NA). Returns symbol-level rows with columns
+        [Date, Symbol, TotalVolume, Notional, Trades, summaryTypeCode] or
+        None when the source is unreachable / unauthorised. The caller MUST
+        treat absence of data as 'authoritative source unavailable' — never
+        as zero off-exchange activity.
+        """
+        api_key = self.get_finra_api_key()
+        if not api_key:
+            return None
+        try:
+            pairs = self._finra_partitions(timeout=timeout)
+            if not pairs:
+                return None
+            week = week_start or self._latest_full_week(pairs)
+            if not week:
+                return None
+            url = _FINRA_API_BASE.format(dataset="weeklySummary")
+            rows_all: List[dict] = []
+            # The API caps each response (observed ~5k rows / call); paginate
+            # with offset until a page returns fewer rows than the page size.
+            page_size = 5000
+            for code in _FINRA_SMBL_CODES:
+                offset = 0
+                while True:
+                    body = {
+                        "limit": page_size,
+                        "offset": offset,
+                        "quoteValues": True,
+                        "delimiter": "|",
+                        "fields": ["issueSymbolIdentifier", "issueName",
+                                   "totalWeeklyShareQuantity", "totalWeeklyTradeCount",
+                                   "totalNotionalSum", "weekStartDate",
+                                   "summaryTypeCode", "tierIdentifier"],
+                        "compareFilters": [
+                            {"fieldName": "weekStartDate", "fieldValue": week,
+                             "compareType": "EQUAL"},
+                            {"fieldName": "summaryTypeCode", "fieldValue": code,
+                             "compareType": "EQUAL"},
+                        ],
+                    }
+                    r = requests.post(
+                        url, json=body,
+                        headers={"Ocp-Apim-Subscription-Key": api_key,
+                                 "Accept": "application/json",
+                                 "Content-Type": "application/json"},
+                        timeout=timeout)
+                    if r.status_code != 200:
+                        break  # 400 past the end / transient failure: stop cleanly
                     payload = r.json()
                     rows = payload.get("data", payload) if isinstance(payload, dict) else payload
-                    df = pd.DataFrame(rows)
-                    if df is not None and not df.empty and "symbol" in df.columns:
-                        return self._normalize_finra_df(df)
-            except Exception:
-                pass  # fall through to the CDN path
-
-        # 2) Public daily CDN files
-        for tier in ("ATS", "NONATS"):
-            url = _FINRA_CDN_DAILY.format(tier=tier, yyyymmdd=yyyymmdd)
-            try:
-                r = requests.get(url, timeout=timeout,
-                                 headers={"User-Agent": "Mozilla/5.0"})
-                if r.status_code != 200:
-                    continue
-                with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
-                    name = zf.namelist()[0]
-                    with zf.open(name) as fh:
-                        df = pd.read_csv(fh)
-                if df is not None and not df.empty:
-                    frames.append(self._normalize_finra_df(df))
-            except Exception:
-                continue
-        if not frames:
+                    if not isinstance(rows, list) or not rows:
+                        break
+                    rows_all.extend(rows)
+                    if len(rows) < page_size:
+                        break
+                    offset += page_size
+            if not rows_all:
+                return None
+            df = pd.DataFrame(rows_all)
+            df = self._normalize_finra_df(df)
+            if df.empty or "Symbol" not in df.columns:
+                return None
+            df.attrs["finra_week"] = week
+            df.attrs["finra_tiers"] = sorted({
+                str(t) for _, t in pairs if _ == week})
+            return df
+        except Exception:
             return None
-        out = pd.concat(frames, ignore_index=True)
-        return out
 
-    def fetch_finra_otc(self, yyyymmdd: Optional[str] = None,
-                        timeout: int = 8) -> Optional[pd.DataFrame]:
+    def fetch_finra_otc(self, week_start: Optional[str] = None,
+                        timeout: int = 20) -> Optional[pd.DataFrame]:
         """Best-effort authoritative off-exchange volume from FINRA.
 
         Memoized with a TTL so the dashboard never fires repeated HTTP
@@ -396,13 +484,12 @@ class DarkPoolEngine:
         window and the result (or its absence) is reused by every caller —
         the per-symbol map AND the data-quality report.
 
-        Tries, in order:
-          1. FINRA OTC API (api.finra.org) when an Ocp-Apim-Subscription-Key is
-             configured (state file or FINRA_API_KEY env var). The API group/
-             name endpoints evolve; the configured value is treated as
-             best-effort and failures fall through gracefully.
-          2. The public daily CDN zip files (frequently WAF-blocked for
-             programmatic access — treated as best-effort).
+        Uses the FINRA OTC Transparency API (group otcmarket / weeklySummary)
+        with an Ocp-Apim-Subscription-Key (state file or FINRA_API_KEY env
+        var), filtered to the most recent published week with full tier
+        coverage (T1/T2/OTCE/NA). The API publishes weekly summaries with a
+        reporting lag (typically 1-4 weeks); the dashboard displays this lag
+        honestly in the Data Quality Center.
 
         Returns a DataFrame with [Date, Symbol, TotalVolume] (plus whatever
         columns the provider returned) or None when the source is unreachable
@@ -420,7 +507,7 @@ class DarkPoolEngine:
                 ts, val = self._finra_cache
                 if now - ts < self._finra_cache_ttl:
                     return val
-            df = self._fetch_finra_uncached(yyyymmdd, timeout)
+            df = self._fetch_finra_uncached(week_start, timeout)
             self._finra_cache = (now, df)
             return df
 
@@ -442,8 +529,13 @@ class DarkPoolEngine:
         out: Dict[str, float] = {}
         for _, row in df.iterrows():
             sym = str(row.get("Symbol", "")).strip().upper()
+            if not sym or sym in ("NAN", "NONE", "NULL"):
+                continue
             try:
-                out[sym] = out.get(sym, 0.0) + float(row.get(vol_col, 0) or 0)
+                val = row.get(vol_col, 0) or 0
+                if val is None or (isinstance(val, float) and math.isnan(val)):
+                    continue
+                out[sym] = out.get(sym, 0.0) + float(val)
             except Exception:
                 continue
         return out or None
@@ -651,16 +743,18 @@ class DarkPoolEngine:
                 observed=False, confidence=0.55,
                 note="Off-exchange volumes are modeled estimates, not exchange-reported prints."
                      if not finra_observed else
-                     "Off-exchange volume partially observed via FINRA OTC transparency.").to_dict(),
+                     "Off-exchange volume anchored to observed FINRA OTC transparency weekly "
+                     "figures where available; modeled for daily granularity.").to_dict(),
             "direction": provenance(
                 "heuristic_classification", "return + VWAP-position based buy/sell estimate",
                 observed=False, confidence=0.45,
                 note="Directional split is an estimate, not actual trade prints.").to_dict(),
             "finra": provenance(
-                "finra_otc_transparency", "daily off-exchange volume (ATS + non-ATS)",
+                "finra_otc_transparency_api", "weekly off-exchange volume (ATS + non-ATS) "
+                "via OTC market API, latest published week",
                 observed=True, confidence=0.9,
-                note="FINRA data present for this symbol." if finra_observed
-                     else "FINRA OTC data unavailable for this symbol.").to_dict(),
+                note="FINRA data present for this symbol (weekly granularity with reporting lag)."
+                     if finra_observed else "FINRA OTC data unavailable for this symbol.").to_dict(),
         }
 
         return {
@@ -1401,6 +1495,8 @@ class DarkPoolEngine:
         sources = []
         finra = self.fetch_finra_otc() if not _SKIP_NETWORK_TESTS else None
         finra_ok = finra is not None and not finra.empty
+        finra_week = getattr(finra, "attrs", {}).get("finra_week")
+        finra_tiers = getattr(finra, "attrs", {}).get("finra_tiers")
 
         # consolidated source status
         cons_ok = False
@@ -1411,16 +1507,21 @@ class DarkPoolEngine:
             pass
 
         sources.append({
-            "name": "FINRA OTC Transparency",
-            "role": "Authoritative off-exchange volume (ATS + non-ATS)",
+            "name": "FINRA OTC Transparency API",
+            "role": "Authoritative off-exchange volume (ATS + non-ATS), weekly per-symbol",
             "status": "OK — observed" if finra_ok else "UNAVAILABLE — falling back to model",
             "observed": finra_ok,
             "last_checked": datetime.utcnow().isoformat() + "Z",
-            "notes": ("Official daily files for ATS and non-ATS off-exchange volume. "
-                      "Programmatic access is frequently rate-limited or blocked; "
-                      "when unavailable the engine clearly labels modeled estimates. "
-                      "Configure a FINRA OTC API key in Settings for the API path.")
-                      if not finra_ok else "Authoritative off-exchange volume available.",
+            "notes": ("Official OTC market API (group otcmarket / weeklySummary). Requires a "
+                      "FINRA API key (configured in Settings). Publishes weekly summaries "
+                      "with a reporting lag (1-4 weeks); the latest published week with full "
+                      "tier coverage is used and the lag is displayed honestly. When "
+                      "unavailable the engine clearly labels modeled estimates.")
+                      if not finra_ok else (
+                        "Authoritative weekly off-exchange volume available for "
+                        f"week {finra_week} (tiers: {', '.join(finra_tiers or [])}). "
+                        "Weekly granularity with the standard FINRA reporting lag; daily "
+                        "series are modeled around the observed weekly anchor."),
         })
         sources.append({
             "name": "Consolidated market data (Yahoo Finance)",
@@ -1467,12 +1568,18 @@ class DarkPoolEngine:
             "===========\n"
             "1. CONSOLIDATED DATA (OBSERVED): Daily OHLCV from the platform market-data "
             "layer (Yahoo Finance primary, with Stooq/Polygon/Alpha Vantage fallbacks).\n\n"
-            "2. OFF-EXCHANGE SHARE (MODELED): Off-exchange volume is not directly observable "
-            "in consolidated daily data. The engine estimates the share of volume executed "
-            "off-exchange using a sector baseline (30-38% depending on sector) adjusted by "
-            "the trailing volume trend. Outputs are clipped to a defensible 12-62% range. "
-            "When FINRA OTC Transparency files are reachable, their ATS + non-ATS volume is "
-            "used as the authoritative anchor for the symbols they cover.\n\n"
+            "2. OFF-EXCHANGE SHARE (OBSERVED + MODELED): The engine first attempts the FINRA "
+            "OTC Transparency API (group otcmarket / weeklySummary) which publishes "
+            "authoritative ATS + non-ATS off-exchange volume per symbol for each reporting "
+            "week. Where a symbol is present in the latest published week, that observed "
+            "weekly volume is the anchor (labeled OBSERVED). For daily granularity the engine "
+            "models the share of consolidated volume executed off-exchange using a sector "
+            "baseline (30-38% depending on sector) adjusted by the trailing volume trend, "
+            "calibrated toward the observed weekly anchor; outputs are clipped to a "
+            "defensible 12-62% range. FINRA publishes weekly with a 1-4 week reporting lag — "
+            "the latest published week is used and the lag is shown in the Data Quality "
+            "Center. When the API is unreachable the off-exchange figures are modeled only "
+            "and clearly labeled.\n\n"
             "3. DIRECTION (ESTIMATED): Buy/sell imbalance is a heuristic based on daily "
             "return and price position relative to VWAP. It is an ESTIMATE — not trade "
             "prints. Actual order flow is not available from free data sources.\n\n"

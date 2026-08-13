@@ -316,9 +316,10 @@ def test_data_quality_report(engine):
 
 def test_methodology_documented(engine):
     m = engine.methodology()
-    assert "OFF-EXCHANGE SHARE (MODELED)" in m
+    assert "OFF-EXCHANGE SHARE (OBSERVED + MODELED)" in m
     assert "PROVENANCE" in m
     assert "DIRECTION (ESTIMATED)" in m
+    assert "FINRA OTC Transparency API" in m
 
 
 def test_regime_detection_offline(engine):
@@ -416,3 +417,239 @@ def test_percentile_windows_are_honest(engine):
     assert h["offex_pctile_5d"] is not None
     assert h["offex_pctile_20d"] is not None
     assert h["offex_pctile_60d"] is not None
+
+
+# --------------------------------------------------------------------------- #
+#  FINRA OTC API provider (real endpoint format, mocked HTTP — offline-safe)
+# --------------------------------------------------------------------------- #
+
+
+def _fake_finra_response():
+    """Shape of the real weeklySummary API rows (per-symbol, ATS + OTC)."""
+    return [
+        {"issueSymbolIdentifier": "AAPL", "issueName": "Apple Inc",
+         "totalWeeklyShareQuantity": 95_000_000, "totalWeeklyTradeCount": 200_000,
+         "totalNotionalSum": 1.5e10, "weekStartDate": "2026-07-20",
+         "summaryTypeCode": "ATS_W_SMBL", "tierIdentifier": "T1"},
+        {"issueSymbolIdentifier": "AAPL", "issueName": "Apple Inc",
+         "totalWeeklyShareQuantity": 60_000_000, "totalWeeklyTradeCount": 150_000,
+         "totalNotionalSum": 9e9, "weekStartDate": "2026-07-20",
+         "summaryTypeCode": "OTC_W_SMBL", "tierIdentifier": "T1"},
+        {"issueSymbolIdentifier": "MSFT", "issueName": "Microsoft Corp",
+         "totalWeeklyShareQuantity": 40_000_000, "totalWeeklyTradeCount": 90_000,
+         "totalNotionalSum": 8e9, "weekStartDate": "2026-07-20",
+         "summaryTypeCode": "ATS_W_SMBL", "tierIdentifier": "T1"},
+    ]
+
+
+def test_finra_provider_normalizes_and_aggregates(engine, monkeypatch):
+    """The real API path: partitions -> weeklySummary rows -> per-symbol map.
+
+    The provider must (1) discover the latest week, (2) POST for ATS + OTC
+    symbol-level summaries, (3) normalize fields, (4) sum ATS + OTC per symbol.
+    """
+    import dark_pool_engine as dpe
+
+    calls = []
+
+    class FakeResp:
+        def __init__(self, status, payload):
+            self.status_code = status
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        calls.append(("GET", url))
+        return FakeResp(200, {"availablePartitions": [
+            {"partitions": ["2026-07-20", "T1"]},
+            {"partitions": ["2026-07-13", "T1"]}]})
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        calls.append(("POST", url, json.get("compareFilters") if json else None))
+        code = json["compareFilters"][1]["fieldValue"]
+        rows = [r for r in _fake_finra_response() if r["summaryTypeCode"] == code]
+        return FakeResp(200, rows)
+
+    monkeypatch.setattr(dpe.requests, "get", fake_get)
+    monkeypatch.setattr(dpe.requests, "post", fake_post)
+
+    e = DarkPoolEngine(state_file=os.path.join(tempfile.mkdtemp(), "s.json"),
+                       fetch_fn=engine._fetch_fn)
+    e.set_finra_api_key("test-key")
+    e.clear_caches()
+
+    df = e.fetch_finra_otc()
+    assert df is not None
+    assert not df.empty
+    # normalized columns present
+    for col in ("Symbol", "TotalVolume", "Date"):
+        assert col in df.columns
+    # both ATS and OTC calls made, plus partitions
+    assert any(c[0] == "GET" for c in calls)
+    assert sum(1 for c in calls if c[0] == "POST") == 2
+
+    vol_map = e._finra_volume_map()
+    assert vol_map is not None
+    # AAPL = ATS 95M + OTC 60M = 155M
+    assert abs(vol_map["AAPL"] - 155_000_000) < 1.0
+    assert vol_map["MSFT"] == 40_000_000
+    assert "AA" not in vol_map  # unknown symbols excluded
+
+
+def test_finra_provider_returns_none_without_key(engine, monkeypatch):
+    import dark_pool_engine as dpe
+
+    called = []
+
+    def fake_get(*a, **k):
+        called.append(1)
+        return None
+
+    monkeypatch.setattr(dpe.requests, "get", fake_get)
+    e = DarkPoolEngine(state_file=os.path.join(tempfile.mkdtemp(), "s.json"),
+                       fetch_fn=engine._fetch_fn)
+    assert e.fetch_finra_otc() is None  # no key -> no API call -> None
+    assert called == []
+
+
+def test_latest_full_week_prefers_full_tier_coverage(engine):
+    """Newest week is skipped when it lacks full tier coverage, so T2/OTCE/NA
+    symbols are never silently dropped from the fetch."""
+    e = DarkPoolEngine(state_file=os.path.join(tempfile.mkdtemp(), "s.json"),
+                       fetch_fn=engine._fetch_fn)
+    pairs = [
+        ("2026-07-20", "T1"),          # newest week: only T1 published yet
+        ("2026-07-13", "T1"),
+        ("2026-07-06", "T1"),
+        ("2026-07-06", "T2"),
+        ("2026-07-06", "OTCE"),
+        ("2026-07-06", "NA"),
+    ]
+    week = e._latest_full_week(pairs)
+    assert week == "2026-07-06"  # not the T1-only 2026-07-20
+
+
+def test_finra_week_and_tiers_recorded(engine, monkeypatch):
+    """fetch_finra_otc records the week + tier coverage on df.attrs for the
+    Data Quality Center."""
+    import dark_pool_engine as dpe
+
+    class FakeResp2:
+        def __init__(self, status_code=200, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        rows = _fake_finra_response()
+        code = json["compareFilters"][1]["fieldValue"]
+        return FakeResp2(payload=[r for r in rows if r["summaryTypeCode"] == code])
+
+    monkeypatch.setattr(dpe.requests, "get",
+                        lambda *a, **k: FakeResp2(payload={"availablePartitions": [
+                            {"partitions": ["2026-07-20", "T1"]},
+                            {"partitions": ["2026-07-06", "T1"]},
+                            {"partitions": ["2026-07-06", "T2"]},
+                            {"partitions": ["2026-07-06", "OTCE"]},
+                            {"partitions": ["2026-07-06", "NA"]}]}))
+    monkeypatch.setattr(dpe.requests, "post", fake_post)
+
+    e = DarkPoolEngine(state_file=os.path.join(tempfile.mkdtemp(), "s.json"),
+                       fetch_fn=engine._fetch_fn)
+    e.set_finra_api_key("test-key")
+    e.clear_caches()
+    df = e.fetch_finra_otc()
+    assert df is not None
+    assert df.attrs.get("finra_week") == "2026-07-06"
+    assert set(df.attrs.get("finra_tiers", [])) >= {"T1", "T2", "OTCE", "NA"}
+
+
+def test_settings_never_return_full_api_key(engine):
+    engine.set_finra_api_key("abcd1234wxyz5678")
+    s = engine.get_settings()
+    assert "finra_api_key" not in s  # never the plaintext key
+    assert s["finra_api_key_set"] is True
+    assert s["finra_api_key_masked"] == "abcd…5678"
+    engine.set_finra_api_key("")
+    s = engine.get_settings()
+    assert s["finra_api_key_masked"] == ""
+
+
+def test_finra_volume_map_skips_nan(engine, monkeypatch):
+    """Null/NaN volume rows must not poison the per-symbol sum."""
+    import dark_pool_engine as dpe
+
+    rows = [
+        {"issueSymbolIdentifier": "AAPL", "totalWeeklyShareQuantity": 100.0,
+         "weekStartDate": "2026-07-06", "summaryTypeCode": "ATS_W_SMBL"},
+        {"issueSymbolIdentifier": "AAPL", "totalWeeklyShareQuantity": None,
+         "weekStartDate": "2026-07-06", "summaryTypeCode": "OTC_W_SMBL"},
+        {"issueSymbolIdentifier": None, "totalWeeklyShareQuantity": 999.0,
+         "weekStartDate": "2026-07-06", "summaryTypeCode": "ATS_W_VOL_STATS"},
+    ]
+
+    class FakeResp2:
+        def __init__(self, status_code=200, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    def fake_get(*a, **k):
+        return FakeResp2(payload={"availablePartitions": [{"partitions": ["2026-07-06", "T1"]}]})
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        code = json["compareFilters"][1]["fieldValue"]
+        return FakeResp2(payload=[r for r in rows if r["summaryTypeCode"] == code])
+
+    monkeypatch.setattr(dpe.requests, "get", fake_get)
+    monkeypatch.setattr(dpe.requests, "post", fake_post)
+    e = DarkPoolEngine(state_file=os.path.join(tempfile.mkdtemp(), "s.json"),
+                       fetch_fn=engine._fetch_fn)
+    e.set_finra_api_key("test-key")
+    e.clear_caches()
+    vm = e._finra_volume_map()
+    assert vm is not None
+    assert vm.get("AAPL") == 100.0  # NaN row skipped, no NaN poison
+    assert "NAN" not in vm
+
+
+def test_finra_observed_anchors_ticker_report(engine, monkeypatch):
+    """When FINRA data is present the report marks finra_observed and records
+    the observed weekly volume; provenance is honest (OBSERVED category)."""
+    import dark_pool_engine as dpe
+
+    class FakeResp2:
+        def __init__(self, status_code=200, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        code = json["compareFilters"][1]["fieldValue"]
+        rows = [r for r in _fake_finra_response() if r["summaryTypeCode"] == code
+                and r["issueSymbolIdentifier"] == "AAPL"]
+        return FakeResp2(payload=rows)
+
+    monkeypatch.setattr(dpe.requests, "get",
+                        lambda *a, **k: FakeResp2(payload={"availablePartitions": [
+                            {"partitions": ["2026-07-20", "T1"]}]}))
+    monkeypatch.setattr(dpe.requests, "post", fake_post)
+
+    e = DarkPoolEngine(state_file=os.path.join(tempfile.mkdtemp(), "s.json"),
+                       fetch_fn=engine._fetch_fn)
+    e.set_finra_api_key("test-key")
+    e.clear_caches()
+
+    r = e.analyze_ticker("AAPL")
+    assert r["ok"] is True
+    assert r["finra_observed"] is True
+    assert r["finra_offexchange_vol"] == 155_000_000
+    assert r["provenance"]["finra"]["category"] == "OBSERVED"

@@ -1304,15 +1304,18 @@ def _tab_settings(engine, mode: str) -> None:
         st.markdown("**FINRA OTC Transparency API**")
         settings = engine.get_settings()
         has_key = settings.get("finra_api_key_set", False)
+        masked = settings.get("finra_api_key_masked", "")
         st.markdown(
             f"Key configured: {'YES' if has_key else 'NO'}"
-            f"{' (from environment)' if settings.get('finra_api_key_env') else ''}")
+            f"{' (from environment)' if settings.get('finra_api_key_env') else ''}"
+            + (f" — {masked}" if masked else ""))
         key_input = st.text_input(
             "FINRA OTC API key",
             type="password",
             key="dp_set_finra_key",
             help="Free registration: https://developer.finra.org. Leave blank to keep the "
-                 "existing key.",
+                 "existing key. The key is stored locally in dark_pool_state.json "
+                 "(gitignored) and is never displayed back in full.",
         )
         b1, b2 = st.columns(2)
         with b1:
@@ -1369,7 +1372,7 @@ def _tab_settings(engine, mode: str) -> None:
 
     if mode == "Institutional":
         st.markdown("---")
-        st.markdown("**Raw settings**")
+        st.markdown("**Settings (API key masked)**")
         st.json(settings)
 
 
