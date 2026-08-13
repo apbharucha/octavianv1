@@ -69,6 +69,7 @@ nav_options = [
     "Chart Analysis",
     "Intelligence Center",
     "Market Heartbeat",
+    "Dark Pool Intelligence",
     "Institutional 13F & SEC Filings",
     "Financial Model Generator",
     "Target Probability",
@@ -898,6 +899,11 @@ elif selection == "Trader Profile":
 elif selection == "Market Heartbeat":
     from market_heartbeat_system import show_market_heartbeat_tab
     show_market_heartbeat_tab()
+
+elif selection == "Dark Pool Intelligence":
+    from dark_pool_ui import render_dark_pool_dashboard
+
+    render_dark_pool_dashboard()
 
 elif selection == "Financial Model Generator":
     # Merged Wall Street-grade modeling suite: DCF + LBO + M&A Accretion/Dilution
