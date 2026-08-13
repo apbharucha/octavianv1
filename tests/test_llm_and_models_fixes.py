@@ -1043,3 +1043,98 @@ def test_v12_ambiguous_ticker_still_resolves_with_own_phrase(q, tok):
     from financial_llm_engine import expand_query_intents
     _i, tickers, _s = expand_query_intents(q)
     assert tok in [str(t).upper() for t in tickers], (q, tickers)
+
+
+# ---------------------------------------------------------------------------
+# v13: region codes (EU/US/UK/...) must NEVER resolve as tickers, and
+# 'safe haven' phrasing must resolve the subject security (TGT).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("q, leaked", [
+    # EU is the European Union here, NOT the Eurus Energy ticker
+    ("Is TGT a safe haven if an EU energy crisis?", ["EU"]),
+    ("EU energy crisis impact on European utilities", ["EU"]),
+    ("an EU energy crisis", ["EU"]),
+    ("EU and US relations", ["EU", "US"]),
+    ("what happens to TGT if the EU imposes tariffs", ["EU"]),
+    ("EU stock price and Eurus Energy outlook", ["EU"]),
+    ("buy EU shares today", ["EU"]),
+])
+def test_v13_region_codes_never_resolve_as_tickers(q, leaked):
+    """Region codes that happen to be universe tickers (EU=Eurus Energy,
+    US=US Global GO Gold) mean the REGION in user queries — 'EU energy
+    crisis', 'EU and US relations' — and must never resolve as securities.
+    This was the exact small-bucket eval failure: 'Is TGT a safe haven if an
+    EU energy crisis?' extracted EU and never discussed TGT."""
+    from financial_llm_engine import expand_query_intents
+    _i, tickers, _s = expand_query_intents(q)
+    uppers = [str(t).upper() for t in tickers]
+    for tok in leaked:
+        assert tok not in uppers, (q, tickers)
+
+
+def test_v13_safe_haven_query_resolves_subject_not_region():
+    """The reported eval failure: the query must resolve TGT (the subject)
+    and never EU (the region) — so the analysis actually discusses Target."""
+    from financial_llm_engine import expand_query_intents
+    _i, tickers, _s = expand_query_intents(
+        "Is TGT a safe haven if an EU energy crisis?")
+    uppers = [str(t).upper() for t in tickers]
+    assert "TGT" in uppers, tickers
+    assert "EU" not in uppers, tickers
+
+
+@pytest.mark.parametrize("q, want", [
+    ("Is TGT a safe haven if an EU energy crisis?", ["TGT"]),
+    ("TGT as a safe haven during the crisis", ["TGT"]),
+    ("safe haven for TGT", ["TGT"]),
+    ("what happens to TGT if the EU imposes tariffs", ["TGT"]),
+])
+def test_v13_safe_haven_phrasing_resolves_ticker(q, want):
+    """'safe haven' security framing must resolve the named ticker (TGT),
+    while region codes in the same sentence stay regions."""
+    from financial_llm_engine import expand_query_intents
+    _i, tickers, _s = expand_query_intents(q)
+    uppers = [str(t).upper() for t in tickers]
+    assert sorted(want) == sorted(uppers), (q, tickers)
+
+
+def test_v13_region_code_with_explicit_security_phrasing():
+    """Even explicit security framing on a region code must not silently
+    substitute the obscure universe ticker — the region meaning wins."""
+    from financial_llm_engine import expand_query_intents
+    for q in ("buy EU shares today", "EU stock analysis", "outlook for US"):
+        _i, tickers, _s = expand_query_intents(q)
+        uppers = [str(t).upper() for t in tickers]
+        assert not any(t in uppers for t in ("EU", "US")), (q, tickers)
+
+
+def test_v13_safe_haven_query_gets_direct_answer():
+    """The reported eval failure must produce a response that ANSWERS the
+    safe-haven question about TGT — not a generic energy briefing that never
+    discusses the named security."""
+    from financial_llm_engine import (generate_financial_analysis,
+                                      _is_focused_event_question)
+    from chatbot_eval.pipeline import mocked_pipeline
+    q = "Is TGT a safe haven if an EU energy crisis?"
+    _i, tickers, _s = expand_query_intents(q)
+    assert "TGT" in [str(t).upper() for t in tickers]
+    assert "EU" not in [str(t).upper() for t in tickers]
+    # Must route to the event briefing (which now carries the direct answer)
+    assert _is_focused_event_question(q, _i, tickers) is True
+    with mocked_pipeline():
+        r = generate_financial_analysis(q) or ""
+    assert "Direct answer" in r, "response must include the direct safe-haven verdict"
+    assert "TGT" in r, "response must discuss TGT"
+    assert "consumer" in r.lower(), "verdict must be grounded in sector economics"
+    assert "safe haven" in r.lower(), "response must answer the safe-haven ask"
+
+
+def test_v13_eu_energy_crisis_alone_is_event_question():
+    """'EU energy crisis' alone (no named security) must still route to the
+    geopolitical briefing — the region-code fix must not break pure event asks."""
+    from financial_llm_engine import _is_focused_event_question
+    q = "What happens to markets if there is an EU energy crisis?"
+    _i, tickers, _s = expand_query_intents(q)
+    assert "EU" not in [str(t).upper() for t in tickers]
+    assert _is_focused_event_question(q, _i, tickers) is True

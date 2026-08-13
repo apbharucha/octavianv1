@@ -98,6 +98,16 @@ _AMBIGUOUS_TICKER_CONCEPTS = {
     "SIX": "Six Flags",  # "six scenarios" vs SIX ticker
 }
 
+# Geographic / regional codes that ALSO happen to be real universe tickers
+# ("EU" = Eurus Energy, "US" = US Global GO Gold, "UK" = a legacy listing).
+# In user queries these mean the region — "EU energy crisis", "US Treasury
+# yields", "EU and US relations" — essentially never the obscure ticker, so
+# they are hard-blocked exactly like semantic concepts. A user who truly
+# wants the security must say "Eurus Energy" or use explicit security
+# framing ("EU stock") — which the block still honors by NOT silently
+# substituting a different asset.
+_REGION_CODES = frozenset({"EU", "US", "UK", "CN", "JP", "DE", "FR", "CA"})
+
 # Common English words (2-6 letters) that happen to be real universe tickers.
 # Typed in lowercase inside prose ("the bar is high", "net margin", "target
 # price", "what do they cost") they are prose, NOT securities — they resolve
@@ -260,6 +270,11 @@ def _is_equity_reference(query: str, token: str, word_boundary: bool = False) ->
         f"moat of {tl}", f"competitive moat of {tl}", f"{tl} moat",
         f"{tl} competitive moat", f"{tl} competitive", f"moat {tl}",
         f"{tl}'s economics",
+        # Safe-haven / defensive framing: "Is TGT a safe haven if an EU
+        # energy crisis?", "TGT as a safe haven", "safe haven for TGT".
+        f"is {tl} a safe haven", f"is {tl} a haven", f"{tl} as a safe haven",
+        f"safe haven for {tl}", f"safe haven {tl}", f"{tl} a safe haven",
+        f"haven for {tl}", f"defensive play in {tl}", f"defensive play {tl}",
         # Dividend framing: "Does LOW pay a dividend?", "Has LOW been growing
         # its dividend?", "LOW's dividend yield".
         f"does {tl} pay", f"{tl} pay a", f"{tl} pays", f"{tl} been growing",
@@ -1058,7 +1073,7 @@ def expand_query_intents(query: str):
                      "FIRST", "SECOND", "THIRD", "FOURTH", "FIFTH", "HALF"}
     for low_t in re.findall(r'\b[a-z]{2,5}\b', query):
         up = low_t.upper()
-        if up in _NUMBER_WORDS or up in _SEMANTIC_CONCEPTS:
+        if up in _NUMBER_WORDS or up in _SEMANTIC_CONCEPTS or up in _REGION_CODES:
             continue
         # Core stopwords that double as genuine universe tickers (ARE, ALL,
         # AM, CAN, PLAY, RUN, ...) resolve ONLY with explicit security
@@ -1142,6 +1157,10 @@ def expand_query_intents(query: str):
         # Financial / semantic concepts (CAPEX, FCF, GPU, CUDA, MOAT, ...) are
         # NEVER securities — drop unconditionally.
         if t_clean in _SEMANTIC_CONCEPTS:
+            continue
+        # Geographic / regional codes (EU/US/UK/...) are regions in user
+        # queries, never the obscure universe tickers that share their name.
+        if t_clean in _REGION_CODES:
             continue
         # Ambiguous words that are both tickers and concepts: keep only when
         # the query clearly references them as securities.
@@ -1561,7 +1580,8 @@ def _infer_deep_dive_subject(query: str):
     except Exception:
         known = set()
     for t in re.findall(r"\b[A-Z][A-Z0-9]{0,5}\b", q):
-        if t.isdigit() or t in _ENTITY_STOPWORDS or t in _SEMANTIC_CONCEPTS:
+        if (t.isdigit() or t in _ENTITY_STOPWORDS or t in _SEMANTIC_CONCEPTS
+                or t in _REGION_CODES):
             continue
         if t in known and t not in _AMBIGUOUS_TICKER_CONCEPTS:
             return t
@@ -1643,7 +1663,8 @@ def _is_focused_event_question(query: str, intents, tickers) -> bool:
     # week" -> AAPL/ADBE/...) must NOT count — a sector event ask is still an
     # event ask even though its expanded lookup list is long.
     explicit = [t for t in re.findall(r"\b[A-Z]{1,6}\b", query or "")
-                if t not in _ENTITY_STOPWORDS and not t.isdigit()]
+                if t not in _ENTITY_STOPWORDS and not t.isdigit()
+                and t not in _REGION_CODES and t not in _SEMANTIC_CONCEPTS]
     if len([t for t in explicit if not _is_market_instrument(t)]) >= 2:
         return False
     if len(q) > 320:
@@ -3865,6 +3886,74 @@ def _build_geopolitical_briefing(query, intents, tickers, sectors, live_data, co
                              f"check its sector exposure against the channels above.")
             else:
                 lines.append(f"- **{t}** — assess exposure through the channels above.")
+
+    # ── Direct safe-haven / defensive assessment ────────────────────────────
+    # "Is TGT a safe haven if an EU energy crisis?" must be ANSWERED, not just
+    # listed. Reverse-lookup each named ticker's sector in the universe and
+    # grade its defensiveness against the transmission channels. Honest
+    # heuristic — grounded in sector economics, never fabricated data.
+    if any(w in q for w in ("safe haven", "haven", "defensive", "defensiveness")) and tickers:
+        try:
+            from ticker_universe import get_ticker_universe
+            _sector_of = {}
+            _all_sec = get_ticker_universe().get_all_sectors()
+            for _sec, _tks in _all_sec.items():
+                for _t in _tks:
+                    _sector_of.setdefault(str(_t).upper(), _sec)
+        except Exception:
+            _sector_of = {}
+
+        # Sector defensiveness grade: how a sector's cash flows hold up in an
+        # energy-driven supply shock + stress-risk-premium environment.
+        _DEFENSIVE_SECTORS = {
+            "consumer_staples": "defensive", "utilities": "defensive",
+            "healthcare": "defensive", "real_estate": "semi-defensive",
+            "communication": "semi-defensive", "agriculture": "semi-defensive",
+        }
+        _CYCLICAL_SECTORS = {
+            "energy": "directly exposed", "materials": "directly exposed",
+            "industrials": "directly exposed", "mining": "directly exposed",
+            "steel": "directly exposed", "copper": "directly exposed",
+            "shipping": "directly exposed", "silver": "directly exposed",
+            "gold": "haven-adjacent", "uranium": "directly exposed",
+        }
+        lines += ["", "**Direct answer to your safe-haven question:**"]
+        for t in tickers[:5]:
+            if _is_market_instrument(t):
+                continue
+            sec = _sector_of.get(str(t).upper(), "")
+            grade = (_DEFENSIVE_SECTORS.get(sec) or _CYCLICAL_SECTORS.get(sec)
+                     or ("consumer" if sec == "consumer" else "mixed"))
+            if grade == "defensive":
+                verdict = (f"**{t}** is in the {sec.replace('_', ' ')} sector — a "
+                           f"relatively DEFENSIVE profile. In an energy-driven crisis, its "
+                           f"essential-demand revenue holds up better than cyclicals, though it "
+                           f"still faces margin pressure from energy input costs and a risk-premium "
+                           f"drag on the multiple. It can act as a relative haven, not an absolute one.")
+            elif grade == "semi-defensive":
+                verdict = (f"**{t}** ({sec.replace('_', ' ')} sector) is a SEMI-defensive name — "
+                           f"recession-resistant cash flows cushion it versus cyclicals, but it is "
+                           f"not a true haven: rate and inflation channels still hit its multiple.")
+            elif grade == "haven-adjacent":
+                verdict = (f"**{t}** ({sec.replace('_', ' ')} sector) behaves as a haven-adjacent "
+                           f"asset — stress typically lifts it on risk-off flows, though real-rate "
+                           f"moves can offset the bid.")
+            elif grade == "directly exposed":
+                verdict = (f"**{t}** ({sec.replace('_', ' ')} sector) is DIRECTLY EXPOSED to this "
+                           f"scenario — its cash flows and margins move with the energy/commodity "
+                           f"channels above, making it a source of risk rather than a haven.")
+            elif grade == "consumer":
+                verdict = (f"**{t}** (consumer sector) is a MIDDLE-ground name: discretionary "
+                           f"spending is sensitive to an energy shock and inflation, so it is not a "
+                           f"classic safe haven, but staples exposure within the name provides some "
+                           f"defensive ballast versus pure cyclicals.")
+            else:
+                verdict = (f"**{t}** — sector data not classified in the universe; treat exposure "
+                           f"through the transmission channels above rather than assuming a haven profile.")
+            lines.append(verdict)
+        lines.append("*This is a sector-economics heuristic (essential-demand vs energy-sensitive "
+                     "cash flows), not a company-level fundamental verdict — check the specific "
+                     "name's balance sheet and cost structure before acting.*")
 
     lines += [
         "",
