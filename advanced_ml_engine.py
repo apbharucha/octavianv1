@@ -13,6 +13,8 @@ from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.neural_network import MLPRegressor
 import warnings
+import threading
+import time
 from typing import List, Dict, Any, Tuple
 import logging
 
@@ -21,6 +23,29 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("OctavianML")
 
 warnings.filterwarnings('ignore')
+
+# --- Per-symbol analysis cache ---
+# analyze_symbol_ensemble re-fits LSTM + Transformer + MLP + RF + GBM on
+# EVERY call (~20s), so repeated analyses of identical price data (re-runs,
+# multiple target checks on the same symbol) were paying the full training
+# cost each time. A fingerprint-keyed, TTL-bounded cache makes identical
+# inputs resolve instantly while genuinely new data still gets a fresh model.
+_ANALYSIS_CACHE: Dict[str, Any] = {}
+_ANALYSIS_CACHE_LOCK = threading.Lock()
+_ANALYSIS_CACHE_TTL = 600.0   # seconds
+_ANALYSIS_CACHE_MAX = 512
+
+
+def _analysis_fingerprint(df: pd.DataFrame, symbol: str) -> str:
+    """Stable fingerprint of the actual price data feeding the model."""
+    close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    if close.empty:
+        return f"{symbol}:empty"
+    close = close.round(4)
+    tail = close.tail(120).values
+    digest = __import__("hashlib").md5(tail.tobytes()).hexdigest()[:16]
+    return f"{symbol}:{len(close)}:{digest}"
+
 
 # --- PyTorch Deep Learning Models ---
 
@@ -95,7 +120,7 @@ class AdvancedEnsembleEngine:
         self.transformer_model = MarketTransformer(input_dim=8).to(self.device)
         
         # Initialize Scikit-Learn Models (Deep Dense & Tree-based)
-        self.mlp_model = MLPRegressor(hidden_layer_sizes=(100, 50, 25), max_iter=200, random_state=42, alpha=0.01) # Added L2 Regularization
+        self.mlp_model = MLPRegressor(hidden_layer_sizes=(100, 50, 25), max_iter=120, random_state=42, alpha=0.01) # Added L2 Regularization
         self.rf_model = RandomForestRegressor(n_estimators=100, max_depth=8, min_samples_leaf=4, random_state=42) # Reduced depth, added min_samples
         self.gbm_model = GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, max_depth=4, min_samples_leaf=4, random_state=42) # Reduced depth, added min_samples
         
@@ -346,6 +371,14 @@ class AdvancedEnsembleEngine:
                 "model_breakdown": {},
             }
             
+        # --- Fast path: identical data already analyzed recently ---
+        fp = _analysis_fingerprint(df, symbol)
+        _now = time.time()
+        with _ANALYSIS_CACHE_LOCK:
+            _hit = _ANALYSIS_CACHE.get(fp)
+            if _hit is not None and (_now - _hit[0]) < _ANALYSIS_CACHE_TTL:
+                return _hit[1]
+
         # --- Online Learning (Rapid Adaptation) ---
         # We train the models on the specific asset's recent history to adapt to its current regime.
         
@@ -360,9 +393,12 @@ class AdvancedEnsembleEngine:
         optimizer_lstm = torch.optim.Adam(self.lstm_model.parameters(), lr=0.01, weight_decay=1e-4)
         optimizer_trans = torch.optim.Adam(self.transformer_model.parameters(), lr=0.01, weight_decay=1e-4)
         
-        # Reduce epochs for speed — fast_mode uses 2 epochs, normal uses 5 max
+        # Reduce epochs for speed — fast_mode uses 2 epochs, normal uses 3 max.
+        # Direction is anchored by the Kalman-smoothed trend (65% weight), so
+        # a couple of online-learning epochs is enough; the old 5-epoch default
+        # roughly doubled training time for no measurable directional gain.
         # IMPORTANT: Sklearn models fit ONCE outside the loop (not O(epochs) times)
-        epochs = 2 if fast_mode else 5
+        epochs = 2 if fast_mode else 3
         
         # Train LSTM
         self.lstm_model.train()
@@ -608,6 +644,16 @@ class AdvancedEnsembleEngine:
             "options_edge": options_edge,
             "volatility": vol,
         })
+
+        # Store in the bounded TTL cache so identical re-analyses are instant.
+        with _ANALYSIS_CACHE_LOCK:
+            _ANALYSIS_CACHE[fp] = (time.time(), out)
+            if len(_ANALYSIS_CACHE) > _ANALYSIS_CACHE_MAX:
+                _old = sorted(
+                    _ANALYSIS_CACHE, key=lambda k: _ANALYSIS_CACHE[k][0]
+                )[: len(_ANALYSIS_CACHE) // 4]
+                for _k in _old:
+                    _ANALYSIS_CACHE.pop(_k, None)
         return out
 
     def get_model_summary(self) -> Dict[str, Any]:

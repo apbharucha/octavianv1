@@ -36,7 +36,10 @@ class _NNState:
     n_samples: int = 0
 
 
-_NN_CACHE_VERSION = "v1"
+# v2: the synth training grid was vectorized and the surrogate shrunk so a
+# cold fit takes a few seconds instead of minutes (the old 31k-sample scalar
+# loop + deep MLP froze the first options/breaking-trades call).
+_NN_CACHE_VERSION = "v2"
 
 
 def _nn_cache_path() -> str:
@@ -86,36 +89,47 @@ class OptionsEngine:
                     return
             except Exception as e:
                 logger.warning("Options NN cache load failed: %s", e)
-            # Train and persist
-            try:
-                X, y = self._build_synth_train_set()
-                scaler = StandardScaler()
-                Xs = scaler.fit_transform(X)
-                base = MLPRegressor(
-                    hidden_layer_sizes=(96, 96, 48),
-                    activation="relu",
-                    max_iter=350,
-                    early_stopping=True,
-                    random_state=42,
-                )
-                model = MultiOutputRegressor(base)
-                model.fit(Xs, y)
-                self.nn.model = model
-                self.nn.scaler = scaler
-                self.nn.trained = True
-                self.nn.n_samples = len(X)
+            # No disk cache → train in a background daemon thread. The caller
+            # (first options / breaking-trades query) is never blocked for the
+            # fit — it gets exact analytic Black-Scholes immediately and the
+            # NN blend activates whenever training completes. The trained
+            # model is persisted so later processes load it in milliseconds.
+            def _train_background():
                 try:
-                    with open(cache_path, "wb") as f:
-                        pickle.dump(
-                            {"model": model, "scaler": scaler, "n_samples": len(X)},
-                            f,
-                            protocol=pickle.HIGHEST_PROTOCOL,
-                        )
-                    logger.info("Options NN surrogate trained and cached to disk")
+                    X, y = self._build_synth_train_set()
+                    scaler = StandardScaler()
+                    Xs = scaler.fit_transform(X)
+                    base = MLPRegressor(
+                        hidden_layer_sizes=(24, 12),
+                        activation="relu",
+                        max_iter=80,
+                        early_stopping=True,
+                        random_state=42,
+                    )
+                    model = MultiOutputRegressor(base)
+                    model.fit(Xs, y)
+                    self.nn.model = model
+                    self.nn.scaler = scaler
+                    self.nn.trained = True
+                    self.nn.n_samples = len(X)
+                    try:
+                        with open(cache_path, "wb") as f:
+                            pickle.dump(
+                                {"model": model, "scaler": scaler, "n_samples": len(X)},
+                                f,
+                                protocol=pickle.HIGHEST_PROTOCOL,
+                            )
+                        logger.info("Options NN surrogate trained and cached to disk")
+                    except Exception as e:
+                        logger.warning("Options NN cache write failed: %s", e)
                 except Exception as e:
-                    logger.warning("Options NN cache write failed: %s", e)
-            except Exception as e:
-                logger.warning("Options NN init failed, analytic-only fallback: %s", e)
+                    logger.warning("Options NN init failed, analytic-only fallback: %s", e)
+
+            threading.Thread(
+                target=_train_background,
+                name="options-nn-train",
+                daemon=True,
+            ).start()
 
     def _feat(self, S: float, K: float, T: float, sigma: float, option_type: str) -> np.ndarray:
         cp = 1.0 if option_type.lower() == "call" else 0.0
@@ -123,20 +137,52 @@ class OptionsEngine:
         return np.array([S, K, T, sigma, m, cp, self.rf_rate], dtype=float)
 
     def _build_synth_train_set(self):
-        spots = np.linspace(50, 400, 14)
-        strikes = np.linspace(50, 400, 14)
-        tenors = np.linspace(7 / 365, 1.25, 10)
-        vols = np.linspace(0.08, 0.9, 8)
-        X, y = [], []
-        for S in spots:
-            for K in strikes:
-                for T in tenors:
-                    for v in vols:
-                        for ot in ("call", "put"):
-                            bs = self._analytic(S, K, T, v, ot)
-                            X.append(self._feat(S, K, T, v, ot))
-                            y.append([bs["price"], bs["delta"], bs["gamma"], bs["theta"], bs["vega"]])
-        return np.asarray(X), np.asarray(y)
+        """Vectorized synthetic Black-Scholes training grid for the NN
+        surrogate. Fully numpy (no per-point scipy scalar calls), so even a
+        cold fit builds in milliseconds; the grid is ~4x smaller than the old
+        scalar version while still covering the moneyness/time/vol space.
+        """
+        r = self.rf_rate
+        spots = np.linspace(50, 400, 10)
+        strikes = np.linspace(50, 400, 10)
+        tenors = np.linspace(7 / 365, 1.25, 7)
+        vols = np.linspace(0.08, 0.9, 6)
+        X_parts, y_parts = [], []
+        for ot in ("call", "put"):
+            S, K, T, sigma = np.meshgrid(
+                spots, strikes, tenors, vols, indexing="ij"
+            )
+            S = S.ravel().astype(float)
+            K = K.ravel().astype(float)
+            T = T.ravel().astype(float)
+            sigma = sigma.ravel().astype(float)
+            ok = (T > 0) & (S > 0) & (K > 0) & (sigma > 0)
+            S, K, T, sigma = S[ok], K[ok], T[ok], sigma[ok]
+            sigma = np.maximum(sigma, 1e-6)
+            s_k = np.log(np.maximum(S, 1e-8) / np.maximum(K, 1e-8))
+            d1 = (s_k + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+            d2 = d1 - sigma * np.sqrt(T)
+            pdf1 = norm.pdf(d1)
+            if ot == "call":
+                price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+                delta = norm.cdf(d1)
+                theta = (-(S * pdf1 * sigma) / (2 * np.sqrt(T))
+                         - r * K * np.exp(-r * T) * norm.cdf(d2)) / 365
+            else:
+                price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+                delta = norm.cdf(d1) - 1
+                theta = (-(S * pdf1 * sigma) / (2 * np.sqrt(T))
+                         + r * K * np.exp(-r * T) * norm.cdf(-d2)) / 365
+            gamma = pdf1 / (S * sigma * np.sqrt(T))
+            vega = (S * pdf1 * np.sqrt(T)) / 100
+            cp = 1.0 if ot == "call" else 0.0
+            X = np.column_stack([
+                S, K, T, sigma, s_k, np.full_like(S, cp), np.full_like(S, r),
+            ])
+            y = np.column_stack([price, delta, gamma, theta, vega])
+            X_parts.append(X)
+            y_parts.append(y)
+        return np.vstack(X_parts), np.vstack(y_parts)
 
     def _predict_nn(self, S: float, K: float, T: float, sigma: float, option_type: str):
         self._ensure_nn()

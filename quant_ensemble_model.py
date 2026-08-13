@@ -97,7 +97,12 @@ class QuantEnsembleModel:
                 data=df,
                 symbol=symbol,
                 asset_type=asset_type,
-                options_context=options_context
+                options_context=options_context,
+                # Scanner/quick-signal path: 2-epoch online learning is plenty
+                # because the ensemble direction is anchored by the
+                # Kalman-smoothed trend (65% weight). Keeps per-symbol cost
+                # low so full-universe scans stay responsive.
+                fast_mode=True,
             )
 
             direction = "NEUTRAL"

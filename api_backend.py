@@ -14,10 +14,57 @@ Author: AI Market Team
 
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-from flask_caching import Cache
-import redis
+
+# Optional dependencies — the API backend degrades gracefully (in-memory
+# cache, no rate limiting, no Redis) when they are not installed, so the
+# module always imports and the REST endpoints stay available.
+try:
+    from flask_limiter import Limiter
+    from flask_limiter.util import get_remote_address
+
+    _HAS_LIMITER = True
+except Exception:
+    _HAS_LIMITER = False
+
+    def get_remote_address():  # type: ignore
+        return "default"
+
+    class _NoOpLimiter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def limit(self, *args, **kwargs):
+            def _deco(fn):
+                return fn
+
+            return _deco
+
+    Limiter = _NoOpLimiter  # type: ignore
+
+try:
+    from flask_caching import Cache
+
+    _HAS_CACHING = True
+except Exception:
+    _HAS_CACHING = False
+
+    class _NoOpCache:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def cached(self, *args, **kwargs):
+            def _deco(fn):
+                return fn
+
+            return _deco
+
+    Cache = _NoOpCache  # type: ignore
+
+try:
+    import redis
+except Exception:
+    redis = None
+
 import json
 import time
 from datetime import datetime, timedelta
