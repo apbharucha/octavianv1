@@ -268,14 +268,19 @@ class DarkPoolEngine:
     #  Data providers
     # ------------------------------------------------------------------ #
 
-    def _fetch_ohlc(self, symbol: str, period: str = "2y") -> pd.DataFrame:
-        """Observed consolidated OHLCV via the platform data layer."""
+    def _fetch_ohlc_once(self, symbol: str, period: str = "2y") -> pd.DataFrame:
+        """Single consolidated OHLCV attempt via the platform data layer."""
         if self._fetch_fn is not None:
-            df = self._fetch_fn(symbol, period)
-        elif _HAS_DATA_SOURCES and get_stock is not None:
-            df = get_stock(symbol, period=period, interval="1d")
-        else:
-            df = pd.DataFrame()
+            return self._fetch_fn(symbol, period)
+        if _HAS_DATA_SOURCES and get_stock is not None:
+            try:
+                return get_stock(symbol, period=period, interval="1d")
+            except Exception:
+                return pd.DataFrame()
+        return pd.DataFrame()
+
+    def _normalize_ohlc(self, df: Optional[pd.DataFrame]) -> pd.DataFrame:
+        """Canonicalize a raw provider frame to [Open, High, Low, Close, Volume]."""
         if df is None:
             return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
@@ -291,6 +296,31 @@ class DarkPoolEngine:
         for col in ("Open", "High", "Low", "Close", "Volume"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
         return df.dropna(subset=["Close"])
+
+    def _alternate_period(self, period: str) -> str:
+        """An alternate history window for retrying a transient provider failure."""
+        return "5y" if period in ("2y", "3y") else "1y"
+
+    def _fetch_ohlc(self, symbol: str, period: str = "2y") -> pd.DataFrame:
+        """Observed consolidated OHLCV via the platform data layer.
+
+        Transient provider hiccups (empty frames from a flaky upstream) are
+        retried once with an alternate window so a single bad call never
+        surfaces as a spurious 'insufficient history' failure. The result is
+        normalized to a canonical [Open, High, Low, Close, Volume] frame
+        sorted by date.
+        """
+        df = self._fetch_ohlc_once(symbol, period)
+        if df is None or df.empty:
+            # Only pause when hitting the real network (never for injected
+            # test fns), keeping tests fast and deterministic.
+            if self._fetch_fn is None:
+                try:
+                    time.sleep(0.75)
+                except Exception:
+                    pass
+            df = self._fetch_ohlc_once(symbol, self._alternate_period(period))
+        return self._normalize_ohlc(df)
 
     # -- settings -- #
     def get_finra_api_key(self) -> str:
@@ -540,6 +570,29 @@ class DarkPoolEngine:
                 continue
         return out or None
 
+    def finra_metadata(self) -> dict:
+        """Transparency metadata about the current FINRA OTC anchor.
+
+        Surfaced in the UI so users always know the off-exchange figures are
+        WEEKLY totals from the latest published FINRA reporting week (which
+        carries a 1-4 week reporting lag) — never a same-day read.
+        """
+        df = self.fetch_finra_otc()
+        if df is None or df.empty:
+            return {"observed": False, "granularity": "weekly"}
+        return {
+            "observed": True,
+            "granularity": "weekly",
+            "week": df.attrs.get("finra_week"),
+            "tiers": list(df.attrs.get("finra_tiers") or []),
+            "rows": int(len(df)),
+            "symbols": int(df["Symbol"].nunique()) if "Symbol" in df.columns else 0,
+            "lag_note": ("FINRA OTC Transparency publishes weekly summaries with a "
+                          "1-4 week reporting lag; the value shown is the total for the "
+                          "latest published week, not a single-day figure."),
+            "fetched_at": datetime.utcnow().isoformat() + "Z",
+        }
+
     # ------------------------------------------------------------------ #
     #  Off-exchange model (clearly labeled)
     # ------------------------------------------------------------------ #
@@ -599,6 +652,21 @@ class DarkPoolEngine:
         """
         symbol = (symbol or "").strip().upper()
         df = self._fetch_ohlc(symbol, period)
+        if not df.empty and len(df) < MIN_HISTORY:
+            # Transient truncated frames (rate-limited/partial provider
+            # responses) are retried once with an alternate window before the
+            # name is declared unresolvable. A fully empty frame already
+            # triggered _fetch_ohlc's own retry, so we don't re-fetch a third
+            # time here.
+            if self._fetch_fn is None:
+                try:
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+            retry_df = self._normalize_ohlc(
+                self._fetch_ohlc_once(symbol, self._alternate_period(period)))
+            if len(retry_df) > len(df):
+                df = retry_df
         if df.empty or len(df) < MIN_HISTORY:
             return {
                 "symbol": symbol,

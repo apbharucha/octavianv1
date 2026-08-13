@@ -653,3 +653,112 @@ def test_finra_observed_anchors_ticker_report(engine, monkeypatch):
     assert r["finra_observed"] is True
     assert r["finra_offexchange_vol"] == 155_000_000
     assert r["provenance"]["finra"]["category"] == "OBSERVED"
+
+
+# --------------------------------------------------------------------------- #
+#  Fix regressions: transient-fetch retry + weekly-granularity transparency
+# --------------------------------------------------------------------------- #
+
+def test_fetch_ohlc_retries_transient_empty(engine, monkeypatch):
+    """A transient empty frame from the provider must be retried once with an
+    alternate window instead of immediately surfacing as insufficient history."""
+    calls = []
+
+    def flaky(symbol, period="2y"):
+        calls.append(period)
+        if len(calls) == 1:
+            return pd.DataFrame()  # transient hiccup
+        return _make_ohlc(n=120, seed=3)
+
+    tmp = tempfile.mkdtemp()
+    e = DarkPoolEngine(state_file=os.path.join(tmp, "s.json"), fetch_fn=flaky)
+    df = e._fetch_ohlc("FLKY")
+    assert len(calls) == 2            # exactly one retry
+    assert calls[1] != calls[0]       # alternate window used
+    assert df is not None and not df.empty
+    # and a full analyze now succeeds thanks to the retry
+    r = e.analyze_ticker("FLKY")
+    assert r["ok"] is True
+
+
+def test_analyze_ticker_retries_past_transient_failure(engine, monkeypatch):
+    """analyze_ticker must recover from a first-call failure via _fetch_ohlc's
+    internal retry — the 'insufficient history' error is reserved for genuinely
+    unresolvable names, not transient provider hiccups."""
+    calls = {"n": 0}
+
+    def flaky(symbol, period="2y"):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return pd.DataFrame()
+        return _make_ohlc(n=120, seed=5)
+
+    tmp = tempfile.mkdtemp()
+    e = DarkPoolEngine(state_file=os.path.join(tmp, "s.json"), fetch_fn=flaky)
+    r = e.analyze_ticker("NVDA")
+    assert r["ok"] is True
+    assert calls["n"] == 2
+
+
+def test_insufficient_history_after_retry_still_honest(engine):
+    """Even after the retry, a name that truly has < 30 bars must still fail
+    honestly with the insufficient-history error (no infinite retry loop)."""
+    calls = {"n": 0}
+
+    def short(symbol, period="2y"):
+        calls["n"] += 1
+        return _make_ohlc(n=10, seed=2)  # always too short
+
+    tmp = tempfile.mkdtemp()
+    e = DarkPoolEngine(state_file=os.path.join(tmp, "s.json"), fetch_fn=short)
+    r = e.analyze_ticker("SHORT")
+    assert r["ok"] is False
+    assert "Insufficient history" in r["error"]
+    assert calls["n"] == 2  # exactly one retry, then honest failure
+
+
+def test_finra_metadata_reports_weekly_anchor(engine, monkeypatch):
+    """finra_metadata() must surface the exact published WEEK and tier coverage
+    so the UI can label the observed figure as weekly (1-4 week lag) — never
+    implying a same-day read."""
+    import dark_pool_engine as dpe
+
+    class FakeResp2:
+        def __init__(self, status_code=200, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        code = json["compareFilters"][1]["fieldValue"]
+        return FakeResp2(payload=[r for r in _fake_finra_response()
+                                  if r["summaryTypeCode"] == code])
+
+    monkeypatch.setattr(dpe.requests, "get",
+                        lambda *a, **k: FakeResp2(payload={"availablePartitions": [
+                            {"partitions": ["2026-07-20", "T1"]},
+                            {"partitions": ["2026-07-06", "T1"]},
+                            {"partitions": ["2026-07-06", "T2"]},
+                            {"partitions": ["2026-07-06", "OTCE"]},
+                            {"partitions": ["2026-07-06", "NA"]}]}))
+    monkeypatch.setattr(dpe.requests, "post", fake_post)
+
+    e = DarkPoolEngine(state_file=os.path.join(tempfile.mkdtemp(), "s.json"),
+                       fetch_fn=engine._fetch_fn)
+    e.set_finra_api_key("test-key")
+    e.clear_caches()
+
+    meta = e.finra_metadata()
+    assert meta["observed"] is True
+    assert meta["granularity"] == "weekly"
+    assert meta["week"] == "2026-07-06"
+    assert set(meta["tiers"]) >= {"T1", "T2", "OTCE", "NA"}
+    assert meta["symbols"] == 2  # AAPL + MSFT in the fixture rows
+    assert "reporting lag" in meta["lag_note"]
+
+    # no FINRA key/network -> observed False, still labeled weekly
+    e2 = DarkPoolEngine(state_file=os.path.join(tempfile.mkdtemp(), "s.json"),
+                        fetch_fn=engine._fetch_fn)
+    assert e2.finra_metadata() == {"observed": False, "granularity": "weekly"}

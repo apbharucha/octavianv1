@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import time as _time
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -80,6 +80,52 @@ def _provenance_line(mode: str, provenance: Optional[dict]) -> None:
         f"confidence {conf*100:.0f}% · {provenance.get('method', '')}",
         unsafe_allow_html=True,
     )
+
+
+def _finra_weekly_note(engine, r: dict) -> None:
+    """Clearly flag that the observed FINRA figure is WEEKLY, with the exact week.
+
+    FINRA OTC Transparency publishes weekly summaries with a 1-4 week reporting
+    lag. The user must never mistake the observed weekly total for a same-day
+    figure — the daily series around it are modeled and labeled as such.
+    """
+    if not r.get("finra_observed"):
+        return
+    meta = {}
+    try:
+        meta = engine.finra_metadata() or {}
+    except Exception:
+        pass
+    vol = r.get("finra_offexchange_vol")
+    week = meta.get("week") or "the latest published reporting week"
+    tiers = ", ".join(meta.get("tiers") or [])
+    tier_txt = f" · tiers: {tiers}" if tiers else ""
+    st.info(
+        f"**FINRA OTC — OBSERVED · WEEKLY.** {vol:,.0f} shares traded off-exchange "
+        f"in the latest published reporting week (week of **{week}**{tier_txt}). "
+        f"FINRA publishes **weekly** summaries with a 1–4 week reporting lag — this "
+        f"is a weekly total, **not today's figure**. The daily series on this page "
+        f"are modeled around this observed anchor and are labeled MODELED.")
+
+
+def _finra_scan_note(engine) -> None:
+    """One-line weekly-granularity flag used by market-wide views."""
+    meta = {}
+    try:
+        meta = engine.finra_metadata() or {}
+    except Exception:
+        pass
+    if meta.get("observed"):
+        st.caption(
+            f"Off-exchange anchors: **FINRA OTC Transparency — weekly summaries** "
+            f"(week of {meta.get('week')}; {meta.get('symbols', 0):,} symbols; tiers "
+            f"{', '.join(meta.get('tiers') or [])}). Weekly granularity with a 1–4 week "
+            f"reporting lag; daily figures are modeled around the observed anchor.")
+    else:
+        st.caption(
+            "Off-exchange figures are **MODELED** (no FINRA anchor currently available). "
+            "FINRA OTC Transparency publishes weekly per-symbol summaries when the API "
+            "is reachable; the dashboard will switch to observed anchors automatically.")
 
 
 def _label_badge(observed: bool) -> str:
@@ -241,7 +287,14 @@ def show_dark_pool_dashboard() -> None:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def _overview_scan(limit: int = SCAN_DEFAULT_LIMIT) -> pd.DataFrame:
-    return get_dark_pool_engine().scan_market(limit=limit)
+    df = get_dark_pool_engine().scan_market(limit=limit)
+    if df is None or df.empty:
+        # Never cache a transient failure — the next render retries the scan.
+        try:
+            _overview_scan.clear()
+        except Exception:
+            pass
+    return df
 
 
 def _tab_market_overview(engine, mode: str) -> None:
@@ -267,6 +320,8 @@ def _tab_market_overview(engine, mode: str) -> None:
               help="Sum of per-name estimated imbalances across the scan.")
     m4.metric("Avg Pressure Score", f"{df['PressureScore'].mean():.0f}/100")
     m5.metric("Top Signal Strength", f"{df['SignalStrength'].max():.0f}")
+
+    _finra_scan_note(engine)
 
     st.markdown("---")
 
@@ -336,6 +391,8 @@ def _tab_scanner(engine, mode: str) -> None:
         st.info("No names meet the filter.")
         return
 
+    _finra_scan_note(engine)
+
     # Ranked tabs: Most Active / Most Unusual / Imbalance / Largest Blocks / Signals
     st.markdown("### Rankings")
     r1, r2, r3, r4, r5 = st.tabs([
@@ -397,9 +454,34 @@ def _tab_scanner(engine, mode: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+_TICKER_REPORT_CACHE: Dict[str, Tuple[float, dict]] = {}
+_TICKER_REPORT_TTL = 300.0
+
+
 def _ticker_report(symbol: str) -> dict:
-    return get_dark_pool_engine().analyze_ticker(symbol)
+    """Ticker analysis with failure-safe caching.
+
+    Only SUCCESSFUL results are cached (5-min TTL). A failed analysis — e.g.
+    a transient data-layer hiccup that returned 'insufficient history' — is
+    NEVER cached, so the very next render retries the provider instead of
+    replaying the error for the whole TTL window.
+    """
+    now = _time.monotonic()
+    # Opportunistic eviction: bound cache growth across a long session.
+    if len(_TICKER_REPORT_CACHE) > 256:
+        stale = [s for s, (ts, _) in _TICKER_REPORT_CACHE.items()
+                 if now - ts >= _TICKER_REPORT_TTL]
+        for s in stale:
+            _TICKER_REPORT_CACHE.pop(s, None)
+        if len(_TICKER_REPORT_CACHE) > 512:  # hard cap fallback
+            _TICKER_REPORT_CACHE.clear()
+    cached = _TICKER_REPORT_CACHE.get(symbol)
+    if cached is not None and now - cached[0] < _TICKER_REPORT_TTL:
+        return cached[1]
+    r = get_dark_pool_engine().analyze_ticker(symbol)
+    if r.get("ok"):
+        _TICKER_REPORT_CACHE[symbol] = (_time.monotonic(), r)
+    return r
 
 
 def _tab_ticker(engine, mode: str) -> None:
@@ -436,13 +518,18 @@ def _tab_ticker(engine, mode: str) -> None:
               else f"{r.get('change_1d_pct', 0):+.2f}%")
     o2.metric("Market Cap", _fmt_big(r.get("market_cap")) if r.get("market_cap") else "—")
     o3.metric("Off-Ex Vol (20d)", f"{r.get('offexchange_vol_20d_avg', 0):,.0f}",
-              help="Modeled average daily off-exchange volume (20d).")
+              help="Modeled average DAILY off-exchange volume (20d). Daily series is "
+                   "modeled around the observed FINRA weekly anchor where available.")
     o4.metric("Off-Ex %", f"{r.get('offexchange_pct_20d', 0):.1f}%",
               delta=f"{r.get('offexchange_pct_today', 0):.1f}% today",
-              delta_color="off")
+              delta_color="off",
+              help="Modeled share of consolidated volume executed off-exchange (20d).")
     o5.metric("Imbalance (5d)", f"{r.get('imbalance_pct', 0):+.1f}%",
               help="Estimated buy/sell imbalance — heuristic, not prints.")
     o6.metric("Pressure Score", f"{r.get('pressure_score', 0):.0f}/100")
+
+    # Weekly-granularity flag (FINRA is a weekly source — never implied daily)
+    _finra_weekly_note(engine, r)
 
     st.markdown("---")
 
@@ -477,10 +564,18 @@ def _tab_ticker(engine, mode: str) -> None:
             ("Buy Vol (5d, est.)", f"{r.get('buy_vol_5d', 0):,.0f}"),
             ("Sell Vol (5d, est.)", f"{r.get('sell_vol_5d', 0):,.0f}"),
             ("Imbalance Acceleration", f"{r.get('imbalance_accel', 0):+.3f}"),
-            ("FINRA observed", "Yes" if r.get("finra_observed") else "No"),
         ]
+        if r.get("finra_observed") and r.get("finra_offexchange_vol"):
+            rows.append((
+                "FINRA off-ex vol — WEEKLY total",
+                f"{r.get('finra_offexchange_vol'):,.0f}"))
         for k, v in rows:
             st.markdown(f"**{k}:** {v}")
+        if r.get("finra_observed"):
+            st.caption(
+                "The FINRA figure is the total off-exchange volume for the latest "
+                "published **week** — FINRA publishes weekly summaries with a 1–4 week "
+                "reporting lag, so it is not a single-day number.")
     with c2:
         st.markdown("**Historical Context (percentiles vs own history)**")
         hist = r.get("historical", {})
@@ -771,7 +866,14 @@ def _tab_institutional(engine, mode: str) -> None:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def _sector_table(limit: int) -> pd.DataFrame:
-    return get_dark_pool_engine().sector_analysis(limit=limit)
+    df = get_dark_pool_engine().sector_analysis(limit=limit)
+    if df is None or df.empty:
+        # Never cache a transient failure — the next render retries.
+        try:
+            _sector_table.clear()
+        except Exception:
+            pass
+    return df
 
 
 def _tab_sectors(engine, mode: str) -> None:
@@ -1346,10 +1448,10 @@ def _tab_settings(engine, mode: str) -> None:
         st.markdown("**Cache management**")
         if st.button("Clear dark-pool caches", key="dp_set_clear_cache"):
             engine.clear_caches()
+            _TICKER_REPORT_CACHE.clear()
             # Scoped: only clear this feature's cached functions, never the
             # whole app's cache (other dashboards keep their warm data).
-            for fn in (globals().get("_overview_scan"), globals().get("_ticker_report"),
-                       globals().get("_sector_table")):
+            for fn in (globals().get("_overview_scan"), globals().get("_sector_table")):
                 try:
                     if fn is not None:
                         fn.clear()
