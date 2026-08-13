@@ -1,8 +1,0 @@
-{
-  "buy_prob": 0.52,
-  "sell_prob": 0.32999999999999996,
-  "min_hold_minutes": 11,
-  "max_position_pct": 0.06,
-  "tuning_steps": 0,
-  "last_updated": "2026-02-11T22:11:07.012899"
-}

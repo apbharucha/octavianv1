@@ -1,9 +1,0 @@
-<component name="libraryTable">
-  <library name="vader_lexicon">
-    <CLASSES>
-      <root url="jar://$PROJECT_DIR$/nltk_data/sentiment/vader_lexicon.zip!/" />
-    </CLASSES>
-    <JAVADOC />
-    <SOURCES />
-  </library>
-</component>

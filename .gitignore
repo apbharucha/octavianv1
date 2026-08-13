@@ -23,6 +23,25 @@ venv/
 *.sqlite3
 octavian_learned_params.json
 
+# Debug / scratch scripts (one-off diagnostics, not part of the product)
+.temp_trash/
+
+# NLTK corpora (downloaded automatically at runtime)
+nltk_data/
+
+# Local data caches (regenerated on demand)
+data_cache/
+.edgar_filings_cache.json
+ticker_universe_cache.json
+
+# Runtime state (regenerated from the *_default templates)
+octavian_paper_trading_state.json
+
+# Frontend build artifacts / deps
+frontend/node_modules/
+frontend/.next/
+frontend/dist/
+
 # OS/editor
 .DS_Store
 .idea/
