@@ -81,6 +81,7 @@ nav_options = [
     "Quant Portal",
     "Quant Modeling Lab",
     "Strategy Research Lab",
+    "Algorithm Builder",
     "Portfolio Analyzer",
     "Position Optimizer",
     "Paper Trading",
@@ -1745,6 +1746,11 @@ elif selection == "Strategy Research Lab":
     from strategy_research_lab import render_strategy_research_lab
 
     render_strategy_research_lab()
+
+elif selection == "Algorithm Builder":
+    from algorithm_builder_ui import render_algorithm_builder
+
+    render_algorithm_builder()
 
 elif selection == "Settings & Analytics":
     st.title("Analytics & Settings")

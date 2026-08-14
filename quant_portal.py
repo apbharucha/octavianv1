@@ -96,15 +96,16 @@ except ImportError:
 # NOTE: page config is set by the host app (main.py) — calling st.set_page_config
 # here again would raise StreamlitSetPageConfigMustBeFirstCommandError and crash.
 # The portal is rendered via render_quant_portal() from within main.py.
+#
+# IMPORTANT: CSS is injected inside render_quant_portal(), NOT at module import
+# time. Streamlit removes elements that are not re-emitted on a rerun, so a
+# module-level st.markdown(<style>) only survives the FIRST render — on the next
+# interaction the CSS disappears (the old "black background that turns normal"
+# bug). The portal-specific rules below deliberately do NOT override .stApp's
+# background: the global Octavian theme owns the page background.
 
-# Professional dark theme styling
-st.markdown("""
+_PORTAL_CSS = """
 <style>
-    /* Main background */
-    .stApp {
-        background: linear-gradient(135deg, #0a0a0f 0%, #12121a 50%, #0d0d14 100%);
-    }
-    
     /* Card styling */
     .qportal-card {
         background: linear-gradient(145deg, rgba(30, 30, 40, 0.9), rgba(20, 20, 30, 0.95));
@@ -208,7 +209,16 @@ st.markdown("""
         font-weight: 600;
     }
 </style>
-""", unsafe_allow_html=True)
+"""
+
+
+def _apply_portal_css() -> None:
+    """Inject portal-specific styling on every render (not at import time).
+
+    Re-emitted each run so Streamlit keeps it in the DOM; scoped to portal
+    elements so it never fights the app-wide theme.
+    """
+    st.markdown(_PORTAL_CSS, unsafe_allow_html=True)
 
 # 
 # HELPER FUNCTIONS
@@ -272,7 +282,9 @@ def _calculate_advanced_metrics(returns: pd.Series) -> dict:
 
 def render_quant_portal():
     """Render the comprehensive quantitative research portal."""
-    
+
+    _apply_portal_css()
+
     # Header
     st.title("")
     st.markdown("""

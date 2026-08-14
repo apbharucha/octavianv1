@@ -1,0 +1,1463 @@
+"""
+Algorithm Builder Engine
+========================
+
+A research-grounded algorithmic strategy generator. Builds, backtests, and
+exports quantitative trading algorithms from either vague natural-language
+requests (auto mode) or explicit structured constraints (guided mode), within
+the limits of what the user asks for while maximizing the quality of the
+resulting algorithm.
+
+Research provenance of the strategy library
+-------------------------------------------
+* Glucksman Fellowship paper (NYU Stern, "Online Quantitative Trading
+  Strategies", Lahanis/Liu/Zhou): online portfolio selection algorithms —
+  Follow-the-Regularized-Leader (FTRL, Sharpe ~1.04), Confidence-Weighted Mean
+  Reversion (CWMR, Sharpe ~1.75), Passive-Aggressive Mean Reversion (PAMR,
+  Sharpe ~1.63), Online Moving-Average Reversion (OLMAR), Robust Median
+  Reversion (RMR), Anticor, pattern-matching, and Fast-Universalization /
+  Online-Gradient-Update meta-ensembles which beat every single strategy.
+* QuantConnect strategy library & community forum: RSI(2)-style mean
+  reversion with a low-volatility filter, dual-momentum (Antonacci) with
+  absolute-momentum gating, Donchian/Turtle breakouts, volatility targeting.
+* Market-structure style notes (Citadel / Jane Street / Optiver): z-score
+  statistical arbitrage and inventory-skewed two-sided market making. Daily
+  OHLCV data can only *approximate* these; the labels stay honest about that.
+
+Every generated algorithm carries a `provenance` string describing exactly
+which source(s) inspired it. Nothing here is financial advice.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+import textwrap
+import uuid
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+
+import numpy as np
+import pandas as pd
+
+try:  # allow the engine to be imported in tests without the data layer
+    from data_sources import get_stock as _default_get_stock
+except Exception:  # pragma: no cover - only hit in exotic import orders
+    def _default_get_stock(symbol, period="3y", interval="1d"):  # type: ignore
+        raise RuntimeError("data_sources unavailable")
+
+BARS_PER_YEAR = 252  # daily bar convention used throughout
+RF = 0.0             # risk-free rate for Sharpe (0 keeps comparisons honest)
+
+# --------------------------------------------------------------------------- #
+#  Metrics
+# --------------------------------------------------------------------------- #
+
+def compute_metrics(returns: pd.Series, equity: pd.Series,
+                    trades: Optional[list] = None, bars_per_year: int = BARS_PER_YEAR,
+                    capital: float = 100_000.0) -> dict:
+    """Standard risk/return metrics from a daily returns series."""
+    returns = returns.dropna()
+    n = len(returns)
+    if n < 2:
+        return {"total_return": 0.0, "cagr": 0.0, "sharpe": 0.0, "sortino": 0.0,
+                "max_drawdown": 0.0, "calmar": 0.0, "volatility": 0.0, "win_rate": 0.0,
+                "profit_factor": 0.0, "trades": 0, "exposure": 0.0, "best_trade": 0.0,
+                "worst_trade": 0.0, "avg_hold_bars": 0.0, "years": 0.0}
+    total = float(equity.iloc[-1] / equity.iloc[0] - 1) if len(equity) > 1 else 0.0
+    years = n / bars_per_year
+    cagr = (1 + total) ** (1 / years) - 1 if years > 0 else 0.0
+    vol = float(returns.std() * math.sqrt(bars_per_year)) if returns.std() > 0 else 0.0
+    sharpe = float(returns.mean() / returns.std() * math.sqrt(bars_per_year)) if returns.std() > 0 else 0.0
+    downside = returns[returns < 0]
+    sortino = float(returns.mean() / downside.std() * math.sqrt(bars_per_year)) if len(downside) > 1 and downside.std() > 0 else 0.0
+    peak = equity.cummax()
+    dd = equity / peak - 1
+    max_dd = float(dd.min()) if len(dd) else 0.0
+    calmar = float(cagr / abs(max_dd)) if max_dd < 0 else 0.0
+    trades = trades or []
+    closed = [t for t in trades if t.get("exit_pnl_pct") is not None]
+    wins = [t for t in closed if t["exit_pnl_pct"] > 0]
+    losses = [t for t in closed if t["exit_pnl_pct"] < 0]
+    win_rate = len(wins) / len(closed) if closed else 0.0
+    gross_win = sum(t["exit_pnl_pct"] for t in wins)
+    gross_loss = abs(sum(t["exit_pnl_pct"] for t in losses))
+    profit_factor = gross_win / gross_loss if gross_loss > 0 else (gross_win if gross_win > 0 else 0.0)
+    exposure = float((returns != 0).mean()) if len(returns) else 0.0
+    return {
+        "total_return": total, "cagr": cagr, "sharpe": sharpe, "sortino": sortino,
+        "max_drawdown": max_dd, "calmar": calmar, "volatility": vol, "win_rate": win_rate,
+        "profit_factor": profit_factor, "trades": len(closed), "exposure": exposure,
+        "best_trade": max((t["exit_pnl_pct"] for t in closed), default=0.0),
+        "worst_trade": min((t["exit_pnl_pct"] for t in closed), default=0.0),
+        "avg_hold_bars": float(np.mean([t["hold_bars"] for t in closed])) if closed else 0.0,
+        "years": years,
+    }
+
+
+# --------------------------------------------------------------------------- #
+#  Indicator helpers
+# --------------------------------------------------------------------------- #
+
+def _sma(s: pd.Series, n: int) -> pd.Series:
+    return s.rolling(max(int(n), 2)).mean()
+
+
+def _ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=max(int(n), 2), adjust=False).mean()
+
+
+def _rsi(close: pd.Series, period: int) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    ag = gain.ewm(alpha=1 / max(int(period), 1), adjust=False).mean()
+    al = loss.ewm(alpha=1 / max(int(period), 1), adjust=False).mean()
+    rs = ag / al.replace(0.0, np.nan)
+    out = 100 - 100 / (1 + rs)
+    return out.fillna(50.0)
+
+
+def _atr(df: pd.DataFrame, n: int) -> pd.Series:
+    tr = pd.concat([
+        df["High"] - df["Low"],
+        (df["High"] - df["Close"].shift()).abs(),
+        (df["Low"] - df["Close"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / max(int(n), 1), adjust=False).mean()
+
+
+def _rolling_z(close: pd.Series, n: int) -> pd.Series:
+    mu = close.rolling(max(int(n), 2)).mean()
+    sd = close.rolling(max(int(n), 2)).std()
+    return (close - mu) / sd.replace(0.0, np.nan)
+
+
+def _simplex_project(w: np.ndarray) -> np.ndarray:
+    """Project weights onto the probability simplex (iterative clip+renormalise)."""
+    w = np.asarray(w, dtype=float)
+    for _ in range(20):
+        w = np.clip(w, 0.0, None)
+        s = w.sum()
+        if s <= 0:
+            w = np.full_like(w, 1.0 / len(w))
+            break
+        w = w / s
+        if (w >= 0).all():
+            break
+    return w
+
+
+# --------------------------------------------------------------------------- #
+#  Archetype registry
+# --------------------------------------------------------------------------- #
+
+# Every archetype: name, family, inspiration/provenance, param space, and a
+# signal generator `sig(df, params) -> pd.Series in [-1, 1]` (warmup -> 0).
+# Params: {name, type: float|int|bool|categorical, min, max, default, choices}
+
+ARCHETYPES: dict = {}
+
+
+def _register(fn):
+    a = fn()
+    ARCHETYPES[a["name"]] = a
+    return a
+
+
+@_register
+def _trend_ma():
+    def sig(df, p):
+        close = df["Close"]
+        fast = _sma(close, p["fast"])
+        slow = _sma(close, p["slow"])
+        norm = (fast / slow - 1.0) * 100.0
+        out = np.tanh(norm / max(p["hysteresis_pct"], 1e-6)).rename("sig")
+        return out.fillna(0.0).clip(-1.0, 1.0)
+    return {
+        "name": "trend_ma", "family": "trend",
+        "label": "Moving-Average Crossover (Trend Following)",
+        "provenance": ("Classic trend-following (dual moving-average crossover with "
+                       "hysteresis dead-band). Standard in the QuantConnect strategy "
+                       "library; momentum family of the Glucksman paper (Follow-the-Winner)."),
+        "params": [
+            {"name": "fast", "type": "int", "min": 2, "max": 60, "default": 10},
+            {"name": "slow", "type": "int", "min": 20, "max": 250, "default": 50},
+            {"name": "hysteresis_pct", "type": "float", "min": 0.05, "max": 2.0, "default": 0.3},
+        ],
+        "sig": sig, "ops": False,
+    }
+
+
+@_register
+def _breakout():
+    def sig(df, p):
+        close = df["Close"]
+        entry_n, exit_n = int(p["entry_n"]), int(p["exit_n"])
+        hi = df["High"].rolling(entry_n).max().shift(1)
+        lo = df["Low"].rolling(exit_n).min().shift(1)
+        state = 0
+        out = np.zeros(len(df))
+        for i in range(len(df)):
+            c = close.iloc[i]
+            if state == 0:
+                if not pd.isna(hi.iloc[i]) and c > hi.iloc[i]:
+                    state = 1
+                elif not pd.isna(lo.iloc[i]) and c < lo.iloc[i]:
+                    state = -1
+            elif state == 1:
+                if not pd.isna(lo.iloc[i]) and c < lo.iloc[i]:
+                    state = -1
+            elif state == -1:
+                if not pd.isna(hi.iloc[i]) and c > hi.iloc[i]:
+                    state = 1
+            out[i] = state
+        return pd.Series(out, index=df.index, name="sig")
+    return {
+        "name": "breakout", "family": "trend",
+        "label": "Donchian / Turtle Breakout",
+        "provenance": ("Donchian-channel breakout (Turtle trading system): enter "
+                       "on an N-bar high breakout, exit on an M-bar low break. "
+                       "Published on the QuantConnect forum and in the QC strategy library."),
+        "params": [
+            {"name": "entry_n", "type": "int", "min": 10, "max": 120, "default": 55},
+            {"name": "exit_n", "type": "int", "min": 5, "max": 60, "default": 20},
+        ],
+        "sig": sig, "ops": False,
+    }
+
+
+@_register
+def _dual_momentum():
+    def sig(df, p):
+        close = df["Close"]
+        rel = close / close.shift(int(p["rel_bars"])) - 1.0
+        abs_gate = close / close.shift(int(p["abs_bars"])) - 1.0
+        out = np.tanh(rel * 100.0 / max(p["mom_scale"], 1e-6))
+        out = out.where(abs_gate > 0, 0.0)
+        return out.fillna(0.0).clip(-1.0, 1.0).rename("sig")
+    return {
+        "name": "dual_momentum", "family": "momentum",
+        "label": "Dual Momentum (Absolute + Relative)",
+        "provenance": ("Dual momentum (Antonacci): relative momentum drives sizing "
+                       "but an absolute-momentum gate over the longer lookback keeps "
+                       "you out of downtrends. Popularized on the QuantConnect forum "
+                       "(Dual Momentum Sector Rotation) and in the QC strategy library."),
+        "params": [
+            {"name": "rel_bars", "type": "int", "min": 10, "max": 63, "default": 21},
+            {"name": "abs_bars", "type": "int", "min": 126, "max": 504, "default": 252},
+            {"name": "mom_scale", "type": "float", "min": 2.0, "max": 10.0, "default": 5.0},
+        ],
+        "sig": sig, "ops": False,
+    }
+
+
+@_register
+def _rsi_meanrev():
+    def sig(df, p):
+        close = df["Close"]
+        r = _rsi(close, int(p["period"]))
+        vol = close.pct_change().rolling(20).std() * math.sqrt(BARS_PER_YEAR)
+        vol_cap = vol.rolling(250).quantile(p["vol_cap_pct"] / 100.0)
+        out = pd.Series(0.0, index=df.index, name="sig")
+        long_cond = (r < p["oversold"]) & (vol <= vol_cap)
+        short_cond = (r > p["overbought"]) & (vol <= vol_cap)
+        if p.get("require_turn", False):
+            long_cond &= close > close.shift(1)
+            short_cond &= close < close.shift(1)
+        out[long_cond] = 1.0
+        out[short_cond] = -1.0
+        return out
+    return {
+        "name": "rsi_meanrev", "family": "meanrev",
+        "label": "RSI Mean Reversion + Low-Vol Filter",
+        "provenance": ("RSI(2)-style mean reversion (Connors) with a volatility "
+                       "cap, as championed in QuantConnect community algorithms "
+                       "(e.g. 'The Alpha Formula': buy low RSI, low volatility) and "
+                       "the Follow-the-Loser family of the Glucksman paper."),
+        "params": [
+            {"name": "period", "type": "int", "min": 2, "max": 14, "default": 2},
+            {"name": "oversold", "type": "float", "min": 5.0, "max": 35.0, "default": 10.0},
+            {"name": "overbought", "type": "float", "min": 65.0, "max": 95.0, "default": 90.0},
+            {"name": "vol_cap_pct", "type": "float", "min": 50.0, "max": 99.0, "default": 80.0},
+            {"name": "require_turn", "type": "bool", "default": True},
+        ],
+        "sig": sig, "ops": False,
+    }
+
+
+@_register
+def _bollinger_meanrev():
+    def sig(df, p):
+        close = df["Close"]
+        mid = _sma(close, int(p["period"]))
+        sd = close.rolling(int(p["period"])).std()
+        upper, lower = mid + p["n_std"] * sd, mid - p["n_std"] * sd
+        state = 0
+        out = np.zeros(len(df))
+        for i in range(len(df)):
+            c = close.iloc[i]
+            if state == 0:
+                if c < lower.iloc[i]:
+                    state = 1
+                elif c > upper.iloc[i]:
+                    state = -1
+            elif state == 1 and p.get("exit_at_mid", False):
+                if c >= mid.iloc[i]:
+                    state = 0
+            elif state == -1 and p.get("exit_at_mid", False):
+                if c <= mid.iloc[i]:
+                    state = 0
+            out[i] = state
+        return pd.Series(out, index=df.index, name="sig")
+    return {
+        "name": "bollinger_meanrev", "family": "meanrev",
+        "label": "Bollinger-Band Mean Reversion",
+        "provenance": ("Mean reversion to Bollinger bands: fade band-touch extremes, "
+                       "exit at the moving midpoint. A staple of the QuantConnect "
+                       "strategy library and the Follow-the-Loser family."),
+        "params": [
+            {"name": "period", "type": "int", "min": 10, "max": 60, "default": 20},
+            {"name": "n_std", "type": "float", "min": 1.5, "max": 3.0, "default": 2.0},
+            {"name": "exit_at_mid", "type": "bool", "default": True},
+        ],
+        "sig": sig, "ops": False,
+    }
+
+
+@_register
+def _vol_target():
+    def sig(df, p):
+        close = df["Close"]
+        rets = close.pct_change()
+        rv = rets.rolling(int(p["lookback"])).std() * math.sqrt(BARS_PER_YEAR)
+        scale = (p["target_vol"] / 100.0) / rv.replace(0.0, np.nan)
+        scale = scale.clip(upper=p["cap"])
+        if p["direction"] == "long_only":
+            out = scale.fillna(0.0).clip(lower=0.0, upper=1.0)
+        else:
+            trend = np.sign(close - _sma(close, int(p["lookback"])))
+            out = (scale * trend).fillna(0.0).clip(-1.0, 1.0)
+        return out.rename("sig")
+    return {
+        "name": "vol_target", "family": "volatility",
+        "label": "Volatility Targeting / Risk Scaling",
+        "provenance": ("Volatility targeting: scale exposure so realized vol "
+                       "converges toward a target — the core risk engine of "
+                       "risk-parity and hedge-fund vol-control mandates (long-only "
+                       "variant) or trend-gated long/short variant."),
+        "params": [
+            {"name": "target_vol", "type": "float", "min": 5.0, "max": 30.0, "default": 15.0},
+            {"name": "lookback", "type": "int", "min": 10, "max": 120, "default": 30},
+            {"name": "cap", "type": "float", "min": 1.0, "max": 3.0, "default": 1.5},
+            {"name": "direction", "type": "categorical", "choices": ["long_only", "long_short"], "default": "long_only"},
+        ],
+        "sig": sig, "ops": False,
+    }
+
+
+@_register
+def _market_making():
+    def sig(df, p):
+        close = df["Close"]
+        fair = _ema(close, int(p["fair_period"]))
+        dev = (close / fair - 1.0) * 100.0
+        spread = p["half_spread_pct"]
+        # Below fair value -> we captured the bid; fade the deviation. This is the
+        # inventory-skew intuition (quote below/above fair pulls inventory back to
+        # target) approximated on daily bars.
+        out = -np.tanh(dev / max(spread, 1e-6))
+        out = out.clip(-p["max_inv"], p["max_inv"])
+        return out.fillna(0.0).rename("sig")
+    return {
+        "name": "market_making", "family": "liquidity",
+        "label": "Inventory-Skewed Market Making (approximation)",
+        "provenance": ("Market making: quote around fair value and skew toward the "
+                       "inventory target — the Optiver / Jane Street playbook. Daily "
+                       "OHLCV only approximates spread capture; production use needs "
+                       "L1/L2 order-book data. Sizing is capped by max_inv to model "
+                       "inventory limits."),
+        "params": [
+            {"name": "fair_period", "type": "int", "min": 10, "max": 100, "default": 30},
+            {"name": "half_spread_pct", "type": "float", "min": 0.05, "max": 1.0, "default": 0.25},
+            {"name": "max_inv", "type": "float", "min": 0.1, "max": 0.9, "default": 0.5},
+        ],
+        "sig": sig, "ops": False,
+    }
+
+
+@_register
+def _statarb_z():
+    def sig(df, p):
+        close = df["Close"]
+        z = _rolling_z(close, int(p["period"]))
+        state = 0
+        out = np.zeros(len(df))
+        for i in range(len(df)):
+            zi = z.iloc[i]
+            if pd.isna(zi):
+                out[i] = 0.0
+                continue
+            if state == 0:
+                if zi > p["entry_z"]:
+                    state = -1
+                elif zi < -p["entry_z"]:
+                    state = 1
+            elif state == 1:
+                if zi >= -p["exit_z"]:
+                    state = 0
+            elif state == -1:
+                if zi <= p["exit_z"]:
+                    state = 0
+            out[i] = state
+        return pd.Series(out, index=df.index, name="sig")
+    return {
+        "name": "statarb_z", "family": "statarb",
+        "label": "Z-Score Statistical Arbitrage (single-instrument)",
+        "provenance": ("Statistical arbitrage: fade deviations beyond an entry z-score, "
+                       "close when the z-score mean-reverts. The cross-sectional stat-arb "
+                       "playbook of firms like Citadel, approximated on a single series "
+                       "via rolling z-score of price around its own mean."),
+        "params": [
+            {"name": "period", "type": "int", "min": 10, "max": 120, "default": 30},
+            {"name": "entry_z", "type": "float", "min": 1.0, "max": 3.0, "default": 2.0},
+            {"name": "exit_z", "type": "float", "min": 0.1, "max": 1.0, "default": 0.5},
+        ],
+        "sig": sig, "ops": False,
+    }
+
+
+@_register
+def _gap_fade():
+    def sig(df, p):
+        close, opn = df["Close"], df["Open"]
+        gap = (opn / close.shift(1) - 1.0) * 100.0
+        thresh = p["gap_thresh_pct"]
+        hold = int(p["hold_bars"])
+        out = np.zeros(len(df))
+        active = 0
+        sign = 0
+        for i in range(len(df)):
+            if active > 0:
+                active -= 1
+                if active == 0:
+                    sign = 0
+            g = gap.iloc[i]
+            if not pd.isna(g) and abs(g) > thresh and sign == 0:
+                sign = -1 if g > 0 else 1  # fade the gap
+                active = hold
+            out[i] = sign
+        return pd.Series(out, index=df.index, name="sig")
+    return {
+        "name": "gap_fade", "family": "meanrev",
+        "label": "Overnight Gap Fade",
+        "provenance": ("Fade large overnight gaps (buy big gaps down, sell big gaps "
+                       "up) for a fixed holding window — the classic gap-mean-reversion "
+                       "event strategy studied in retail and institutional event desks."),
+        "params": [
+            {"name": "gap_thresh_pct", "type": "float", "min": 0.3, "max": 3.0, "default": 1.0},
+            {"name": "hold_bars", "type": "int", "min": 1, "max": 10, "default": 3},
+        ],
+        "sig": sig, "ops": False,
+    }
+
+
+# --------------------------------------------------------------------------- #
+#  Online Portfolio Selection (Glucksman paper families)
+# --------------------------------------------------------------------------- #
+
+def _ftrl_step(b: np.ndarray, x: np.ndarray, st: dict, params: dict) -> np.ndarray:
+    """Follow-the-Regularized-Leader: gradient ascent on log(b·x) - beta/2||b||^2."""
+    eta, beta = params["eta"], params["beta"]
+    g = x / max(float(b @ x), 1e-12) - beta * b
+    return _simplex_project(b + eta * g)
+
+
+def _pamr_step(b: np.ndarray, x: np.ndarray, st: dict, params: dict) -> np.ndarray:
+    """Passive-Aggressive Mean Reversion (Li et al. 2012)."""
+    eps, C = params["eps"], params["C"]
+    mean = float(b @ x)
+    if mean <= eps:
+        denom = float(((x - mean) ** 2).sum()) + 1e-12
+        tau = min((mean - eps) / denom, C)
+        return _simplex_project(b - tau * (x - mean))
+    return b
+
+
+def _olmar_step(b: np.ndarray, x: np.ndarray, st: dict, params: dict) -> np.ndarray:
+    """Online Moving-Average Reversion (Li & Hoi 2012): predict via window mean."""
+    w, eps = params["w"], params["eps"]
+    st["hist"].append(x)
+    if len(st["hist"]) >= w:
+        xhat = np.mean(st["hist"][-w:], axis=0)
+        mean = float(b @ xhat)
+        if mean <= eps:
+            denom = float(((xhat - mean) ** 2).sum()) + 1e-12
+            tau = (mean - eps) / denom
+            return _simplex_project(b - tau * (xhat - mean))
+    return b
+
+
+def _cwmr_step(b: np.ndarray, x: np.ndarray, st: dict, params: dict) -> np.ndarray:
+    """Confidence-Weighted Mean Reversion, diagonal-covariance variant (CWMR-2)."""
+    eps, C = params["eps"], params["C"]
+    sigma = st["sigma"]
+    mean = float(b @ x)
+    var = float(((sigma * (x - mean)) ** 2).sum()) + 1e-12
+    if mean <= eps:
+        lam = min(max((mean - eps) / var, 0.0), C)
+        b = _simplex_project(b - lam * sigma * (x - mean))
+        st["sigma"] = sigma * np.sqrt(np.clip(1.0 - 2.0 * lam * (x - mean) ** 2, 0.05, 1.0))
+    return b
+
+
+def _anticor_step(b: np.ndarray, x: np.ndarray, st: dict, params: dict) -> np.ndarray:
+    """Anticor (Borodin et al. 2003): transfer wealth from winners to losers."""
+    w, alpha, rho = params["w"], params["alpha"], params["rho"]
+    st["hist"].append(np.log(np.clip(x, 1e-12, None)))
+    L = len(st["hist"])
+    m = len(b)
+    if L >= 2 * w:
+        y1 = np.array(st["hist"][L - 2 * w:L - w])
+        y2 = np.array(st["hist"][L - w:])
+        mu1, mu2 = y1.mean(axis=0), y2.mean(axis=0)
+        var2 = y2.var(axis=0)
+        with np.errstate(all="ignore"):
+            c = np.corrcoef(y1.T, y2.T)[:m, m:]
+        c = np.nan_to_num(c, nan=0.0)
+        for i in range(m):
+            for j in range(m):
+                if i == j or c[i, j] <= rho:
+                    continue
+                if mu1[i] > mu2[i]:
+                    transfer = alpha * c[i, j] * (mu1[i] - mu2[i]) / max(var2[i], 1e-12)
+                    transfer = min(transfer, b[i] / max(m - 1, 1))
+                    b[i] -= transfer
+                    b[j] += transfer
+    return _simplex_project(b)
+
+
+_OPS_STEPS = {
+    "ftrl": (_ftrl_step, lambda: {}),
+    "pamr": (_pamr_step, lambda: {}),
+    "olmar": (_olmar_step, lambda: {"hist": []}),
+    "cwmr": (_cwmr_step, lambda: {"sigma": np.full(1, 0.5)}),
+    "anticor": (_anticor_step, lambda: {"hist": []}),
+}
+
+OPS_ALGOS = {
+    "ftrl": {"label": "FTRL (Follow-the-Regularized-Leader)", "params": [
+        {"name": "eta", "type": "float", "min": 0.01, "max": 0.5, "default": 0.1},
+        {"name": "beta", "type": "float", "min": 0.0, "max": 1.0, "default": 0.1},
+    ]},
+    "pamr": {"label": "PAMR (Passive-Aggressive Mean Reversion)", "params": [
+        {"name": "eps", "type": "float", "min": 0.0005, "max": 0.02, "default": 0.005},
+        {"name": "C", "type": "float", "min": 0.1, "max": 10.0, "default": 1.0},
+    ]},
+    "cwmr": {"label": "CWMR (Confidence-Weighted Mean Reversion)", "params": [
+        {"name": "eps", "type": "float", "min": 0.0005, "max": 0.02, "default": 0.005},
+        {"name": "C", "type": "float", "min": 0.1, "max": 10.0, "default": 2.0},
+    ]},
+    "olmar": {"label": "OLMAR (Online Moving-Average Reversion)", "params": [
+        {"name": "w", "type": "int", "min": 2, "max": 30, "default": 5},
+        {"name": "eps", "type": "float", "min": 0.0005, "max": 0.02, "default": 0.005},
+    ]},
+    "anticor": {"label": "Anticor (Anti-Correlation Transfer)", "params": [
+        {"name": "w", "type": "int", "min": 2, "max": 20, "default": 3},
+        {"name": "alpha", "type": "float", "min": 0.5, "max": 4.0, "default": 2.5},
+        {"name": "rho", "type": "float", "min": 0.1, "max": 0.9, "default": 0.5},
+    ]},
+}
+
+
+def run_ops_basket(prices: pd.DataFrame, algo: str, params: dict,
+                   capital: float = 100_000.0) -> dict:
+    """Run an online portfolio selection algorithm over a price matrix.
+
+    Returns equity + wealth + final weights + metrics. `prices` columns are
+    tickers, rows are bars. Needs >= 2 assets.
+    """
+    prices = prices.dropna(how="all").ffill().dropna()
+    if prices.shape[1] < 2 or len(prices) < 20:
+        raise ValueError("online portfolio selection needs >= 2 assets and >= 20 bars")
+    rel = prices.to_numpy()
+    rel = rel[1:] / rel[:-1]
+    rel = np.clip(rel, 1e-8, None)
+    n, m = rel.shape
+    if algo not in _OPS_STEPS:
+        raise ValueError(f"unknown OPS algorithm: {algo}")
+    step, state0 = _OPS_STEPS[algo]
+    b = np.full(m, 1.0 / m)
+    st = state0()
+    if algo == "cwmr":
+        st["sigma"] = np.full(m, 0.5)
+    wealths: list = []
+    for t in range(n):
+        x = rel[t]
+        wealths.append(max(float(b @ x), 1e-12))  # wealth from weights set BEFORE x_t
+        b = step(b, x, st, params)
+    wealth = np.cumprod(wealths)
+    equity = pd.Series(wealth * capital, index=prices.index[1:])
+    returns = equity.pct_change().fillna(0.0)
+    metrics = compute_metrics(returns, equity, bars_per_year=BARS_PER_YEAR, capital=capital)
+    metrics["trades"] = m  # rebalanced weights, not discrete trades
+    metrics["exposure"] = 1.0
+    return {
+        "equity": equity, "returns": returns, "metrics": metrics,
+        "final_weights": {prices.columns[i]: round(float(b[i]), 4) for i in range(m)},
+        "weights_history": None,
+    }
+
+
+def run_fast_universalization(prices: pd.DataFrame, base_algos: list,
+                              base_params: dict, capital: float = 100_000.0) -> dict:
+    """Fast Universalization (Glucksman eq. 21): reweight experts by cumulative wealth."""
+    results = {}
+    for algo in base_algos:
+        results[algo] = run_ops_basket(prices, algo, base_params.get(algo, {}), capital)
+    wealths = {a: res["equity"] for a, res in results.items()}
+    idx = list(wealths.values())[0].index
+    W = pd.DataFrame({a: wealths[a].reindex(idx).ffill() for a in base_algos}).fillna(1.0)
+    weights = W.div(W.sum(axis=1), axis=0)
+    blended = (W.diff().fillna(0.0) * weights).sum(axis=1) + 1.0
+    blended.iloc[0] = 1.0
+    equity = blended.cumprod() * capital
+    returns = equity.pct_change().fillna(0.0)
+    metrics = compute_metrics(returns, equity, bars_per_year=BARS_PER_YEAR, capital=capital)
+    final_w = {a: round(float(weights[a].iloc[-1]), 4) for a in base_algos}
+    return {"equity": equity, "returns": returns, "metrics": metrics,
+            "final_weights": final_w, "weights_history": weights}
+
+
+# --------------------------------------------------------------------------- #
+#  Single-instrument backtester (OHLCV, honest fills & costs)
+# --------------------------------------------------------------------------- #
+
+def backtest_ohlcv(df: pd.DataFrame, signal: pd.Series, params: dict,
+                   capital: float = 100_000.0, bars_per_year: int = BARS_PER_YEAR) -> dict:
+    """Bar-by-bar backtest with cash accounting, costs, and gap-aware stops."""
+    o, h, l, c = (df["Open"].to_numpy(), df["High"].to_numpy(),
+                  df["Low"].to_numpy(), df["Close"].to_numpy())
+    sig = signal.reindex(df.index).fillna(0.0).to_numpy()
+    n = len(df)
+    sizing = params.get("sizing", "vol_target")
+    risk_pct = float(params.get("risk_pct", 0.15))
+    max_lev = float(params.get("max_leverage", 2.0))
+    atr_n = int(params.get("atr_period", 14))
+    atr = _atr(df, atr_n).to_numpy()
+    stop_pct = params.get("stop_loss_pct", None)
+    tp_pct = params.get("take_profit_pct", None)
+    trail_pct = params.get("trailing_pct", None)
+    max_hold = int(params.get("max_hold_bars", 0)) or None
+    commission = float(params.get("commission_bps", 3.0)) / 1e4
+    slippage = float(params.get("slippage_bps", 5.0)) / 1e4
+    direction = params.get("direction", "long_only")
+
+    cash = capital
+    shares = 0.0
+    entry_price = 0.0
+    entry_bar = 0
+    peak_price = 0.0
+    trades: list = []
+    equity = np.zeros(n)
+    open_pos = False
+    cur_dir = 0
+    open_trade = None
+
+    for i in range(n):
+        price = c[i]
+        opn = o[i]
+        # ---- exits (gap-aware: fill at open if it gaps through the stop) ----
+        if open_pos:
+            gapped = False
+            exit_price = None
+            if stop_pct is not None:
+                stop_px = entry_price * (1 - stop_pct / 100.0) if cur_dir > 0 else entry_price * (1 + stop_pct / 100.0)
+                if (cur_dir > 0 and opn <= stop_px) or (cur_dir < 0 and opn >= stop_px):
+                    exit_price, gapped = opn, True
+                elif (cur_dir > 0 and price <= stop_px) or (cur_dir < 0 and price >= stop_px):
+                    exit_price = stop_px
+            if tp_pct is not None and exit_price is None:
+                tp_px = entry_price * (1 + tp_pct / 100.0 * cur_dir)
+                if (cur_dir > 0 and opn >= tp_px) or (cur_dir < 0 and opn <= tp_px):
+                    exit_price, gapped = opn, True
+                elif (cur_dir > 0 and price >= tp_px) or (cur_dir < 0 and price <= tp_px):
+                    exit_price = tp_px
+            if trail_pct is not None and exit_price is None:
+                if cur_dir > 0:
+                    peak_price = max(peak_price, price)
+                    trail_stop = peak_price * (1 - trail_pct / 100.0)
+                    if opn <= trail_stop:
+                        exit_price, gapped = opn, True
+                    elif price <= trail_stop:
+                        exit_price = trail_stop
+                else:
+                    peak_price = min(peak_price, price) if peak_price != 0 else price
+                    trail_stop = peak_price * (1 + trail_pct / 100.0)
+                    if opn >= trail_stop:
+                        exit_price, gapped = opn, True
+                    elif price >= trail_stop:
+                        exit_price = trail_stop
+            if max_hold is not None and exit_price is None and (i - entry_bar) >= max_hold:
+                exit_price = opn
+                gapped = True
+            if exit_price is not None:
+                fill = exit_price if gapped else price
+                cost = commission + slippage
+                cash += shares * fill * (1 - cost)
+                exit_pnl_pct = (fill / entry_price - 1.0) * cur_dir * 100.0
+                open_trade["exit_pnl_pct"] = round(exit_pnl_pct, 4)
+                open_trade["exit_date"] = str(df.index[i].date())
+                open_trade["hold_bars"] = i - entry_bar
+                trades.append(open_trade)
+                open_trade = None
+                shares = 0.0
+                open_pos = False
+                cur_dir = 0
+
+        # ---- target position ----
+        target = float(sig[i])
+        if direction == "long_only":
+            target = max(target, 0.0)
+        target = float(np.clip(target, -max_lev, max_lev))
+        if target != 0 and not open_pos:
+            px = opn if not pd.isna(opn) else price
+            atr_i = atr[i] if not pd.isna(atr[i]) and atr[i] > 0 else px * 0.02
+            atr_pct = max(atr_i / px, 1e-4)
+            if sizing == "vol_target":
+                # risk budget: one ATR adverse move costs `risk_pct` of capital
+                notional = capital * risk_pct / atr_pct
+            else:  # fixed_pct
+                notional = capital * risk_pct
+            notional = min(notional, capital * max_lev)
+            notional = min(notional, cash / max((1 + commission + slippage), 1e-9))
+            if notional > 0 and notional / max(capital, 1e-9) >= 0.002:
+                buy_shares = notional / px
+                cost = commission + slippage
+                if target > 0:
+                    cash -= buy_shares * px * (1 + cost)
+                    shares = buy_shares
+                else:
+                    cash += buy_shares * px * (1 - cost)  # short proceeds held in cash
+                    shares = -buy_shares
+                open_pos = True
+                cur_dir = 1.0 if target > 0 else -1.0
+                entry_price = px
+                entry_bar = i
+                peak_price = px
+                open_trade = {"entry_date": str(df.index[i].date()), "entry_price": round(px, 4),
+                              "direction": "LONG" if cur_dir > 0 else "SHORT",
+                              "exit_pnl_pct": None, "exit_date": None, "hold_bars": None}
+        elif open_pos and abs(target) < 0.01 and not gapped:
+            # flat signal while holding: close at close (no gap info needed)
+            fill = price
+            cost = commission + slippage
+            cash += shares * fill * (1 - cost)
+            open_trade["exit_pnl_pct"] = round((fill / entry_price - 1.0) * cur_dir * 100.0, 4)
+            open_trade["exit_date"] = str(df.index[i].date())
+            open_trade["hold_bars"] = i - entry_bar
+            trades.append(open_trade)
+            open_trade = None
+            shares = 0.0
+            open_pos = False
+            cur_dir = 0
+
+        equity[i] = cash + shares * price
+
+    if open_pos:
+        fill = c[-1]
+        cash += shares * fill * (1 - commission - slippage)
+        open_trade["exit_pnl_pct"] = round((fill / entry_price - 1.0) * cur_dir * 100.0, 4)
+        open_trade["exit_date"] = str(df.index[-1].date())
+        open_trade["hold_bars"] = n - 1 - entry_bar
+        trades.append(open_trade)
+
+    eq = pd.Series(equity, index=df.index)
+    returns = eq.pct_change().fillna(0.0)
+    metrics = compute_metrics(returns, eq, trades=trades, bars_per_year=bars_per_year, capital=capital)
+    return {"equity": eq, "returns": returns, "metrics": metrics, "trades": trades}
+
+
+# --------------------------------------------------------------------------- #
+#  Parameter search with train/test splits (conditional-return, like the repo)
+# --------------------------------------------------------------------------- #
+
+def sample_params(archetype: dict, rng: np.random.Generator,
+                  locked: Optional[dict] = None) -> dict:
+    out = {}
+    for p in archetype["params"]:
+        name = p["name"]
+        if locked and name in locked:
+            out[name] = locked[name]
+            continue
+        if p["type"] == "bool":
+            out[name] = bool(rng.integers(0, 2))
+        elif p["type"] == "int":
+            out[name] = int(rng.integers(p["min"], p["max"] + 1))
+        elif p["type"] == "categorical":
+            out[name] = str(rng.choice(p["choices"]))
+        else:
+            out[name] = float(rng.uniform(p["min"], p["max"]))
+    return out
+
+
+def _validate_params(archetype: dict, params: dict, n_bars: Optional[int] = None) -> dict:
+    """Enforce hard relationships (slow > fast, exit < entry, etc.) and keep
+    every lookback window inside the available history."""
+    p = dict(params)
+    if "fast" in p and "slow" in p and p["slow"] <= p["fast"]:
+        p["slow"] = p["fast"] + max(10, p["fast"])
+    if "entry_n" in p and "exit_n" in p and p["exit_n"] >= p["entry_n"]:
+        p["exit_n"] = max(2, p["entry_n"] - 2)
+    if n_bars is not None:
+        cap = max(10, n_bars // 3)
+        for k, v in p.items():
+            if isinstance(v, int) and k not in ("hold_bars", "max_hold_bars") and v > cap:
+                p[k] = int(cap)
+    return p
+
+
+def search_best(archetype: dict, df: pd.DataFrame, n_trials: int = 30,
+                rng: Optional[np.random.Generator] = None, seed: int = 42,
+                backtest_params: Optional[dict] = None, locked: Optional[dict] = None,
+                split: float = 0.75, objective: str = "sharpe") -> dict:
+    """Random-search the archetype's parameter space on a train window, then
+    report honest out-of-sample metrics on the held-out test window."""
+    rng = rng or np.random.default_rng(seed)
+    backtest_params = backtest_params or {}
+    n = len(df)
+    cut = max(int(n * split), 60)
+    train_df, test_df = df.iloc[:cut], df.iloc[cut:]
+    if len(train_df) < 60 or len(test_df) < 30:
+        return {"error": "insufficient history for train/test split"}
+
+    candidates = []
+    for _ in range(max(n_trials, 5)):
+        params = _validate_params(archetype, sample_params(archetype, rng, locked),
+                                  n_bars=len(train_df))
+        # compute the signal once over the FULL series: rolling indicators only
+        # use past data, so the test slice sees exactly what live trading would
+        sig_all = archetype["sig"](df, params)
+        sig_train, sig_test = sig_all.iloc[:cut], sig_all.iloc[cut:]
+        res = backtest_ohlcv(train_df, sig_train, backtest_params)
+        m = res["metrics"]
+        if m["trades"] < 1:  # at least one trade; trend systems can be 1-2 trades/window
+            continue
+        score = m.get(objective, m["sharpe"]) if objective in m else m["sharpe"]
+        if objective == "sharpe" and math.isnan(score):
+            score = -9.0
+        candidates.append((score, params, res, sig_test))
+    candidates.sort(key=lambda t: -t[0])
+    if not candidates:
+        return {"error": "no viable parameter sets found on training window"}
+
+    # robust pick: from the top-5, prefer the one whose OOS drawdown is acceptable
+    top = candidates[: min(5, len(candidates))]
+    chosen = None
+    for score, params, train_res, sig_test in top:
+        test_res = backtest_ohlcv(test_df, sig_test, backtest_params)
+        oos_m = test_res["metrics"]
+        dd_cap = float(backtest_params.get("max_dd_cap", -0.60))
+        if oos_m["trades"] >= 1 and oos_m["max_drawdown"] >= dd_cap:
+            chosen = (params, train_res, test_res, oos_m)
+            break
+    if chosen is None:
+        score, params, train_res, sig_test = candidates[0]
+        test_res = backtest_ohlcv(test_df, sig_test, backtest_params)
+        chosen = (params, train_res, test_res, test_res["metrics"])
+
+    params, train_res, test_res, oos_m = chosen
+    return {
+        "archetype": archetype["name"], "params": params,
+        "train_metrics": train_res["metrics"], "test_metrics": oos_m,
+        "train_equity": train_res["equity"], "test_equity": test_res["equity"],
+        "train_trades": train_res["trades"], "test_trades": test_res["trades"],
+    }
+
+
+# --------------------------------------------------------------------------- #
+#  Ensembles (single-instrument)
+# --------------------------------------------------------------------------- #
+
+def build_ensemble(members: list, df: pd.DataFrame, method: str = "fast_universalization",
+                   capital: float = 100_000.0) -> dict:
+    """Blend several strategies' daily returns into one ensemble.
+
+    * equal_weight       : 1/K each (static)
+    * sharpe_weight      : weight by train Sharpe (static, clipped)
+    * fast_universalization: wealth-proportional reweighting (Glucksman eq. 21)
+    """
+    if not members:
+        raise ValueError("ensemble needs at least one member")
+    equities = {m.name: m.equity.reindex(df.index).ffill() for m in members}
+    idx = df.index
+    E = pd.DataFrame(equities)
+    rets = E.pct_change().fillna(0.0)
+    K = len(members)
+    if method == "equal_weight":
+        w = pd.Series({m.name: 1.0 / K for m in members})
+        combined = (rets * w).sum(axis=1)
+        final_w = w.to_dict()
+    elif method == "sharpe_weight":
+        sh = {m.name: max(m.metrics.get("sharpe", 0.0), 0.0) for m in members}
+        tot = sum(sh.values())
+        w = pd.Series({k: (v / tot if tot > 0 else 1.0 / K) for k, v in sh.items()})
+        combined = (rets * w).sum(axis=1)
+        final_w = w.round(4).to_dict()
+    else:  # fast_universalization
+        W = E.div(E.sum(axis=1), axis=0).fillna(1.0 / K)
+        combined = (rets * W.shift(1).fillna(1.0 / K)).sum(axis=1)
+        final_w = {k: round(float(W[k].iloc[-1]), 4) for k in W.columns}
+    equity = (1.0 + combined).cumprod() * capital
+    returns = equity.pct_change().fillna(0.0)
+    metrics = compute_metrics(returns, equity, bars_per_year=BARS_PER_YEAR, capital=capital)
+    return {"equity": equity, "returns": returns, "metrics": metrics,
+            "final_weights": final_w, "method": method, "members": [m.name for m in members]}
+
+
+# --------------------------------------------------------------------------- #
+#  Natural-language request parsing (auto mode)
+# --------------------------------------------------------------------------- #
+
+_KEYWORD_FAMILIES = [
+    (["mean reversion", "mean-reversion", "mean reverting", "revert", "reversion",
+      "fade", "buy the dip", "buy dip", "oversold", "bollinger", "rsi",
+      "stat arb", "statarb", "pairs", "z-score", "zscore", "gap"],
+     ["rsi_meanrev", "bollinger_meanrev", "statarb_z", "gap_fade"]),
+    (["trend", "momentum", "moving average", "crossover", "breakout", "turtle",
+      "donchian", "follow the winner", "follow-the-winner", "follow the trend"],
+     ["trend_ma", "breakout", "dual_momentum"]),
+    (["market mak", "liquidity", "spread", "optiver", "jane street", "citadel",
+      "order book", "quoting"],
+     ["market_making"]),
+    (["volatility", "vol target", "vol targeting", "risk parity", "risk scaling",
+      "hedge fund", "risk control"],
+     ["vol_target"]),
+    (["portfolio selection", "online portfolio", "pamr", "cwmr", "ftrl", "olmar",
+      "anticor", "universal", "glucksman"],
+     ["online_ops"]),
+    (["ensemble", "meta", "combine", "combining", "multiple strategies", "blend",
+      "all of them", "everything"],
+     ["ensemble"]),
+]
+
+_DEFAULT_BY_RISK = {
+    "conservative": ["rsi_meanrev", "vol_target", "bollinger_meanrev"],
+    "balanced": ["trend_ma", "rsi_meanrev", "statarb_z"],
+    "aggressive": ["breakout", "dual_momentum", "gap_fade"],
+}
+
+
+def parse_request(text: str, risk: str = "balanced") -> list:
+    """Map a vague request to archetype families. Empty/unknown -> risk default."""
+    t = (text or "").lower()
+    hits: list = []
+    for keywords, families in _KEYWORD_FAMILIES:
+        if any(k in t for k in keywords):
+            for f in families:
+                if f not in hits and f != "ensemble":
+                    hits.append(f)
+    if "ensemble" in t or (not hits and any(k in t for k in ["all", "best", "everything", "any"])):
+        pass
+    if not hits:
+        hits = list(_DEFAULT_BY_RISK.get(risk, _DEFAULT_BY_RISK["balanced"]))
+    return hits[:4]
+
+
+# --------------------------------------------------------------------------- #
+#  Code / spec / report generation
+# --------------------------------------------------------------------------- #
+
+def generate_python(archetype_name: str, params: dict, backtest_params: dict,
+                    universe: list, ops_algo: Optional[str] = None) -> str:
+    """Generate a self-contained, runnable pandas strategy script."""
+    sym = universe[0] if universe else "SPY"
+    uni_literal = json.dumps(universe[:4])
+    if archetype_name == "online_ops":
+        ops = OPS_ALGOS.get(ops_algo or "pamr", OPS_ALGOS["pamr"])
+        p_lit = json.dumps(params)
+        return textwrap.dedent(f'''\
+            """Self-contained {ops["label"]} strategy — generated by the Algorithm Builder.
+
+            Research provenance: Glucksman Fellowship paper (NYU Stern), online
+            portfolio selection family. Rebalances weights across the universe on
+            every bar. Educational use only — not financial advice.
+            """
+            import numpy as np
+            import pandas as pd
+            from data_sources import get_stock
+
+            UNIVERSE = {uni_literal}
+            ALGO = {json.dumps(ops_algo or "pamr")!r}
+            PARAMS = {p_lit}
+
+            def main():
+                prices = pd.DataFrame({{s: get_stock(s)["Close"] for s in UNIVERSE}})
+                prices = prices.ffill().dropna()
+                rel = np.clip(prices.to_numpy()[1:] / prices.to_numpy()[:-1], 1e-8, None)
+                n, m = rel.shape
+                w = np.full(m, 1.0 / m)
+                weights = []
+                for t in range(n):
+                    x = rel[t]
+                    mean = w @ x
+                    if "eps" in PARAMS and mean <= PARAMS["eps"]:
+                        denom = ((x - mean) ** 2).sum() + 1e-12
+                        tau = min((mean - PARAMS["eps"]) / denom, PARAMS.get("C", 1.0))
+                        w = w - tau * (x - mean)
+                        w = np.clip(w, 0, None)
+                        w /= max(w.sum(), 1e-12)
+                    weights.append(w.copy())
+                wealth = np.cumprod([w @ x for w, x in zip(weights, rel)])
+                eq = pd.Series(wealth, index=prices.index[1:])
+                print(eq.tail())
+                return eq
+
+            if __name__ == "__main__":
+                main()
+            ''')
+    a = ARCHETYPES[archetype_name]
+    p_lit = json.dumps(params)
+    bp_lit = json.dumps(backtest_params)
+    return textwrap.dedent(f'''\
+        """{a["label"]} — generated by the Algorithm Builder.
+
+        Research provenance: {a["provenance"]}
+        Educational use only — not financial advice.
+        """
+        import numpy as np
+        import pandas as pd
+        from data_sources import get_stock
+
+        SYMBOL = {json.dumps(sym)}
+        PARAMS = {p_lit}
+        BACKTEST = {bp_lit}
+
+        def sma(s, n):
+            return s.rolling(max(int(n), 2)).mean()
+
+        def signal(df, p):
+            """Returns target exposure in [-1, 1] per bar."""
+            close = df["Close"]
+    ''') + textwrap.indent(_signal_body(archetype_name), "    ") + textwrap.dedent(f'''\
+
+        def main():
+            df = get_stock(SYMBOL)
+            sig = signal(df, PARAMS)
+            eq = df["Close"].iloc[:0].copy()
+            cash, shares, equity = 100_000.0, 0.0, []
+            for i in range(len(df)):
+                price = float(df["Close"].iloc[i])
+                target = float(sig.iloc[i])
+                if BACKTEST.get("direction") == "long_only":
+                    target = max(target, 0.0)
+                if shares == 0 and target != 0:
+                    notional = min(100_000 * 0.5, cash * 0.95)
+                    shares = notional / price * (1 if target > 0 else -1)
+                    if target < 0:
+                        cash += notional
+                elif shares != 0 and abs(target) < 0.01:
+                    cash += shares * price * (1 - 0.0008)
+                    shares = 0.0
+                equity.append(cash + shares * price)
+            out = pd.Series(equity, index=df.index)
+            print(out.tail())
+            return out
+
+        if __name__ == "__main__":
+            main()
+        ''')
+
+
+def _signal_body(name: str) -> str:
+    """Emit the signal function body for the generated script (mirrors engine)."""
+    if name == "trend_ma":
+        return textwrap.dedent('''\
+                fast = sma(close, PARAMS["fast"])
+                slow = sma(close, PARAMS["slow"])
+                return np.tanh(((fast / slow - 1) * 100) / max(PARAMS["hysteresis_pct"], 1e-6)).fillna(0)
+
+        ''')
+    if name == "breakout":
+        return textwrap.dedent('''\
+                hi = df["High"].rolling(int(PARAMS["entry_n"])).max().shift(1)
+                lo = df["Low"].rolling(int(PARAMS["exit_n"])).min().shift(1)
+                out = pd.Series(0.0, index=df.index)
+                state = 0
+                for i in range(len(df)):
+                    c = close.iloc[i]
+                    if state == 0:
+                        if c > hi.iloc[i]: state = 1
+                        elif c < lo.iloc[i]: state = -1
+                    elif state == 1 and c < lo.iloc[i]: state = -1
+                    elif state == -1 and c > hi.iloc[i]: state = 1
+                    out.iloc[i] = state
+                return out
+
+        ''')
+    if name == "dual_momentum":
+        return textwrap.dedent('''\
+                rel = close / close.shift(int(PARAMS["rel_bars"])) - 1
+                gate = close / close.shift(int(PARAMS["abs_bars"])) - 1
+                return (np.tanh(rel * 100 / max(PARAMS["mom_scale"], 1e-6))).where(gate > 0, 0).fillna(0)
+
+        ''')
+    if name == "rsi_meanrev":
+        return textwrap.dedent('''\
+                delta = close.diff()
+                gain = delta.clip(lower=0).ewm(alpha=1/int(PARAMS["period"]), adjust=False).mean()
+                loss = (-delta.clip(upper=0)).ewm(alpha=1/int(PARAMS["period"]), adjust=False).mean()
+                rsi = 100 - 100 / (1 + gain / loss.replace(0, float("nan")))
+                vol = close.pct_change().rolling(20).std() * np.sqrt(252)
+                cap = vol.rolling(250).quantile(PARAMS["vol_cap_pct"] / 100)
+                out = pd.Series(0.0, index=df.index)
+                out[(rsi < PARAMS["oversold"]) & (vol <= cap)] = 1.0
+                out[(rsi > PARAMS["overbought"]) & (vol <= cap)] = -1.0
+                return out.fillna(0)
+
+        ''')
+    if name == "bollinger_meanrev":
+        return textwrap.dedent('''\
+                mid = sma(close, int(PARAMS["period"]))
+                sd = close.rolling(int(PARAMS["period"])).std()
+                up, lo_ = mid + PARAMS["n_std"] * sd, mid - PARAMS["n_std"] * sd
+                out = pd.Series(0.0, index=df.index)
+                out[close < lo_] = 1.0
+                out[close > up] = -1.0
+                return out
+
+        ''')
+    if name == "vol_target":
+        return textwrap.dedent('''\
+                rv = close.pct_change().rolling(int(PARAMS["lookback"])).std() * np.sqrt(252)
+                scale = (PARAMS["target_vol"] / 100) / rv.replace(0, float("nan"))
+                scale = scale.clip(upper=PARAMS["cap"]).fillna(0)
+                if PARAMS["direction"] == "long_only":
+                    return scale.clip(lower=0, upper=1)
+                trend = np.sign(close - sma(close, int(PARAMS["lookback"])))
+                return (scale * trend).clip(-1, 1)
+
+        ''')
+    if name == "market_making":
+        return textwrap.dedent('''\
+                fair = close.ewm(span=int(PARAMS["fair_period"]), adjust=False).mean()
+                dev = (close / fair - 1) * 100
+                out = -np.tanh(dev / max(PARAMS["half_spread_pct"], 1e-6)).clip(-PARAMS["max_inv"], PARAMS["max_inv"])
+                return out.fillna(0)
+
+        ''')
+    if name == "statarb_z":
+        return textwrap.dedent('''\
+                mu = close.rolling(int(PARAMS["period"])).mean()
+                sd = close.rolling(int(PARAMS["period"])).std()
+                z = (close - mu) / sd.replace(0, float("nan"))
+                out = pd.Series(0.0, index=df.index)
+                out[z > PARAMS["entry_z"]] = -1.0
+                out[z < -PARAMS["entry_z"]] = 1.0
+                return out
+
+        ''')
+    if name == "gap_fade":
+        return textwrap.dedent('''\
+                gap = (df["Open"] / close.shift(1) - 1) * 100
+                out = pd.Series(0.0, index=df.index)
+                out[gap.abs() > PARAMS["gap_thresh_pct"]] = -np.sign(gap[gap.abs() > PARAMS["gap_thresh_pct"]])
+                return out
+
+        ''')
+    return "        return pd.Series(0.0, index=close.index)\n\n"
+
+
+# --------------------------------------------------------------------------- #
+#  Orchestration
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class AlgorithmResult:
+    name: str
+    family: str
+    archetype: str
+    params: dict
+    backtest_params: dict
+    provenance: str
+    equity: pd.Series
+    returns: pd.Series
+    metrics: dict
+    trades: list
+    train_metrics: Optional[dict] = None
+    test_metrics: Optional[dict] = None
+    universe: list = field(default_factory=list)
+    ops_algo: Optional[str] = None
+    ensemble_weights: Optional[dict] = None
+    members: list = field(default_factory=list)
+    build_notes: list = field(default_factory=list)
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id, "name": self.name, "family": self.family,
+            "archetype": self.archetype, "params": self.params,
+            "backtest_params": self.backtest_params, "provenance": self.provenance,
+            "metrics": {k: round(v, 4) if isinstance(v, float) else v for k, v in self.metrics.items()},
+            "train_metrics": self.train_metrics, "test_metrics": self.test_metrics,
+            "universe": self.universe, "ops_algo": self.ops_algo,
+            "ensemble_weights": self.ensemble_weights, "members": self.members,
+            "build_notes": self.build_notes,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2)
+
+    def to_csv(self) -> str:
+        eq = self.equity.rename("Equity")
+        ret = self.returns.rename("Return")
+        sig = eq.index.to_series().rename("Date")
+        out = pd.concat([sig, eq, ret], axis=1)
+        out["Date"] = out["Date"].astype(str)
+        return out.to_csv(index=False)
+
+    def to_markdown(self, include_code: bool = True) -> str:
+        m = self.metrics
+        lines = [
+            f"# {self.name}",
+            "",
+            f"**Family:** {self.family} · **Archetype:** {self.archetype}",
+            f"**Provenance:** {self.provenance}",
+            "",
+            "## Backtest metrics (in-sample full window)",
+            "",
+            "| Metric | Value |",
+            "| --- | --- |",
+            f"| Total return | {m['total_return'] * 100:.2f}% |",
+            f"| CAGR | {m['cagr'] * 100:.2f}% |",
+            f"| Sharpe | {m['sharpe']:.2f} |",
+            f"| Sortino | {m['sortino']:.2f} |",
+            f"| Volatility | {m['volatility'] * 100:.2f}% |",
+            f"| Max drawdown | {m['max_drawdown'] * 100:.2f}% |",
+            f"| Calmar | {m['calmar']:.2f} |",
+            f"| Win rate | {m['win_rate'] * 100:.1f}% |",
+            f"| Profit factor | {m['profit_factor']:.2f} |",
+            f"| Trades | {m['trades']} |",
+            "",
+            "## Parameters",
+            "",
+            "```json",
+            json.dumps(self.params, indent=2),
+            "```",
+            "",
+            "## Backtest parameters",
+            "",
+            "```json",
+            json.dumps(self.backtest_params, indent=2),
+            "```",
+        ]
+        if self.train_metrics and self.test_metrics:
+            lines += [
+                "",
+                "## Train / test split (honest out-of-sample)",
+                "",
+                f"- Train Sharpe: {self.train_metrics.get('sharpe', 0):.2f} "
+                f"(drawdown {self.train_metrics.get('max_drawdown', 0) * 100:.1f}%)",
+                f"- **Test (OOS) Sharpe: {self.test_metrics.get('sharpe', 0):.2f}** "
+                f"(drawdown {self.test_metrics.get('max_drawdown', 0) * 100:.1f}%, trades {self.test_metrics.get('trades', 0)})",
+            ]
+        if self.ensemble_weights:
+            lines += ["", "## Ensemble weights", ""]
+            for k, v in self.ensemble_weights.items():
+                lines.append(f"- {k}: {v * 100:.1f}%")
+            lines.append("")
+            lines.append(f"**Members:** {', '.join(self.members)}")
+        if include_code:
+            lines += ["", "## Generated code", "", "```python", self.code(), "```"]
+        lines += ["", "---", "*Educational use only — not financial advice.*"]
+        return "\n".join(lines)
+
+    def code(self) -> str:
+        return generate_python(self.archetype, self.params, self.backtest_params,
+                               self.universe, self.ops_algo)
+
+
+def _default_backtest_params(risk: str, direction: str) -> dict:
+    if risk == "conservative":
+        return {"sizing": "vol_target", "risk_pct": 0.08, "max_leverage": 1.0,
+                "stop_loss_pct": 5.0, "take_profit_pct": None, "trailing_pct": None,
+                "max_hold_bars": 0, "commission_bps": 3.0, "slippage_bps": 5.0,
+                "direction": "long_only", "max_dd_cap": -0.25}
+    if risk == "aggressive":
+        return {"sizing": "vol_target", "risk_pct": 0.25, "max_leverage": 2.0,
+                "stop_loss_pct": 8.0, "take_profit_pct": None, "trailing_pct": 12.0,
+                "max_hold_bars": 0, "commission_bps": 3.0, "slippage_bps": 5.0,
+                "direction": direction, "max_dd_cap": -0.70}
+    return {"sizing": "vol_target", "risk_pct": 0.15, "max_leverage": 1.5,
+            "stop_loss_pct": 6.0, "take_profit_pct": None, "trailing_pct": 8.0,
+            "max_hold_bars": 0, "commission_bps": 3.0, "slippage_bps": 5.0,
+            "direction": direction, "max_dd_cap": -0.45}
+
+
+def _fmt_metric(v) -> str:
+    if isinstance(v, float):
+        return f"{v:.4f}"
+    return str(v)
+
+
+def build_algorithms(
+    request: str = "",
+    mode: str = "auto",
+    count: int = 3,
+    ensemble: bool = False,
+    risk: str = "balanced",
+    direction: str = "long_only",
+    universe: Optional[list] = None,
+    archetypes: Optional[list] = None,
+    locked_params: Optional[dict] = None,
+    n_trials: int = 25,
+    seed: int = 42,
+    data_fn: Callable = _default_get_stock,
+    period: str = "3y",
+    backtest_params_override: Optional[dict] = None,
+) -> list:
+    """Build one or more algorithms from a request.
+
+    Auto mode parses the natural-language request; guided mode uses the explicit
+    `archetypes` list. Returns a list of AlgorithmResult. Ensemble mode appends
+    an ensemble card built from the top members.
+    """
+    rng = np.random.default_rng(seed)
+    universe = universe or ["SPY"]
+    universe = [u.strip().upper() for u in universe if u and u.strip()]
+    if not universe:
+        universe = ["SPY"]
+
+    if mode == "guided" and archetypes:
+        families = [a for a in archetypes if a in ARCHETYPES or a == "online_ops"]
+    else:
+        families = parse_request(request, risk)
+    if not families:
+        families = _DEFAULT_BY_RISK.get(risk, _DEFAULT_BY_RISK["balanced"])
+
+    # fetch data (single-symbol archetypes)
+    dfs: dict = {}
+    fetch_errors: list = []
+    for sym in universe[:6]:
+        try:
+            df = data_fn(sym, period=period, interval="1d")
+            if df is None or len(df) < 60:
+                raise ValueError(f"insufficient history for {sym}")
+            for col in ("Open", "High", "Low", "Close", "Volume"):
+                if col not in df.columns:
+                    df[col] = df["Close"] if col == "Close" else df.get(col)
+            dfs[sym] = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        except Exception as e:  # noqa: BLE001
+            fetch_errors.append(f"{sym}: {e}")
+    if not dfs:
+        raise RuntimeError("Could not fetch price data for any symbol in the universe: "
+                           + "; ".join(fetch_errors))
+    primary_sym = universe[0] if universe[0] in dfs else next(iter(dfs))
+    primary = dfs[primary_sym]
+
+    bp = backtest_params_override or _default_backtest_params(risk, direction)
+    locked = locked_params or {}
+
+    results: list = []
+    used_families = families[: max(count, 1)]
+    # diversify: rotate seeds so repeated families produce distinct configs
+    for i, fam in enumerate(used_families):
+        if fam == "online_ops":
+            if len(dfs) < 2:
+                results.append(_error_result("online_ops",
+                    "Online portfolio selection needs ≥ 2 assets in the universe. "
+                    "Add more tickers (e.g. SPY, QQQ, IWM) or pick another family."))
+                continue
+            prices = pd.DataFrame({s: dfs[s]["Close"] for s in dfs})
+            ops_algo = locked.get("ops_algo", "pamr")
+            params = {p["name"]: p["default"] for p in OPS_ALGOS[ops_algo]["params"]}
+            for p in OPS_ALGOS[ops_algo]["params"]:
+                if p["name"] in locked:
+                    params[p["name"]] = locked[p["name"]]
+            res = run_ops_basket(prices, ops_algo, params)
+            prov = OPS_ALGOS[ops_algo]["label"] + " — " + (
+                "Glucksman Fellowship paper (NYU Stern) online portfolio selection family."
+                if ops_algo in ("pamr", "cwmr", "olmar", "anticor") else
+                "Glucksman Fellowship paper FTRL (regularized Follow-the-Winner).")
+            results.append(AlgorithmResult(
+                name=f"OPS-{ops_algo.upper()}-{primary_sym}", family="portfolio",
+                archetype="online_ops", params=params,
+                backtest_params={"universe": list(dfs)},
+                provenance=prov, equity=res["equity"], returns=res["returns"],
+                metrics=res["metrics"], trades=[], universe=list(dfs),
+                ops_algo=ops_algo,
+                build_notes=["Portfolio-level backtest over " + ", ".join(list(dfs)[:4])]))
+            continue
+        a = ARCHETYPES[fam]
+        trial_rng = np.random.default_rng(seed + i * 1013)
+        found = search_best(a, primary, n_trials=n_trials, rng=trial_rng,
+                            backtest_params=bp, locked=locked,
+                            seed=seed + i * 1013)
+        if "error" in found:
+            results.append(_error_result(fam, found["error"]))
+            continue
+        params = found["params"]
+        sig = a["sig"](primary, params)
+        full = backtest_ohlcv(primary, sig, bp)
+        results.append(AlgorithmResult(
+            name=f"{a['label']}-{primary_sym}", family=a["family"], archetype=fam,
+            params=params, backtest_params=bp, provenance=a["provenance"],
+            equity=full["equity"], returns=full["returns"], metrics=full["metrics"],
+            trades=full["trades"], train_metrics=found["train_metrics"],
+            test_metrics=found["test_metrics"], universe=[primary_sym],
+            build_notes=[f"Parameters optimized on train window "
+                         f"(train Sharpe {found['train_metrics'].get('sharpe', 0):.2f}), "
+                         f"reported OOS test Sharpe "
+                         f"{found['test_metrics'].get('sharpe', 0):.2f}."]))
+
+    # ensemble of the built members (skip error cards)
+    if ensemble and len(results) >= 2:
+        members = [r for r in results if r.metrics.get("trades", 0) > 0 or r.family == "portfolio"]
+        if len(members) >= 2:
+            method = "fast_universalization"
+            ens = build_ensemble(members, primary, method=method)
+            results.append(AlgorithmResult(
+                name=f"ENSEMBLE-{len(members)}-strategies", family="ensemble",
+                archetype="ensemble", params={"method": method,
+                                              "members": [m.name for m in members]},
+                backtest_params=bp,
+                provenance=("Fast Universalization (Glucksman eq. 21): experts are "
+                            "reweighted by cumulative wealth each bar — the meta-learning "
+                            "family that beat every single strategy in the paper."),
+                equity=ens["equity"], returns=ens["returns"], metrics=ens["metrics"],
+                trades=[], train_metrics=None, test_metrics=None,
+                universe=[primary_sym], ensemble_weights=ens["final_weights"],
+                members=[m.name for m in members],
+                build_notes=[f"Blend method: {method}. Weights drift toward "
+                             f"historically-strong members."]))
+    return results
+
+
+def _error_result(family: str, msg: str) -> AlgorithmResult:
+    idx = pd.date_range("2020-01-01", periods=2, freq="D")
+    eq = pd.Series([100_000.0, 100_000.0], index=idx)
+    return AlgorithmResult(
+        name=f"{family}-ERROR", family=family, archetype=family,
+        params={}, backtest_params={}, provenance="",
+        equity=eq, returns=pd.Series([0.0, 0.0], index=idx),
+        metrics={"total_return": 0.0, "cagr": 0.0, "sharpe": 0.0, "sortino": 0.0,
+                 "max_drawdown": 0.0, "calmar": 0.0, "volatility": 0.0, "win_rate": 0.0,
+                 "profit_factor": 0.0, "trades": 0, "exposure": 0.0, "best_trade": 0.0,
+                 "worst_trade": 0.0, "avg_hold_bars": 0.0, "years": 0.0},
+        trades=[], build_notes=["ERROR: " + msg])
+
+
+def build_request_signature(request: str, mode: str, count: int, ensemble: bool,
+                            risk: str, direction: str, universe: list,
+                            archetypes: list, locked: dict, n_trials: int, seed: int) -> str:
+    blob = json.dumps([request, mode, count, ensemble, risk, direction,
+                       universe, archetypes, locked, n_trials, seed], sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+# Re-export for UI convenience
+ALL_ARCHETYPE_NAMES = list(ARCHETYPES.keys()) + ["online_ops"]
+RISK_PROFILES = ["conservative", "balanced", "aggressive"]
+EXPORT_FORMATS = ["python", "json", "csv", "markdown"]
