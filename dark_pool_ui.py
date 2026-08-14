@@ -68,6 +68,73 @@ def _mode_selector() -> str:
     return mode
 
 
+def _mode_banner(mode: str) -> None:
+    """Make the current mode's scope explicit — switching modes must be visible."""
+    if mode == "Basic":
+        st.info(
+            "**Basic mode — plain-language view.** Summaries and key figures; "
+            "statistics like z-scores, raw tables and evidence are hidden. "
+            "Switch to **Advanced** for full statistics, or **Institutional** "
+            "for raw data, lineage and per-figure provenance.")
+    elif mode == "Advanced":
+        st.info(
+            "**Advanced mode — full statistics.** Adds z-scores, raw tables, "
+            "evidence and statistical context on top of the Basic view. "
+            "**Institutional** additionally exposes provenance and raw model outputs.")
+    else:
+        st.info(
+            "**Institutional mode — raw data & lineage.** Everything in Advanced "
+            "plus provenance, method notes and raw model outputs for every figure.")
+
+
+def _plain_language_summary(r: dict) -> str:
+    """Template-grounded plain-language digest of a ticker report (Basic mode).
+
+    Built only from computed report metrics — never invented figures.
+    """
+    sym = r.get("symbol", "?")
+    price = r.get("price")
+    offex = r.get("offexchange_pct_20d")
+    today = r.get("offexchange_pct_today")
+    imb = r.get("imbalance_pct", 0.0)
+    relvol = r.get("rel_volume")
+    hist = r.get("historical", {})
+    pctile = hist.get("offex_pctile_20d")
+    z = hist.get("offex_z_20d")
+    inst = r.get("institutional", {})
+    pattern = inst.get("pattern", "Indeterminate")
+    iconf = inst.get("confidence", 0)
+
+    parts = []
+    parts.append(f"**{sym}** is trading at **${price:,.2f}**." if price is not None
+                 else f"**{sym}** report:")
+    if offex is not None:
+        today_txt = f", {today:.1f}% today" if today is not None else ""
+        parts.append(f"About **{offex:.1f}%** of its volume executes off-exchange "
+                     f"(20-day average{today_txt}).")
+    if pctile is not None:
+        ztxt = f" ({z:+.2f}σ from its normal level)" if z is not None else ""
+        parts.append(f"Its off-exchange activity sits at the **{pctile:.0f}th percentile** "
+                     f"of its own history{ztxt}.")
+    if imb is not None:
+        if abs(imb) < 5:
+            flow = "balanced — buyers and sellers are roughly matched"
+        elif imb > 0:
+            flow = f"net **buying** ({imb:+.1f}%)"
+        else:
+            flow = f"net **selling** ({imb:+.1f}%)"
+        parts.append(f"Estimated flow over the last 5 sessions is {flow}.")
+    if pattern and pattern != "Indeterminate":
+        parts.append(f"The overall pattern is consistent with **{pattern.lower()}** "
+                     f"(confidence {iconf * 100:.0f}%).")
+    else:
+        parts.append("The overall pattern is indeterminate — activity is too normal "
+                     "or mixed to infer intent.")
+    if relvol is not None:
+        parts.append(f"Volume is running at **{relvol:.2f}×** its 20-day average.")
+    return " ".join(parts)
+
+
 def _provenance_line(mode: str, provenance: Optional[dict]) -> None:
     if not provenance:
         return
@@ -204,6 +271,7 @@ def show_dark_pool_dashboard() -> None:
     )
 
     mode = _mode_selector()
+    _mode_banner(mode)
     engine = _engine()
     regime = engine.detect_regime()
 
@@ -421,26 +489,27 @@ def _tab_scanner(engine, mode: str) -> None:
         st.dataframe(df.nlargest(15, "SignalStrength")[cols].reset_index(drop=True),
                      width="stretch", hide_index=True)
 
-    st.markdown("---")
-    st.markdown("### Sector / Pressure Matrix")
-    fig = go.Figure(go.Scatter(
-        x=df["OffEx%"], y=df["Imbalance"],
-        mode="markers+text",
-        text=df["Symbol"],
-        textposition="top center",
-        marker=dict(
-            size=df["PressureScore"].clip(8, 30),
-            color=df["PressureScore"],
-            colorscale="Viridis",
-            showscale=True,
-            colorbar=dict(title="Pressure"),
-            line=dict(width=1, color="#0a1628"),
-        ),
-        hovertemplate="%{text}<br>OffEx %{x:.1f}%<br>Imb %{y:+.2f}<br>Pressure %{marker.color:.0f}<extra></extra>",
-    ))
-    fig.update_layout(title="Off-Exchange % vs Estimated Imbalance (bubble = pressure)",
-                      xaxis_title="Off-exchange % (20d, modeled)", yaxis_title="Imbalance (5d)")
-    st.plotly_chart(_layout(fig, 460), width="stretch")
+    if mode in ("Advanced", "Institutional"):
+        st.markdown("---")
+        st.markdown("### Sector / Pressure Matrix")
+        fig = go.Figure(go.Scatter(
+            x=df["OffEx%"], y=df["Imbalance"],
+            mode="markers+text",
+            text=df["Symbol"],
+            textposition="top center",
+            marker=dict(
+                size=df["PressureScore"].clip(8, 30),
+                color=df["PressureScore"],
+                colorscale="Viridis",
+                showscale=True,
+                colorbar=dict(title="Pressure"),
+                line=dict(width=1, color="#0a1628"),
+            ),
+            hovertemplate="%{text}<br>OffEx %{x:.1f}%<br>Imb %{y:+.2f}<br>Pressure %{marker.color:.0f}<extra></extra>",
+        ))
+        fig.update_layout(title="Off-Exchange % vs Estimated Imbalance (bubble = pressure)",
+                          xaxis_title="Off-exchange % (20d, modeled)", yaxis_title="Imbalance (5d)")
+        st.plotly_chart(_layout(fig, 460), width="stretch")
 
     if mode == "Institutional":
         _provenance_line(mode, df.attrs.get("provenance") or {
@@ -530,6 +599,11 @@ def _tab_ticker(engine, mode: str) -> None:
 
     # Weekly-granularity flag (FINRA is a weekly source — never implied daily)
     _finra_weekly_note(engine, r)
+
+    if mode == "Basic":
+        # Basic mode is the plain-language view — a grounded digest, no raw stats.
+        st.markdown("**Plain-language summary**")
+        st.markdown(_plain_language_summary(r))
 
     st.markdown("---")
 
@@ -827,14 +901,15 @@ def _tab_institutional(engine, mode: str) -> None:
         f"</div>", unsafe_allow_html=True)
 
     st.markdown("---")
-    st.markdown("**Evidence**")
-    ev = inst.get("evidence", {})
-    e1, e2, e3, e4, e5 = st.columns(5)
-    e1.metric("Off-Ex pctile (20d)", f"{ev.get('offex_pctile_20d', '—')}%")
-    e2.metric("Off-Ex z (20d)", f"{ev.get('offex_z_20d', 0):+.2f}")
-    e3.metric("Imbalance (5d)", f"{ev.get('imbalance_5d', 0):+.2f}")
-    e4.metric("10d Return", f"{ev.get('ret_10d_pct', 0):+.2f}%")
-    e5.metric("Vol ratio (10/40)", f"{ev.get('vol_ratio_10_40', 0):.2f}x")
+    if mode in ("Advanced", "Institutional"):
+        st.markdown("**Evidence**")
+        ev = inst.get("evidence", {})
+        e1, e2, e3, e4, e5 = st.columns(5)
+        e1.metric("Off-Ex pctile (20d)", f"{ev.get('offex_pctile_20d', '—')}%")
+        e2.metric("Off-Ex z (20d)", f"{ev.get('offex_z_20d', 0):+.2f}")
+        e3.metric("Imbalance (5d)", f"{ev.get('imbalance_5d', 0):+.2f}")
+        e4.metric("10d Return", f"{ev.get('ret_10d_pct', 0):+.2f}%")
+        e5.metric("Vol ratio (10/40)", f"{ev.get('vol_ratio_10_40', 0):.2f}x")
 
     # Pattern glossary
     with st.expander("What each pattern means"):
@@ -918,6 +993,13 @@ def _tab_sectors(engine, mode: str) -> None:
                     f"avg pressure: {row['AvgPressure']:.0f} · "
                     f"max signal: {row['MaxSignal']:.0f}")
 
+    if mode == "Institutional":
+        _provenance_line(mode, {
+            "category": "MIXED", "source": "dark_pool_engine.sector_analysis",
+            "method": "aggregation of per-name modeled off-exchange metrics by sector",
+            "confidence": 0.5,
+        })
+
 
 # --------------------------------------------------------------------------- #
 #  8. Historical Analytics
@@ -968,23 +1050,24 @@ def _tab_historical(engine, mode: str) -> None:
     else:
         st.info("Not enough history for percentile context.")
 
-    # z-score table
-    zrows = [
-        ("Off-Ex vol z · 5d", hist.get("offex_z_5d")),
-        ("Off-Ex vol z · 20d", hist.get("offex_z_20d")),
-        ("Off-Ex vol z · 60d", hist.get("offex_z_60d")),
-        ("Off-Ex share z · 1y", hist.get("share_z_1y")),
-    ]
-    st.markdown("**Z-scores (std dev from own mean)**")
-    zdf = pd.DataFrame([
-        {"Metric": k, "Z": v} for k, v in zrows if v is not None
-    ])
-    if not zdf.empty:
-        zdf["Signal"] = zdf["Z"].apply(
-            lambda z: "UNUSUAL" if abs(z) >= 2 else "elevated" if abs(z) >= 1 else "normal")
-        st.dataframe(zdf, width="stretch", hide_index=True)
-        st.caption("|z| ≥ 2 is statistically unusual; |z| ≥ 1 is elevated. "
-                   "Based on each name's own trailing window.")
+    # z-score table (statistics — Advanced and up)
+    if mode in ("Advanced", "Institutional"):
+        zrows = [
+            ("Off-Ex vol z · 5d", hist.get("offex_z_5d")),
+            ("Off-Ex vol z · 20d", hist.get("offex_z_20d")),
+            ("Off-Ex vol z · 60d", hist.get("offex_z_60d")),
+            ("Off-Ex share z · 1y", hist.get("share_z_1y")),
+        ]
+        st.markdown("**Z-scores (std dev from own mean)**")
+        zdf = pd.DataFrame([
+            {"Metric": k, "Z": v} for k, v in zrows if v is not None
+        ])
+        if not zdf.empty:
+            zdf["Signal"] = zdf["Z"].apply(
+                lambda z: "UNUSUAL" if abs(z) >= 2 else "elevated" if abs(z) >= 1 else "normal")
+            st.dataframe(zdf, width="stretch", hide_index=True)
+            st.caption("|z| ≥ 2 is statistically unusual; |z| ≥ 1 is elevated. "
+                       "Based on each name's own trailing window.")
 
     # 3D-ish scatter of share vs return vs volume (advanced)
     series = r.get("series")

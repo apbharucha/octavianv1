@@ -206,3 +206,60 @@ def test_tab_renders_without_exception(tab):
                 break
         exc = [str(e.value) for e in at.exception]
         assert not exc, f"Tab {tab!r} raised: {exc[:2]}"
+
+
+def test_dark_pool_modes_are_actually_different():
+    """Basic / Advanced / Institutional must render visibly different content.
+
+    Guards the tiered-viewing design: Basic is a plain-language digest (no
+    z-scores / evidence / raw tables), Advanced adds the statistics, and
+    Institutional adds provenance + raw outputs. If this test fails the modes
+    have collapsed back into looking identical.
+    """
+    at = AppTest.from_file(os.path.join(ROOT, "main.py"), default_timeout=240)
+    with ExitStack() as stack:
+        for m in _build_mocks():
+            stack.enter_context(m)
+        at.run()
+        for r in at.sidebar.radio:
+            if r.label == "Navigation":
+                r.set_value("Dark Pool Intelligence")
+                at.run()
+                break
+
+        mode = at.radio(key="dp_mode")
+        assert mode is not None, "Viewing Mode radio not found"
+        assert mode.value == "Basic"
+
+        def _text():
+            md = " ".join(m.value for m in at.markdown)
+            cap = " ".join(c.value for c in at.caption)
+            return md + " " + cap
+
+        # Basic: plain-language digest present; statistics hidden
+        assert "Plain-language summary" in _text()
+        assert "Z-scores (std dev" not in _text()
+        assert "Evidence for inference" not in _text()
+        assert "Sector / Pressure Matrix" not in _text()
+        assert "**Provenance**" not in _text()
+
+        # Advanced: statistics appear; raw provenance still hidden
+        mode.set_value("Advanced")
+        at.run()
+        mode = at.radio(key="dp_mode")
+        assert mode.value == "Advanced"
+        t = _text()
+        assert "Plain-language summary" not in t
+        assert "Z-scores (std dev" in t
+        assert "Evidence for inference" in t
+        assert "Sector / Pressure Matrix" in t
+        assert "**Provenance**" not in t
+
+        # Institutional: provenance + raw outputs appear
+        mode.set_value("Institutional")
+        at.run()
+        t = _text()
+        assert "Z-scores (std dev" in t
+        assert "Evidence for inference" in t
+        assert "Sector / Pressure Matrix" in t
+        assert "**Provenance**" in t
