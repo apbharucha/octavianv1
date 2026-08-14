@@ -88,7 +88,7 @@ def _metric_row(m: dict) -> None:
 
 def _render_result(r: AlgorithmResult, idx: int, expanded: bool = False) -> None:
     is_error = any(n.startswith("ERROR:") for n in r.build_notes)
-    title = f"{idx}. {r.name}" + (" ⚠️" if is_error else "")
+    title = f"{idx}. {r.name}" + (" (error)" if is_error else "")
     with st.expander(title, expanded=expanded):
         if is_error:
             for n in r.build_notes:
@@ -111,7 +111,7 @@ def _render_result(r: AlgorithmResult, idx: int, expanded: bool = False) -> None
                   "<br>".join(f"• {k}: {v * 100:.1f}%" for k, v in r.params.items()
                               if isinstance(v, (int, float))))
         if r.provenance:
-            st.markdown(f"<div style='font-size:0.8rem;color:{MUTED};'>📚 <b>Provenance:</b> {r.provenance}</div>",
+            st.markdown(f"<div style='font-size:0.8rem;color:{MUTED};'><b>Provenance:</b> {r.provenance}</div>",
                         unsafe_allow_html=True)
         if r.build_notes:
             for n in r.build_notes:
@@ -125,18 +125,18 @@ def _render_result(r: AlgorithmResult, idx: int, expanded: bool = False) -> None
         st.markdown("**Export**")
         safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in r.name)
         ec1, ec2, ec3, ec4 = st.columns(4)
-        ec1.download_button("⬇ Python", r.code(), f"{safe}.py",
+        ec1.download_button("Download Python", r.code(), f"{safe}.py",
                             mime="text/x-python", key=f"py_{r.id}")
-        ec2.download_button("⬇ JSON spec", r.to_json(), f"{safe}.json",
+        ec2.download_button("Download JSON spec", r.to_json(), f"{safe}.json",
                             mime="application/json", key=f"json_{r.id}")
-        ec3.download_button("⬇ Equity CSV", r.to_csv(), f"{safe}_equity.csv",
+        ec3.download_button("Download Equity CSV", r.to_csv(), f"{safe}_equity.csv",
                             mime="text/csv", key=f"csv_{r.id}")
-        ec4.download_button("⬇ Research note", r.to_markdown(), f"{safe}_note.md",
+        ec4.download_button("Download Research note", r.to_markdown(), f"{safe}_note.md",
                             mime="text/markdown", key=f"md_{r.id}")
 
 
 def _render_methodology() -> None:
-    with st.expander("📚 Research & methodology (what powers this builder)"):
+    with st.expander("Research & methodology (what powers this builder)"):
         st.markdown("""
 **Strategy families are grounded in published research and live-tested community algorithms:**
 
@@ -187,7 +187,7 @@ def _build(build_args: dict, progress) -> list:
 
 def render_algorithm_builder() -> None:
     st.markdown(
-        f"<h2 style='margin-bottom:2px;'>🤖 Algorithm Builder</h2>"
+        f"<h2 style='margin-bottom:2px;'>Algorithm Builder</h2>"
         f"<div style='color:{MUTED};font-size:0.9rem;'>Research-grounded strategy "
         f"generator — build, backtest (train/test split), and export trading algorithms "
         f"from a vague idea or explicit constraints.</div>",
@@ -202,7 +202,7 @@ def render_algorithm_builder() -> None:
 
     st.markdown("---")
     if auto:
-        st.markdown("#### 🧠 Describe what you want")
+        st.markdown("#### Describe what you want")
         request = st.text_area(
             "Describe your strategy in plain language — the more you say, the more it uses.",
             placeholder="e.g. 'mean reversion on low-volatility stocks with tight stops' or "
@@ -228,7 +228,7 @@ def render_algorithm_builder() -> None:
         universe = [s.strip() for s in uni_text.split(",") if s.strip()][:6]
         archetypes = None
     else:
-        st.markdown("#### 🛠️ Guided configuration")
+        st.markdown("#### Guided configuration")
         g1, g2 = st.columns(2)
         with g1:
             fam_options = [ARCHETYPES[n]["label"] for n in ALL_ARCHETYPE_NAMES if n != "online_ops"]
@@ -265,7 +265,7 @@ def render_algorithm_builder() -> None:
                            help="Same inputs + same seed = identical algorithms.", key="ab_seed")
     locked = {"stop_loss_pct": None}  # execution settings pass through backtest_params, not strategy params
 
-    if st.button("🚀 Build algorithms", type="primary", use_container_width=True):
+    if st.button("Build algorithms", type="primary", use_container_width=True):
         build_args = dict(
             request=request or "", mode="auto" if auto else "guided",
             count=int(count), ensemble=bool(ensemble), risk=str(risk),
@@ -318,13 +318,13 @@ def render_algorithm_builder() -> None:
             _render_result(r, i, expanded=(i == 1 and not any(x.startswith("ERROR:") for x in r.build_notes)))
         # combined research note for the whole build
         st.markdown("---")
-        st.markdown("#### 📦 Export everything")
+        st.markdown("#### Export everything")
         combined = ["# Algorithm Builder — Research Bundle", ""]
         for i, r in enumerate(results, 1):
             combined.append(f"\n---\n\n{r.to_markdown(include_code=False)}")
         combined.append("\n---\n*Generated by Octavian Algorithm Builder. Educational use only — not financial advice.*")
         bundle = "\n".join(combined)
-        st.download_button("⬇ Full research bundle (Markdown)", bundle,
+        st.download_button("Download full research bundle (Markdown)", bundle,
                            "algorithm_builder_bundle.md", mime="text/markdown")
         summary_rows = []
         for r in results:

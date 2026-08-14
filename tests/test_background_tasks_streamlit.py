@@ -36,16 +36,16 @@ if st.button("Launch", key="launch"):
         result_key="demo_result",
     )
     st.session_state["_bg_demo_result"] = tid
-    st.toast("started in background", icon="⏳")
+    st.toast("started in background")
 
 # 2) Publish + notify: same code path as main.py._check_background_tasks().
 for t in bt.drain_completed(_sid()):
     if t["status"] == "done" and t.get("result_key"):
         st.session_state[t["result_key"]] = t["result"]
     if t["status"] == "done":
-        st.toast("Demo task complete", icon="✅")
+        st.toast("Demo task complete")
     else:
-        st.toast("Demo task failed: " + str(t.get("error"))[:80], icon="⚠️")
+        st.toast("Demo task failed: " + str(t.get("error"))[:80])
 
 # 3) Show live status for the page.
 tid = st.session_state.get("_bg_demo_result")

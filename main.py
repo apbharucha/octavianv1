@@ -139,10 +139,10 @@ def _check_background_tasks(force_rerun=False):
                 if t["status"] == "done" and t.get("result_key"):
                     st.session_state[t["result_key"]] = t["result"]
                 if t["status"] == "done":
-                    st.toast(f"{t['name']} complete — results are ready.", icon="✅")
+                    st.toast(f"{t['name']} complete — results are ready.")
                 else:
                     st.toast(
-                        f"{t['name']} failed: {str(t.get('error'))[:100]}", icon="⚠️"
+                        f"{t['name']} failed: {str(t.get('error'))[:100]}"
                     )
             except Exception as e:
                 # Delivery failed (e.g. a session-state write error) — re-queue
@@ -178,18 +178,18 @@ def _render_background_status():
     for t in reversed(tasks):
         if t["status"] == "running":
             st.sidebar.markdown(
-                f"<span style='color:#e0c97f'>⏳</span> {t['name']} — running "
+                f"<span style='color:#e0c97f'>{t['name']}</span> — running "
                 f"({int(now - t['submitted_at'])}s)",
                 unsafe_allow_html=True,
             )
         elif t["status"] == "done":
             st.sidebar.markdown(
-                f"<span style='color:#00ff88'>✅</span> {t['name']} — done",
+                f"<span style='color:#00ff88'>{t['name']}</span> — done",
                 unsafe_allow_html=True,
             )
         else:
             st.sidebar.markdown(
-                f"<span style='color:#ff6666'>⚠️</span> {t['name']} — failed",
+                f"<span style='color:#ff6666'>{t['name']}</span> — failed",
                 unsafe_allow_html=True,
             )
 
@@ -489,14 +489,13 @@ if selection == "Dashboard":
             )
             st.toast(
                 "Breaking Trades scan started in the background — you can keep "
-                "using the app and will be notified when it completes.",
-                icon="⏳",
+                "using the app and will be notified when it completes."
             )
             st.rerun()
 
         if _bt_running:
             st.info(
-                "⏳ Full-universe scan is **running in the background** — "
+                "Full-universe scan is **running in the background** — "
                 "navigate freely anywhere in the app and you'll be notified "
                 "when the results are ready."
             )
@@ -928,7 +927,7 @@ elif selection == "Daily Briefing":
 
     if _brief_running:
         st.info(
-            "⏳ Briefing is being generated in the **background** — navigate "
+            "Briefing is being generated in the **background** — navigate "
             "freely anywhere in the app and you'll be notified when it's ready."
         )
 
@@ -949,8 +948,7 @@ elif selection == "Daily Briefing":
             _launch_background("Daily Briefing", "daily_report", _run_briefing)
             st.toast(
                 "Briefing generation started in the background — you can keep "
-                "using the app and will be notified when it completes.",
-                icon="⏳",
+                "using the app and will be notified when it completes."
             )
             st.rerun()
     with col_gen2:

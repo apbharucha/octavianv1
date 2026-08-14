@@ -753,7 +753,7 @@ def _render_comprehensive_sim_tab():
         sim_duration = st.slider("Simulation Duration (Minutes)", 5, 120, 30)
         sim_universe = st.slider("Universe Size (Assets)", 10, 500, 50)
         
-        if st.button("▶ Run Full Simulation", type="primary", use_container_width=True):
+        if st.button("Run Full Simulation", type="primary", use_container_width=True):
             if not HAS_ENGINE:
                 st.error("MarketSimulationEngine is not available.")
             else:

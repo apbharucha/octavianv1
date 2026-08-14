@@ -39,7 +39,7 @@ Usage
     # ... user keeps navigating ...
     for task in drain_completed(sid):          # finished + not yet toasted
         st.session_state[task["result_key"]] = task["result"]
-        st.toast(f"{task['name']} complete", icon="✅")
+        st.toast(f"{task['name']} complete")
 """
 
 from __future__ import annotations

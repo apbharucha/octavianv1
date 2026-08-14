@@ -93,15 +93,15 @@ parity is enforced by the existing 138-test suite plus a new parity harness.
 ## 4. Conversion Roadmap (phased, zero-feature-loss)
 
 ### Phase 0 — Foundations (1–2 weeks) *[partially done this session]*
-- ✅ Lazy + disk-cached OptionsEngine NN (done)
-- ✅ 16-tab UI walkthrough, 138 tests green (done)
-- ⬜ **Loading UX in Streamlit now** (user request, do while web app builds):
+- [x] Lazy + disk-cached OptionsEngine NN (done)
+- [x] 16-tab UI walkthrough, 138 tests green (done)
+- [ ] **Loading UX in Streamlit now** (user request, do while web app builds):
   - Custom CSS skeleton/spinner overlay (`st.spinner` + `st.markdown` CSS pulse)
   - Progress bar for long jobs (scans, backtests, model builds)
   - "Streaming" placeholder in chat while awaiting LLM
-- ⬜ **API contract freeze:** document every endpoint + payload in `API_CONTRACT.md`
+- [ ] **API contract freeze:** document every endpoint + payload in `API_CONTRACT.md`
   so the web app and tests share one source of truth
-- ⬜ Inventory all `st.session_state` usage → define the server-side session model
+- [ ] Inventory all `st.session_state` usage → define the server-side session model
 
 ### Phase 1 — Backend productionization (2–3 weeks)
 - Migrate `database_manager.py`/`db_manager.py` → **SQLAlchemy + Alembic on Postgres (Neon)**;

@@ -168,7 +168,7 @@ Remaining "Placeholder"sites: 2 (simulation engines + strategy lab heuristic —
 | 34 | **`main.py`breaking-trades still fell back to a 55-ticker hardcoded list** | Medium | `main.py`| Now always `get_ticker_universe().get_full_universe_sample(80)`— no preset fallback. |
 | 35 | **`quant_portal.py`crowding used `FactorCrowdingEngine()`directly and a hardcoded default symbol list** | Medium | `quant_portal.py`| Uses the `get_crowding_engine()`singleton and samples the live universe when no symbols provided. |
 | 36 | **Duplicate method definitions in `ai_chatbot.py`** (`_get_real_time_data`, `_create_advanced_price_chart`, `_create_prediction_chart`each defined twice — first definition dead) + a dead first `process_unbiased_query`(117 lines, never executed) | Medium | `ai_chatbot.py`| Removed all dead duplicates and the dead first `process_unbiased_query`. |
-| 37 | **Emoji character left in `options_simulation_grader.py`** (a ⏳ glyph) | Low | `options_simulation_grader.py`| Replaced with plain text; full repo sweep now reports 0 emojis outside `.temp_trash`. |
+| 37 | **Emoji character left in `options_simulation_grader.py`** (an hourglass glyph) | Low | `options_simulation_grader.py`| Replaced with plain text; full repo sweep now reports 0 emojis outside `.temp_trash`. |
 | 38 | **`spreadsheet_generator.py`regressed to 13 `pass`stubs** (quick templates/custom models broken) after a git operation reverted working-tree changes | Critical | `spreadsheet_generator.py`| Restored from the full 1356-line implementation (all 10 quick templates + IB styling helpers). DCF/LBO quick templates now expose WACC, terminal growth, tax rate, debt % and exit-multiple inputs that flow directly into the generated workbook values — user-provided numbers are used verbatim. |
 | 39 | **`presentation_generator.py`decks were text-only with empty space** | Medium | `presentation_generator.py`| Native pptx charts embedded across all decks: M&A EPS-walk bar + Sources & Uses pie + synergies waterfall; DCF scenario bar + WACC bridge; LBO value-bridge + S&U pie. Institutional Arial typography, page-number footers retained; verified all three decks build with embedded charts. |
 | 40 | **Ticker extraction produced fake symbols for natural-language queries** (e.g. "up and coming" → COMING=X, PICK, YOUR, RISE) | High | `financial_llm_engine.py`| ~40 new stopwords added; sector injection now yields real biotech/energy tickers for scan-style queries. |
@@ -293,14 +293,14 @@ users could not reach them.
 | Terms of Service | `terms_of_service.py` | `show_terms_of_service()` |
 
 ### End-to-end verification (not just renders)
-- **DCF pitchbook**: real `InstitutionalDCFEngine.run_dcf()` → 61 KB valid `.pptx` ✓
-- **M&A pitchbook**: real `get_mna_engine().run_mna()` → 84 KB `.pptx` ✓
-- **LBO pitchbook**: real `get_lbo_engine().run_lbo()` → 58 KB `.pptx` ✓
+- **DCF pitchbook**: real `InstitutionalDCFEngine.run_dcf()` → 61 KB valid `.pptx`
+- **M&A pitchbook**: real `get_mna_engine().run_mna()` → 84 KB `.pptx`
+- **LBO pitchbook**: real `get_lbo_engine().run_lbo()` → 58 KB `.pptx`
 - **M&A workbook**: `build_mna_workbook()` → Assumptions/Contribution/Sensitivity sheets,
-  user inputs (20% premium, $400M synergies) confirmed present ✓
-- **LBO workbook**: `build_lbo_workbook()` → Sources & Uses/Projections/Returns ✓
+  user inputs (20% premium, $400M synergies) confirmed present
+- **LBO workbook**: `build_lbo_workbook()` → Sources & Uses/Projections/Returns
 - **13F engine**: SEC EDGAR unreachable from this machine → **graceful degradation**
-  (shows "unavailable", never fabricates) ✓
+  (shows "unavailable", never fabricates)
 
 ### Tests
 - UI walkthrough extended 16 → **27 tabs**, all pass (46 s)

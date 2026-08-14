@@ -61,7 +61,7 @@ PowerPoint accuracy, financial-model formula/values, LLM entity pollution and
 - `_safe_info_fetch(ticker_obj)` — defensive wrapper: `None` → `{}`, non-dict →
   coerced or `{}`, drops `None` values. The NoneType crash can no longer escape.
 - `_derive_revenue_millions(info, shares)` — per-share fallback now multiplies
-  by shares outstanding: `revenuePerShare × shares` ($25 × 15.5B ≈ $387B ✓).
+  by shares outstanding: `revenuePerShare × shares` ($25 × 15.5B ≈ $387B).
   Falls back conservatively to 0 (never a fabricated floor).
 - `_extract_ebitda_millions` — removed the fabricated `500.0` fallback; missing
   EBITDA now yields 0 (callers clamp) instead of inventing $500M.
@@ -280,10 +280,10 @@ both fixed and regression-tested:
 
 | Suite | Result |
 |---|---|
-| `tests/test_llm_and_models_fixes.py` (new, 152 cases) | ✅ 152 passed |
-| `llm_stress_test.py 100000` (new harness) | ✅ 100,000 prompts, 0 failures |
-| `tests/` full suite (excluding UI walkthrough) | ✅ **327 passed** |
-| `tests/test_ui_walkthrough.py` (26 UI flows) | ✅ passed (earlier run, no UI change since) |
+| `tests/test_llm_and_models_fixes.py` (new, 152 cases) | 152 passed |
+| `llm_stress_test.py 100000` (new harness) | 100,000 prompts, 0 failures |
+| `tests/` full suite (excluding UI walkthrough) | **327 passed** |
+| `tests/test_ui_walkthrough.py` (26 UI flows) | passed (earlier run, no UI change since) |
 
 ## Files Changed
 
@@ -362,14 +362,14 @@ USDTRY, USDZAR, USDINR, ...) added so the lead reads like a currency-desk note.
 
 | Suite | Result |
 |---|---|
-| `tests/test_llm_and_models_fixes.py` (266 cases) | ✅ 266 passed |
-| v9 negative guards (24 probes) | ✅ 24/24 |
-| `stress_100k.py` extraction/decomposition stress | ✅ **100,000 prompts, 0 failures** |
-| Eval bucket small (12k) | ✅ 12,000 / 12,000 (100%) |
-| Eval bucket medium (12k) | ✅ 12,000 / 12,000 (100%) |
-| Eval bucket huge (12k) | ✅ 12,000 / 12,000 (100%) |
-| Eval bucket mega (12k) | ✅ 12,000 / 12,000 (100%) |
-| **Full pipeline total** | ✅ **48,000 / 48,000 (100.00%)** |
+| `tests/test_llm_and_models_fixes.py` (266 cases) | 266 passed |
+| v9 negative guards (24 probes) | 24/24 |
+| `stress_100k.py` extraction/decomposition stress | **100,000 prompts, 0 failures** |
+| Eval bucket small (12k) | 12,000 / 12,000 (100%) |
+| Eval bucket medium (12k) | 12,000 / 12,000 (100%) |
+| Eval bucket huge (12k) | 12,000 / 12,000 (100%) |
+| Eval bucket mega (12k) | 12,000 / 12,000 (100%) |
+| **Full pipeline total** | **48,000 / 48,000 (100.00%)** |
 
 All answers for every bucket are stored in `chatbot_eval/octavian_chatbot_eval.db`
 (keyed by run_id), matching the original request to store results in the same
