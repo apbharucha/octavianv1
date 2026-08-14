@@ -34,6 +34,7 @@ def _reset():
     with bt._LOCK:
         bt._TASKS.clear()
         bt._ORDER.clear()
+        bt._EXECUTING.clear()
 
 
 def test_successful_task_lifecycle():
@@ -41,14 +42,18 @@ def test_successful_task_lifecycle():
     gate = threading.Event()
 
     def slow():
-        gate.wait(timeout=10)
+        # No timeout: the worker must stay blocked until the test releases
+        # it, so status assertions are never racy under heavy suite load.
+        gate.wait()
         return 42
 
-    tid = bt.submit_task("t1", slow, session_id="s1", result_key="rk")
-    # still running while the worker is blocked on the gate
-    assert bt.get_task(tid)["status"] == "running"
-    assert any(t["task_id"] == tid for t in bt.running_tasks("s1"))
-    gate.set()
+    try:
+        tid = bt.submit_task("t1", slow, session_id="s1", result_key="rk")
+        # still running while the worker is blocked on the gate
+        assert bt.get_task(tid)["status"] == "running"
+        assert any(t["task_id"] == tid for t in bt.running_tasks("s1"))
+    finally:
+        gate.set()  # always release the worker, even if an assertion fails
     assert _wait_until(lambda: bt.get_task(tid)["status"] == "done")
     rec = bt.get_task(tid)
     assert rec["result"] == 42
@@ -112,14 +117,16 @@ def test_running_tasks_view():
     gate = threading.Event()
 
     def blocked():
-        gate.wait(timeout=10)
+        gate.wait()
         return "released"
 
-    tid = bt.submit_task("blocked", blocked, session_id="s4")
-    assert any(
-        t["task_id"] == tid for t in bt.running_tasks("s4")
-    ), "running task should be visible while it executes"
-    gate.set()
+    try:
+        tid = bt.submit_task("blocked", blocked, session_id="s4")
+        assert any(
+            t["task_id"] == tid for t in bt.running_tasks("s4")
+        ), "running task should be visible while it executes"
+    finally:
+        gate.set()  # always release the worker, even if an assertion fails
     assert _wait_until(lambda: bt.get_task(tid)["status"] == "done")
     assert bt.running_tasks("s4") == []
     _reset()
@@ -138,33 +145,71 @@ def test_eviction_prefers_to_keep_running_tasks():
     gate = threading.Event()
 
     def blocked():
-        gate.wait(timeout=10)
+        # No timeout: the task must still be running when eviction runs, or
+        # the test would silently be testing the wrong thing (and flake
+        # under full-suite load when 10s can elapse). Released via finally.
+        gate.wait()
         return "done"
 
-    tid_running = bt.submit_task("blocked", blocked, session_id="s12")
-    for i in range(310):
-        bt.submit_task(f"fast{i}", lambda i=i: i, session_id="s12")
+    try:
+        tid_running = bt.submit_task("blocked", blocked, session_id="s12")
+        # Deterministic: wait until the worker is genuinely executing the
+        # blocked task, so the flood below can never evict it while queued.
+        assert _wait_until(lambda: tid_running in bt._EXECUTING)
+        for i in range(310):
+            bt.submit_task(f"fast{i}", lambda i=i: i, session_id="s12")
 
-    # Wait until every record that still exists is finished (the oldest fast
-    # tasks may already have been evicted to stay within the cap — that is
-    # the bounded-registry behavior we want).
-    def all_survivors_done():
-        with bt._LOCK:
-            recs = list(bt._TASKS.values())
-        return bool(recs) and all(
-            r["status"] == "done"
-            for r in recs
-            if r["task_id"] != tid_running
-        )
+        # Wait until every record that still exists is finished (the oldest
+        # fast tasks may already have been evicted to stay within the cap —
+        # that is the bounded-registry behavior we want).
+        def all_survivors_done():
+            with bt._LOCK:
+                recs = list(bt._TASKS.values())
+            return bool(recs) and all(
+                r["status"] == "done"
+                for r in recs
+                if r["task_id"] != tid_running
+            )
 
-    assert _wait_until(all_survivors_done)
-    # Push past the cap once more: cleanup must evict finished records,
-    # never the still-running one.
-    bt.submit_task("spill", lambda: 1, session_id="s12")
-    assert bt.count() <= 300
-    assert bt.get_task(tid_running) is not None, "running task was evicted"
-    gate.set()
+        assert _wait_until(all_survivors_done)
+        # Push past the cap once more: cleanup must evict finished records,
+        # never the still-running one.
+        bt.submit_task("spill", lambda: 1, session_id="s12")
+        assert bt.count() <= 300
+        assert bt.get_task(tid_running) is not None, "running task was evicted"
+    finally:
+        gate.set()  # always release the worker, even if an assertion fails
     assert _wait_until(lambda: bt.get_task(tid_running)["status"] == "done")
+    _reset()
+
+
+def test_cleanup_evicts_queued_before_executing():
+    """Regression: a flood of queued records must never evict a task whose
+    worker thread is genuinely executing (the oldest record is the executing
+    one — evicting it would silently drop the longest-pending job).
+    """
+    _reset()
+    with bt._LOCK:
+        for i in range(305):
+            tid = f"t{i}"
+            bt._TASKS[tid] = {
+                "task_id": tid,
+                "name": "x",
+                "session_id": "s",
+                "status": "running",  # queued: stamped at submit, no worker yet
+                "result": None,
+                "error": None,
+                "result_key": None,
+                "notified": False,
+                "submitted_at": time.time(),
+                "finished_at": None,
+            }
+            bt._ORDER.append(tid)
+        executing = "t0"  # oldest record, the one a worker is actually running
+        bt._EXECUTING.add(executing)
+        bt._cleanup_locked()
+        assert bt.get_task(executing) is not None, "executing task was evicted"
+        assert bt.count() <= 300
     _reset()
 
 

@@ -12,7 +12,7 @@ class DatasetDownloader:
     """Download and setup historical datasets."""
     
     def __init__(self):
-        self.cache_dir = Path("/Users/aavibharucha/Documents/market_ai/data_cache")
+        self.cache_dir = Path(__file__).resolve().parent / "data_cache"
         self.cache_dir.mkdir(exist_ok=True)
     
     def download_all(self):

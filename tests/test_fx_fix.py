@@ -5,7 +5,7 @@ import asyncio
 import pandas as pd
 
 # Add the project root to sys.path
-sys.path.append('/Users/aavibharucha/Documents/market_ai')
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from financial_llm_engine import expand_query_intents, _fetch_live_data_for_tickers
 from ai_chatbot import OctavianEnhancedChatbot

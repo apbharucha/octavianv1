@@ -42,12 +42,12 @@ You had **2 Streamlit processes running simultaneously**, causing the old versio
 
 #### Option 1: Use the Clean Start Script (RECOMMENDED)
 ```bash
-cd /Users/aavibharucha/Documents/market_ai
+# From the project root (where this file lives)
 ./start_streamlit.sh
 ```
 #### Option 2: Manual Start
 ```bash
-cd /Users/aavibharucha/Documents/market_ai
+# From the project root (where this file lives)
 
 # Kill any running Streamlit
 pkill -9 -f "streamlit run"

@@ -17,6 +17,7 @@ network access is required. Coverage:
   * data quality report shape
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -762,3 +763,208 @@ def test_finra_metadata_reports_weekly_anchor(engine, monkeypatch):
     e2 = DarkPoolEngine(state_file=os.path.join(tempfile.mkdtemp(), "s.json"),
                         fetch_fn=engine._fetch_fn)
     assert e2.finra_metadata() == {"observed": False, "granularity": "weekly"}
+
+
+# --------------------------------------------------------------------------- #
+#  Alert evaluation (kinds, cooldown, disabled/unknown, persistence)
+# --------------------------------------------------------------------------- #
+
+def _craft_report(symbol="NVDA", **overrides):
+    """A minimal analyze_ticker-shaped report for alert-kind unit tests."""
+    r = {
+        "ok": True,
+        "symbol": symbol,
+        "historical": {"offex_pctile_5d": 55.0, "offex_pctile_20d": 50.0},
+        "signals": [{"name": "Test signal", "strength": 30.0, "confidence": 50.0}],
+        "block_vol_today": 1_000_000.0,
+        "avg_volume_20d": 10_000_000.0,
+        "imbalance_5d": 0.05,
+        "imbalance_accel": 0.02,
+    }
+    r.update(overrides)
+    return r
+
+
+def _alert_engine(engine):
+    return DarkPoolEngine(state_file=os.path.join(tempfile.mkdtemp(), "s.json"),
+                          fetch_fn=engine._fetch_fn)
+
+
+def test_alert_evaluation_offex_pctile(engine, monkeypatch):
+    e = _alert_engine(engine)
+    e.add_alert({"symbol": "NVDA", "kind": "offex_pctile_90",
+                 "threshold": 0.9, "enabled": True})
+    monkeypatch.setattr(e, "analyze_ticker",
+                        lambda sym, include_live=True: _craft_report(
+                            historical={"offex_pctile_5d": 94.0}))
+    res = e.evaluate_alerts()
+    assert res["checked"] == 1
+    assert len(res["fired"]) == 1
+    f = res["fired"][0]
+    assert f["symbol"] == "NVDA"
+    assert f["kind"] == "offex_pctile_90"
+    assert f["value"] == 94.0
+    assert "percentile" in f["message"]
+
+
+def test_alert_below_threshold_does_not_fire(engine, monkeypatch):
+    e = _alert_engine(engine)
+    e.add_alert({"symbol": "NVDA", "kind": "offex_pctile_90",
+                 "threshold": 0.9, "enabled": True})
+    monkeypatch.setattr(e, "analyze_ticker",
+                        lambda sym, include_live=True: _craft_report(
+                            historical={"offex_pctile_5d": 50.0}))
+    res = e.evaluate_alerts()
+    assert res["fired"] == []
+    assert res["checked"] == 1
+
+
+def test_alert_kinds_fire_on_condition(engine, monkeypatch):
+    """large_print / imbalance / acceleration / ai_unusual all fire when their
+    condition is met, and stay silent when it is not."""
+    # large_print: block >= threshold x avg volume
+    e1 = _alert_engine(engine)
+    e1.add_alert({"symbol": "AAPL", "kind": "large_print",
+                  "threshold": 0.5, "enabled": True})
+    monkeypatch.setattr(e1, "analyze_ticker",
+                        lambda sym, include_live=True: _craft_report(
+                            block_vol_today=6_000_000.0, avg_volume_20d=10_000_000.0))
+    r1 = e1.evaluate_alerts()
+    assert len(r1["fired"]) == 1 and r1["fired"][0]["kind"] == "large_print"
+
+    # imbalance_threshold: |imbalance| >= threshold
+    e2 = _alert_engine(engine)
+    e2.add_alert({"symbol": "AAPL", "kind": "imbalance_threshold",
+                  "threshold": 0.6, "enabled": True})
+    monkeypatch.setattr(e2, "analyze_ticker",
+                        lambda sym, include_live=True: _craft_report(imbalance_5d=-0.72))
+    r2 = e2.evaluate_alerts()
+    assert len(r2["fired"]) == 1 and r2["fired"][0]["kind"] == "imbalance_threshold"
+
+    # activity_acceleration: |accel| >= threshold
+    e3 = _alert_engine(engine)
+    e3.add_alert({"symbol": "AAPL", "kind": "activity_acceleration",
+                  "threshold": 0.2, "enabled": True})
+    monkeypatch.setattr(e3, "analyze_ticker",
+                        lambda sym, include_live=True: _craft_report(imbalance_accel=0.31))
+    r3 = e3.evaluate_alerts()
+    assert len(r3["fired"]) == 1 and r3["fired"][0]["kind"] == "activity_acceleration"
+
+    # ai_unusual: top signal strength >= threshold x 100
+    e4 = _alert_engine(engine)
+    e4.add_alert({"symbol": "AAPL", "kind": "ai_unusual",
+                  "threshold": 0.7, "enabled": True})
+    monkeypatch.setattr(e4, "analyze_ticker",
+                        lambda sym, include_live=True: _craft_report(
+                            signals=[{"name": "Unusual activity", "strength": 88.0,
+                                      "confidence": 60.0}]))
+    r4 = e4.evaluate_alerts()
+    assert len(r4["fired"]) == 1 and r4["fired"][0]["kind"] == "ai_unusual"
+
+    # below-threshold large_print stays silent
+    e5 = _alert_engine(engine)
+    e5.add_alert({"symbol": "AAPL", "kind": "large_print",
+                  "threshold": 0.9, "enabled": True})
+    monkeypatch.setattr(e5, "analyze_ticker",
+                        lambda sym, include_live=True: _craft_report(
+                            block_vol_today=2_000_000.0, avg_volume_20d=10_000_000.0))
+    assert e5.evaluate_alerts()["fired"] == []
+
+
+def test_alert_cooldown_prevents_refiring(engine, monkeypatch):
+    e = _alert_engine(engine)
+    e.add_alert({"symbol": "NVDA", "kind": "offex_pctile_90",
+                 "threshold": 0.9, "enabled": True})
+    monkeypatch.setattr(e, "analyze_ticker",
+                        lambda sym, include_live=True: _craft_report(
+                            historical={"offex_pctile_5d": 96.0}))
+    assert len(e.evaluate_alerts()["fired"]) == 1
+    assert e.evaluate_alerts()["fired"] == []  # cooldown: no immediate re-fire
+    # a NEW engine on the same state file honours the persisted cooldown too
+    e2 = DarkPoolEngine(state_file=e._state_file, fetch_fn=engine._fetch_fn)
+    monkeypatch.setattr(e2, "analyze_ticker",
+                        lambda sym, include_live=True: _craft_report(
+                            historical={"offex_pctile_5d": 96.0}))
+    assert e2.evaluate_alerts()["fired"] == []
+
+
+def test_alert_cooldown_expires_after_window(engine, monkeypatch):
+    e = _alert_engine(engine)
+    e.add_alert({"symbol": "NVDA", "kind": "offex_pctile_90",
+                 "threshold": 0.9, "enabled": True})
+    monkeypatch.setattr(e, "analyze_ticker",
+                        lambda sym, include_live=True: _craft_report(
+                            historical={"offex_pctile_5d": 96.0}))
+    assert len(e.evaluate_alerts()["fired"]) == 1
+    # backdate the persisted fire time beyond the cooldown
+    fired_log = e._state["alert_fired"]
+    for k in fired_log:
+        fired_log[k] = time.time() - (e.ALERT_COOLDOWN_HOURS * 3600.0 + 60.0)
+    assert len(e.evaluate_alerts()["fired"]) == 1  # re-arms after the window
+
+
+def test_alert_disabled_and_unknown_kind_safe(engine, monkeypatch):
+    e = _alert_engine(engine)
+    e.add_alert({"symbol": "NVDA", "kind": "offex_pctile_90",
+                 "threshold": 0.9, "enabled": False})
+    e.add_alert({"symbol": "NVDA", "kind": "bogus_kind",
+                 "threshold": 0.9, "enabled": True})
+    monkeypatch.setattr(e, "analyze_ticker",
+                        lambda sym, include_live=True: _craft_report(
+                            historical={"offex_pctile_5d": 99.0}))
+    res = e.evaluate_alerts()
+    assert res["fired"] == []   # disabled skipped, unknown kind never fires
+    assert res["checked"] == 1  # only the enabled alert was checked
+
+
+def test_alert_skips_unresolvable_symbols(engine, monkeypatch):
+    e = _alert_engine(engine)
+    e.add_alert({"symbol": "NVDA", "kind": "offex_pctile_90",
+                 "threshold": 0.9, "enabled": True})
+    monkeypatch.setattr(e, "analyze_ticker",
+                        lambda sym, include_live=True: {
+                            "ok": False, "symbol": sym,
+                            "error": "Insufficient history."})
+    res = e.evaluate_alerts()
+    assert res["fired"] == []
+    assert res["checked"] == 1  # evaluated but the report is not usable
+
+
+def test_alert_evaluation_reuses_one_report_per_symbol(engine, monkeypatch):
+    """N alerts on the same symbol cost exactly one analyze_ticker call."""
+    e = _alert_engine(engine)
+    e.add_alert({"symbol": "AAPL", "kind": "offex_pctile_90",
+                 "threshold": 0.9, "enabled": True})
+    e.add_alert({"symbol": "AAPL", "kind": "large_print",
+                 "threshold": 0.5, "enabled": True})
+    calls = {"n": 0}
+
+    def fake_analyze(sym, include_live=True):
+        calls["n"] += 1
+        return _craft_report(symbol=sym, historical={"offex_pctile_5d": 95.0},
+                             block_vol_today=6_000_000.0,
+                             avg_volume_20d=10_000_000.0)
+
+    monkeypatch.setattr(e, "analyze_ticker", fake_analyze)
+    res = e.evaluate_alerts()
+    assert calls["n"] == 1
+    assert len(res["fired"]) == 2
+
+
+def test_add_alert_assigns_id_and_legacy_alerts_still_evaluate(engine, monkeypatch):
+    e = _alert_engine(engine)
+    assert e.add_alert({"symbol": "NVDA", "kind": "offex_pctile_90",
+                        "threshold": 0.9, "enabled": True})
+    assert e.get_alerts()[0].get("id")  # uuid assigned at creation
+    # legacy alert (no id, as persisted by older sessions) still evaluates
+    with open(e._state_file, "w", encoding="utf-8") as fh:
+        json.dump({"alerts": [{"symbol": "NVDA", "kind": "offex_pctile_90",
+                                "threshold": 0.9, "enabled": True}],
+                   "watchlists": {}}, fh)
+    e._load_state()
+    monkeypatch.setattr(e, "analyze_ticker",
+                        lambda sym, include_live=True: _craft_report(
+                            historical={"offex_pctile_5d": 97.0}))
+    res = e.evaluate_alerts()
+    assert len(res["fired"]) == 1
+    assert res["fired"][0]["id"].startswith("legacy:")

@@ -2,6 +2,7 @@ import matplotlib
 import streamlit as st
 
 matplotlib.use("Agg")
+import os
 import pandas as pd
 import plotly.graph_objs as go
 
@@ -47,7 +48,7 @@ apply_theme()
 
 # --- Sidebar Navigation ---
 try:
-    st.sidebar.image("/Users/aavibharucha/Documents/market_ai/logo.png", width=280)
+    st.sidebar.image(os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png"), width=280)
 except Exception:
     st.sidebar.markdown(
         f'<div style="text-align:center;padding:16px 12px 8px;">'

@@ -1273,7 +1273,12 @@ def _tab_alerts(engine, mode: str) -> None:
             asym = st.text_input("Symbol", key="dp_alert_sym")
             akind = st.selectbox("Trigger", [
                 "offex_pctile_90", "large_print", "imbalance_threshold",
-                "activity_acceleration", "ai_unusual"], key="dp_alert_kind")
+                "activity_acceleration", "ai_unusual"], key="dp_alert_kind",
+                help="offex_pctile_90: 5d off-exchange volume >= threshold x 100th "
+                     "percentile · large_print: modeled block volume >= threshold x "
+                     "20d avg volume · imbalance_threshold: |5d imbalance| >= threshold "
+                     "· activity_acceleration: |imbalance acceleration| >= threshold · "
+                     "ai_unusual: top signal strength >= threshold x 100")
             athresh = st.number_input("Threshold", 0.0, 1.0, 0.9, 0.05,
                                       key="dp_alert_thresh")
             achan = st.multiselect("Channels", ["In-app", "Email", "Webhook"],
@@ -1288,11 +1293,36 @@ def _tab_alerts(engine, mode: str) -> None:
                 "channels": achan,
                 "created": datetime.utcnow().isoformat(),
             })
-            st.success("Alert created. Alerts evaluate on each scan.")
+            st.success("Alert created. Use the check below to evaluate it.")
             st.rerun()
 
+        st.markdown("---")
+        st.markdown("**Alert evaluation**")
+        st.caption(
+            "Alerts are checked on demand against each symbol's current report "
+            "(reusing the 5-minute ticker cache where possible). A fired alert "
+            f"re-arms after a **{engine.ALERT_COOLDOWN_HOURS:.0f}-hour cooldown** so a "
+            "persistent condition notifies once per window, not on every check.")
+        if st.button("Check alerts now", key="dp_alert_check", type="primary"):
+            with st.spinner("Evaluating alerts against current reports…"):
+                res = engine.evaluate_alerts()
+            fired = res.get("fired", [])
+            if fired:
+                for f in fired:
+                    st.success(
+                        f"**{f['symbol']}** · {f['kind']} — {f['message']}")
+            else:
+                st.info(
+                    f"No alerts fired ({res.get('checked', 0)} enabled alert(s) "
+                    "checked, within cooldown where applicable).")
+            if res.get("errors"):
+                st.warning(
+                    f"{len(res['errors'])} symbol(s) could not be analyzed this check:")
+                st.json(res["errors"])
+
     st.markdown("---")
-    st.caption("Alerts and watchlists persist locally in dark_pool_state.json.")
+    st.caption("Alerts and watchlists persist locally in dark_pool_state.json. "
+               "Alerts are descriptive watchdogs — they never place trades.")
 
 
 # --------------------------------------------------------------------------- #

@@ -43,6 +43,7 @@ import math
 import os
 import threading
 import time
+import uuid
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
@@ -157,6 +158,11 @@ SCAN_MAX_LIMIT = 200
 class DarkPoolEngine:
     """Analytics engine for off-exchange / dark-pool activity."""
 
+    # Alerts that fire stay silent for this long before they can fire again,
+    # so a persistent condition notifies once per window instead of spamming
+    # every evaluation.
+    ALERT_COOLDOWN_HOURS = 6.0
+
     def __init__(self, state_file: str = STATE_FILE,
                  fetch_fn: Optional[Any] = None):
         self._state_file = state_file
@@ -251,7 +257,9 @@ class DarkPoolEngine:
         """alert: {symbol, kind, threshold, enabled, channels:[]}"""
         with self._lock:
             alerts = self._state.setdefault("alerts", [])
-            alerts.append(dict(alert))
+            entry = dict(alert)
+            entry.setdefault("id", uuid.uuid4().hex[:10])
+            alerts.append(entry)
             self._save_state()
             return True
 
@@ -263,6 +271,169 @@ class DarkPoolEngine:
                 self._save_state()
                 return True
         return False
+
+    # -- alert evaluation -- #
+
+    def _alert_key(self, alert: dict) -> str:
+        """Stable identity for cooldown tracking.
+
+        New alerts carry a uuid assigned at creation. Legacy alerts persisted
+        before ids existed are fingerprinted on their content so old state
+        files still evaluate and honour cooldowns correctly.
+        """
+        aid = (alert or {}).get("id")
+        if aid:
+            return f"id:{aid}"
+        return (f"legacy:{alert.get('symbol', '?')}:{alert.get('kind', '?')}:"
+                f"{alert.get('threshold', '?')}")
+
+    def _evaluate_alert(self, alert: dict, report: dict) -> Optional[dict]:
+        """Check one enabled alert against a ticker report.
+
+        Returns a fired-alert payload when the condition holds, else None.
+        Every trigger includes the observed value and a plain-language message
+        built only from values present in the report. Alerts are descriptive
+        watchdogs — never trade instructions.
+
+        Threshold semantics per kind (threshold is a 0..1 number):
+          offex_pctile_90      -> 5d off-exchange volume percentile >= threshold*100
+          large_print          -> modeled block volume >= threshold * 20d avg volume
+          imbalance_threshold  -> |5d imbalance| >= threshold
+          activity_acceleration-> |imbalance acceleration| >= threshold
+          ai_unusual           -> top signal strength >= threshold*100
+        """
+        if not alert or not alert.get("enabled", True):
+            return None
+        if not report or not report.get("ok"):
+            return None
+        kind = alert.get("kind", "")
+        symbol = report.get("symbol", alert.get("symbol", ""))
+        try:
+            threshold = float(alert.get("threshold", 0.9) or 0.9)
+        except Exception:
+            threshold = 0.9
+        hist = report.get("historical", {}) or {}
+        signals = report.get("signals", []) or []
+
+        def fire(value, display: str, message: str, severity: float) -> dict:
+            return {
+                "id": self._alert_key(alert),
+                "symbol": symbol,
+                "kind": kind,
+                "threshold": threshold,
+                "value": value,
+                "display": display,
+                "message": message,
+                "severity": round(float(np.clip(severity, 0, 100)), 1),
+                "fired_at": datetime.utcnow().isoformat() + "Z",
+            }
+
+        if kind == "offex_pctile_90":
+            pct = hist.get("offex_pctile_5d")
+            if pct is not None:
+                pct = float(pct)
+                if pct >= threshold * 100.0:
+                    return fire(pct, f"{pct:.0f}th percentile",
+                                f"{symbol} off-exchange volume is at the {pct:.0f}th "
+                                f"percentile of its trailing 5-day distribution "
+                                f"(alert >= {threshold*100:.0f}th).",
+                                30 + pct * 0.6)
+        elif kind == "large_print":
+            block = float(report.get("block_vol_today", 0) or 0)
+            avg = float(report.get("avg_volume_20d", 0) or 0)
+            if avg > 0 and block >= threshold * avg:
+                return fire(round(block / avg, 3), f"{block:,.0f} sh",
+                            f"{symbol} modeled block volume of {block:,.0f} shares is >= "
+                            f"{threshold*100:.0f}% of its {avg:,.0f}-share 20-day "
+                            f"average volume.",
+                            55 + min(35.0, block / avg * 40.0))
+        elif kind == "imbalance_threshold":
+            imb = float(report.get("imbalance_5d", 0) or 0)
+            if abs(imb) >= threshold:
+                return fire(round(imb, 3), f"{imb*100:+.0f}%",
+                            f"{symbol} 5-day estimated buy/sell imbalance is "
+                            f"{imb*100:+.0f}% (alert >= {threshold*100:.0f}% magnitude).",
+                            40 + abs(imb) * 55)
+        elif kind == "activity_acceleration":
+            accel = float(report.get("imbalance_accel", 0) or 0)
+            if abs(accel) >= threshold:
+                return fire(round(accel, 4), f"{accel:+.3f}",
+                            f"{symbol} rolling imbalance is accelerating at "
+                            f"{accel:+.3f}/day (alert >= {threshold:+.2f} magnitude).",
+                            35 + abs(accel) * 300)
+        elif kind == "ai_unusual":
+            top = max(signals, key=lambda s: float(s.get("strength", 0) or 0),
+                      default=None)
+            strength = float((top or {}).get("strength", 0) or 0)
+            if top and strength >= threshold * 100.0:
+                return fire(round(strength, 1), f"strength {strength:.0f}",
+                            f"{symbol} top dark-pool signal '{top.get('name', '?')}' has "
+                            f"strength {strength:.0f} (alert >= {threshold*100:.0f}).",
+                            strength)
+        return None
+
+    def evaluate_alerts(self, reports: Optional[Dict[str, dict]] = None) -> dict:
+        """Evaluate all enabled alerts against current ticker reports.
+
+        Each symbol is (re)analyzed at most once per check (via the platform
+        OHLCV layer with live lookups disabled) unless the caller supplies
+        precomputed reports, so N alerts on one symbol cost one analysis.
+        Fired alerts honour a cooldown window (ALERT_COOLDOWN_HOURS) recorded
+        in state, so a persistent condition notifies once per window.
+
+        Returns {"checked", "fired": [...], "errors": [...], "cooldown_hours"}.
+        Alerts are descriptive watchdogs — never trade instructions.
+        """
+        alerts = [a for a in self.get_alerts() if a.get("enabled", True)]
+        fired: List[dict] = []
+        errors: List[dict] = []
+        checked = 0
+        reports = reports or {}
+        now = time.time()
+        fired_log = self._state.setdefault("alert_fired", {})
+
+        # Prune the firing log (bounded: keep ~7 days of history).
+        cutoff = now - 7 * 86400.0
+        for key in [k for k, v in fired_log.items() if v is None or float(v) < cutoff]:
+            fired_log.pop(key, None)
+
+        by_symbol: Dict[str, List[dict]] = {}
+        for a in alerts:
+            sym = (a.get("symbol") or "").strip().upper()
+            if sym:
+                by_symbol.setdefault(sym, []).append(a)
+
+        for symbol, sym_alerts in by_symbol.items():
+            report = reports.get(symbol)
+            if report is None:
+                try:
+                    report = self.analyze_ticker(symbol, include_live=False)
+                except Exception as exc:  # provider hiccup: report, don't crash
+                    errors.append({"symbol": symbol, "error": str(exc)})
+                    continue
+            for alert in sym_alerts:
+                key = self._alert_key(alert)
+                last = fired_log.get(key)
+                if last is not None:
+                    try:
+                        if now - float(last) < self.ALERT_COOLDOWN_HOURS * 3600.0:
+                            continue  # still in cooldown
+                    except Exception:
+                        pass
+                result = self._evaluate_alert(alert, report)
+                checked += 1
+                if result:
+                    fired_log[key] = now
+                    fired.append(result)
+
+        with self._lock:
+            self._save_state()
+        return {
+            "checked": checked,
+            "fired": fired,
+            "errors": errors,
+            "cooldown_hours": self.ALERT_COOLDOWN_HOURS,
+        }
 
     # ------------------------------------------------------------------ #
     #  Data providers

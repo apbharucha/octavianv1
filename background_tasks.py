@@ -56,6 +56,10 @@ _EXECUTOR: ThreadPoolExecutor | None = None
 _TASKS: dict[str, dict] = {}
 # task ids in submission order, used for bounded cleanup
 _ORDER: list[str] = []
+# task ids whose worker thread is *actually* executing right now. Records are
+# stamped "running" at submit time, so without this set cleanup cannot tell a
+# queued task from an executing one.
+_EXECUTING: set[str] = set()
 
 # A few worker threads is enough: each task may itself parallelize
 # internally (e.g. the discovery engine fans out its own fetches). Keeping
@@ -77,12 +81,13 @@ def _get_executor() -> ThreadPoolExecutor:
 
 
 def _cleanup_locked() -> None:
-    """Keep the registry bounded without dropping running tasks.
+    """Keep the registry bounded without dropping executing tasks.
 
-    Evicts the oldest finished / already-notified records first, so a task
-    that is still executing can always report its result. Only if the cap is
-    still exceeded (an extreme flood of concurrent jobs) are running records
-    evicted as a last resort.
+    Evicts the oldest finished / errored / still-queued records first, so a
+    task whose worker thread is genuinely executing can always report its
+    result. Only if the cap is still exceeded (an extreme flood of genuinely
+    concurrent jobs — impossible with a bounded worker pool) are executing
+    records evicted as a last resort.
     """
     if len(_ORDER) <= _MAX_TASKS:
         return
@@ -90,7 +95,8 @@ def _cleanup_locked() -> None:
         if len(_ORDER) <= _MAX_TASKS:
             break
         r = _TASKS.get(tid)
-        if r is None or r["status"] != "running":
+        keep = r is not None and r["status"] == "running" and tid in _EXECUTING
+        if not keep:
             _ORDER.remove(tid)
             _TASKS.pop(tid, None)
     while len(_ORDER) > _MAX_TASKS:
@@ -132,6 +138,8 @@ def submit_task(
         _cleanup_locked()
 
     def _run() -> None:
+        with _LOCK:
+            _EXECUTING.add(task_id)
         try:
             result = fn(*args, **kwargs)
             with _LOCK:
@@ -145,6 +153,9 @@ def submit_task(
                     _TASKS[task_id]["status"] = "error"
                     _TASKS[task_id]["error"] = f"{type(exc).__name__}: {exc}"
                     _TASKS[task_id]["finished_at"] = time.time()
+        finally:
+            with _LOCK:
+                _EXECUTING.discard(task_id)
 
     _get_executor().submit(_run)
     return task_id
@@ -249,5 +260,7 @@ def shutdown(wait: bool = True) -> None:
     with _LOCK:
         ex = _EXECUTOR
         _EXECUTOR = None
+    with _LOCK:
+        _EXECUTING.clear()
     if ex is not None:
         ex.shutdown(wait=wait)
