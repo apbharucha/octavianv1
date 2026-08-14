@@ -953,7 +953,7 @@ def _tab_historical(engine, mode: str) -> None:
         ("Off-Ex share · 1y", hist.get("share_pctile_1y")),
         ("Volume · 20d", hist.get("volume_pctile_20d")),
     ]
-    labels = [k for k, _ in items if _[1] is not None]
+    labels = [k for k, v in items if v is not None]
     values = [v for _, v in items if v is not None]
     if labels:
         fig = go.Figure(go.Bar(

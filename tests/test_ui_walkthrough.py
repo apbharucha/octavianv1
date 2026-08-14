@@ -21,6 +21,7 @@ from unittest.mock import patch  # noqa: E402
 NAV = [
     "Dashboard", "Watchlist", "Market Scanner", "Symbol Analysis",
     "Chart Analysis", "Intelligence Center", "Market Heartbeat",
+    "Dark Pool Intelligence",
     "Institutional 13F & SEC Filings",
     "Financial Model Generator", "Target Probability",
     "Presentation Generator", "Document Analyzer", "Comparative Analysis",
@@ -179,6 +180,14 @@ def _build_mocks():
               return_value=[]),
         # scan_sectors / futures_rank hit yf.download directly
         patch.object(_yf, "download", return_value=_pd.DataFrame()),
+        # Dark Pool Intelligence binds get_stock/get_vix/get_realtime_price at
+        # module import time, so patching data_sources.* never reaches it.
+        # Mock its own bindings + force the no-key (modeled) FINRA path so the
+        # whole 15-tab terminal renders offline.
+        patch("dark_pool_engine.get_stock", side_effect=_mock_get_stock),
+        patch("dark_pool_engine.get_vix", side_effect=_mock_get_stock),
+        patch("dark_pool_engine.get_realtime_price", return_value=(225.0, 223.0)),
+        patch("dark_pool_engine.DarkPoolEngine.get_finra_api_key", return_value=""),
     ]
 
 
