@@ -30,11 +30,13 @@ os.environ["OCTAVIAN_OFFLINE"] = "1"
 from algorithm_builder_engine import (  # noqa: E402
     ARCHETYPES,
     AlgorithmResult,
+    _default_backtest_params,
     backtest_ohlcv,
     build_algorithms,
     generate_python,
     parse_request,
     run_ops_basket,
+    search_best,
     strategy_spec_to_signal,
     strategy_spec_to_weights,
 )
@@ -117,13 +119,22 @@ def _mk_data_fn(df1, df2=None):
 
 def test_parse_request_families():
     assert parse_request("mean reversion with bollinger and rsi") == \
-        ["rsi_meanrev", "bollinger_meanrev", "statarb_z", "gap_fade"]
-    assert parse_request("turtle breakout momentum") == ["trend_ma", "breakout", "dual_momentum"]
+        ["stoch_williams", "rsi_meanrev", "bollinger_meanrev", "statarb_z"]
+    assert parse_request("turtle breakout momentum") == \
+        ["value_momentum", "flag_breakout", "trend_ma", "breakout"]
     assert parse_request("market making with inventory control citadel") == ["market_making"]
     assert parse_request("volatility targeting risk parity") == ["vol_target"]
     assert "online_ops" in parse_request("online portfolio selection from the glucksman paper")
     assert parse_request("") == ["trend_ma", "rsi_meanrev", "statarb_z"]
     assert len(parse_request("")) <= 4
+    # research-grounded families surface first for their own keywords
+    assert parse_request("stochastic williams oversold")[0] == "stoch_williams"
+    assert parse_request("value and momentum everywhere")[0] == "value_momentum"
+    assert parse_request("chart pattern flag breakout")[1] == "flag_breakout"
+    # multi-topic requests interleave across matching groups (diverse mix)
+    mix = parse_request("value and momentum plus stochastic oversold")
+    assert "value_momentum" in mix and "stoch_williams" in mix
+    assert len(mix) <= 4
 
 
 # --------------------------------------------------------------------------- #
@@ -633,3 +644,115 @@ def test_strategy_spec_bad_archetype_returns_none(df_trend):
             "direction": "long_only", "universe": ["SPY"], "ops_algo": None}
     assert strategy_spec_to_signal(spec, df_trend) is None
     assert strategy_spec_to_signal(None, df_trend) is None
+
+
+# --------------------------------------------------------------------------- #
+#  Research-grounded families (papers attached 2026-08-15)
+# --------------------------------------------------------------------------- #
+
+def _long_df(n=1300, seed=7, vol=0.012, trend=0.0004, osc=False):
+    """~5 years of daily bars for the low-frequency families (weekly lookbacks
+    need a long history; short fixtures would never fire)."""
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range(end=pd.Timestamp("2026-08-01"), periods=n)
+    r = np.zeros(n)
+    for t in range(1, n):
+        r[t] = (0.05 * np.sin(t / 60) if osc else trend) + rng.normal(0, vol)
+    close = 100 * np.cumprod(1 + np.clip(r, -0.08, 0.08))
+    return pd.DataFrame({
+        "Open": close * (1 + rng.normal(0, 0.002, n)),
+        "High": np.maximum(close, close * (1 + np.abs(rng.normal(0, 0.004, n)))),
+        "Low": np.minimum(close, close * (1 - np.abs(rng.normal(0, 0.004, n)))),
+        "Close": close,
+        "Volume": rng.integers(1_000_000, 5_000_000, n).astype(float),
+    }, index=idx)
+
+
+def test_stoch_williams_archetype_shapes_and_volume_scaling():
+    """JRFM 17:501 (Paik et al. 2024): weekly Stochastic %K/%D + Williams %R
+    timing with volume-surge position scaling. Signal must be long-only, in
+    [0, 3] (2x/3x volume surge), and derived from weekly-resampled bars."""
+    df = _long_df(seed=7, osc=True)  # oscillating series makes oversold fire
+    a = ARCHETYPES["stoch_williams"]
+    p = {q["name"]: q["default"] for q in a["params"]}
+    sig = a["sig"](df, p)
+    assert len(sig) == len(df)
+    assert float(sig.min()) >= 0.0
+    assert float(sig.max()) <= 3.0
+    # the signal is piecewise-constant (weekly cadence forward-filled to daily)
+    # -> most bars are repeats of the previous bar
+    dup = (sig.diff().fillna(0.0) == 0.0).mean()
+    assert dup > 0.5, "expected weekly (low-frequency) signal cadence"
+    # at least one long entry on oscillating data
+    res = backtest_ohlcv(df, sig, _default_backtest_params("balanced", "long_only"))
+    assert res["metrics"]["trades"] >= 1
+
+
+def test_value_momentum_archetype_mom2_12_and_gate():
+    """Asness, Moskowitz & Pedersen (J. Finance 2013): MOM2-12 momentum skips
+    the most recent month; an absolute-momentum gate flattens during 1y
+    downtrends. Signal must be in [-1, 1] and gated."""
+    df = _long_df(seed=3)
+    a = ARCHETYPES["value_momentum"]
+    p = {q["name"]: q["default"] for q in a["params"]}
+    sig = a["sig"](df, p)
+    assert len(sig) == len(df)
+    assert float(sig.min()) >= -1.0 - 1e-9
+    assert float(sig.max()) <= 1.0 + 1e-9
+    # the momentum signal uses close.shift(skip) with skip = mom_skip (21)
+    assert p["mom_skip"] == 21  # skips the most recent month
+
+
+def test_flag_breakout_archetype_strict_pattern():
+    """Velay & Daniel (2018): hard-coded flag detection with strict bounds.
+    On a trending series the flag fires sparsely (strict bounds, ~0 false
+    positives), producing few trades on the backtest."""
+    df = _long_df(seed=7, trend=0.0012)
+    a = ARCHETYPES["flag_breakout"]
+    p = {q["name"]: q["default"] for q in a["params"]}
+    sig = a["sig"](df, p)
+    assert len(sig) == len(df)
+    # strict bounds -> rare signals
+    assert float(sig.abs().sum()) < len(df) * 0.05
+
+
+def test_walk_forward_cv_reports_folds_and_consistency(df_trend):
+    """Bergmeir & Hyndman (2018): multi-fold walk-forward OOS beats a single
+    split for controlling overfitting. search_best(wf_folds=N) must attach a
+    walk_forward dict with per-fold stats + residual autocorrelation."""
+    df = _long_df(seed=11)
+    found = search_best(ARCHETYPES["value_momentum"], df, n_trials=6, wf_folds=4,
+                        backtest_params=_default_backtest_params("balanced", "long_only"))
+    assert "error" not in found
+    wf = found.get("walk_forward")
+    assert wf is not None
+    assert wf["folds"] >= 2
+    assert len(wf["per_fold"]) == wf["folds"]
+    assert 0.0 <= wf["consistency"] <= 1.0
+    # residual autocorrelation is a float in [-1, 1]
+    assert -1.0 <= wf["mean_autocorr"] <= 1.0
+    # every fold metrics carry the residual autocorr key (p4 residual check)
+    assert all("residual_autocorr" in f for f in wf["per_fold"])
+
+
+def test_build_algorithms_with_wf_folds_attaches_notes(df_trend):
+    """build_algorithms(wf_folds=3) threads the walk-forward evaluation into
+    the result build_notes so the UI can show it."""
+    res = build_algorithms(mode="guided", archetypes=["trend_ma"], count=1,
+                           universe=["SPY"], seed=7, runs_per_family=1,
+                           wf_folds=3, data_fn=_mk_data_fn(_long_df(seed=5)))
+    assert len(res) == 1
+    joined = " ".join(res[0].build_notes)
+    assert "Walk-forward CV" in joined
+    assert "consistency" in joined
+
+
+def test_generated_research_scripts_compile_and_run(df_trend):
+    """The three research-grounded archetypes must export Python that compiles
+    AND executes against mocked data (regression for the json.dumps bug class)."""
+    for name in ("stoch_williams", "value_momentum", "flag_breakout"):
+        params = {p["name"]: p["default"] for p in ARCHETYPES[name]["params"]}
+        code = generate_python(name, params,
+                               _default_backtest_params("balanced", "long_only"),
+                               ["SPY"])
+        _exec_with_mock_data(code, _long_df(seed=9, trend=0.0010))

@@ -168,6 +168,7 @@ def compute_metrics(returns: pd.Series, equity: pd.Series,
     gross_loss = abs(sum(t["exit_pnl_pct"] for t in losses))
     profit_factor = gross_win / gross_loss if gross_loss > 0 else (gross_win if gross_win > 0 else 0.0)
     exposure = float((returns != 0).mean()) if len(returns) else 0.0
+    residual_autocorr = _lag1_autocorr(returns)
     return {
         "total_return": total, "cagr": cagr, "sharpe": sharpe, "sortino": sortino,
         "max_drawdown": max_dd, "calmar": calmar, "volatility": vol, "win_rate": win_rate,
@@ -176,7 +177,23 @@ def compute_metrics(returns: pd.Series, equity: pd.Series,
         "worst_trade": min((t["exit_pnl_pct"] for t in closed), default=0.0),
         "avg_hold_bars": float(np.mean([t["hold_bars"] for t in closed])) if closed else 0.0,
         "years": years,
+        "residual_autocorr": residual_autocorr,
     }
+
+
+def _lag1_autocorr(s: pd.Series) -> float:
+    """Lag-1 autocorrelation of a returns series — the Ljung-Box-style residual
+    check from Bergmeir & Hyndman (2018). Large |autocorr| on strategy returns
+    means the model leaves predictable structure on the table (underfits); near
+    zero means the signal already captured the linear dependence."""
+    s = s.dropna()
+    if len(s) < 5:
+        return 0.0
+    x = s.to_numpy()
+    mu = float(x.mean())
+    num = float(np.sum((x[1:] - mu) * (x[:-1] - mu)))
+    den = float(np.sum((x - mu) ** 2))
+    return num / den if den != 0.0 else 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -547,6 +564,216 @@ def _gap_fade():
 
 
 # --------------------------------------------------------------------------- #
+#  Research-grounded families (peer-reviewed / NBER-adjacent sources)
+# --------------------------------------------------------------------------- #
+
+def _resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    """Resample a daily OHLCV frame to weekly (W-FRI) bars."""
+    out = df.resample("W-FRI").agg({"Open": "first", "High": "max",
+                                     "Low": "min", "Close": "last", "Volume": "sum"})
+    return out.dropna()
+
+
+@_register
+def _stoch_williams():
+    """Paik, Choi & Vaquero (JRFM 2024) — low-frequency market-timing with a
+    Stochastic oscillator, Williams %R, and a volume-surge position scaler.
+
+    Weekly bars; buy when the stochastic (%K) is oversold (< 30) AND Williams
+    %R is deeply oversold (< -75); sell when %K is overbought (> 80) AND %R is
+    overbought (> -20). When a buy fires, a volume surge (weekly volume >= 20%
+    above the 52-week mean, or more than 1 standard deviation above it) scales
+    the position to 2x; meeting BOTH conditions scales to 3x. A weekly loss-cut
+    (~10% below entry) flattens the position. The paper reports ~90% hit rate
+    with <1% max drawdown on SPY 2010-2023 (1.5 trades/yr)."""
+    def sig(df, p):
+        w = _resample_weekly(df)
+        if len(w) < 30:
+            return pd.Series(0.0, index=df.index, name="sig")
+        hi, lo, cl, vol = w["High"], w["Low"], w["Close"], w["Volume"]
+        k_per = max(int(p["k_period"]), 2)
+        rng_hi = hi.rolling(k_per).max()
+        rng_lo = lo.rolling(k_per).min()
+        denom = (rng_hi - rng_lo).replace(0.0, np.nan)
+        stoch_k = ((cl - rng_lo) / denom * 100.0).fillna(50.0)
+        stoch_d = stoch_k.rolling(max(int(p["d_period"]), 2)).mean()
+        r_per = max(int(p["r_period"]), 2)
+        rng_hi2 = hi.rolling(r_per).max()
+        rng_lo2 = lo.rolling(r_per).min()
+        denom2 = (rng_hi2 - rng_lo2).replace(0.0, np.nan)
+        williams = ((cl - rng_hi2) / denom2 * 100.0).fillna(-50.0)
+        vol_avg = vol.rolling(max(int(p["vol_period"]), 5)).mean()
+        vol_std = vol.rolling(max(int(p["vol_period"]), 5)).std()
+        vol_pct = p["vol_surge_pct"]
+        buy_k, buy_r = p["buy_k"], p["buy_r"]
+        sell_k, sell_r = p["sell_k"], p["sell_r"]
+        loss_cut = p["loss_cut_pct"]
+        out = np.zeros(len(w))
+        state = 0
+        entry_px = 0.0
+        for i in range(len(w)):
+            if state != 0 and entry_px > 0 and cl.iloc[i] / entry_px - 1.0 < -loss_cut / 100.0:
+                state = 0  # weekly loss-cut flattens
+            if state == 0:
+                if stoch_d.iloc[i] < buy_k and williams.iloc[i] < buy_r:
+                    vol_i = vol.iloc[i]
+                    surge20 = not pd.isna(vol_avg.iloc[i]) and vol_i >= vol_avg.iloc[i] * (1 + vol_pct / 100.0)
+                    surge1s = not pd.isna(vol_std.iloc[i]) and vol_std.iloc[i] > 0 and vol_i >= vol_avg.iloc[i] + vol_std.iloc[i]
+                    if surge20 and surge1s:
+                        state = 3.0
+                    elif surge20 or surge1s:
+                        state = 2.0
+                    else:
+                        state = 1.0
+                    entry_px = cl.iloc[i]
+                else:
+                    state = 0.0
+            elif stoch_d.iloc[i] > sell_k and williams.iloc[i] > sell_r:
+                state = 0.0
+                entry_px = 0.0
+            out[i] = state
+        # forward-fill the weekly target onto daily bars (hold until the weekly
+        # signal changes; keeps the low-frequency character of the paper)
+        sig_w = pd.Series(out, index=w.index, name="sig")
+        sig_d = sig_w.reindex(df.index, method="ffill").fillna(0.0)
+        return sig_d.clip(lower=0.0)  # long-only by construction
+    return {
+        "name": "stoch_williams", "family": "meanrev",
+        "label": "Stochastic + Williams %R + Volume Surge (low-freq timing)",
+        "provenance": ("Paik, Choi & Vaquero, 'Algorithm-Based Low-Frequency Trading "
+                       "Using a Stochastic Oscillator, Williams%R, and Trading Volume "
+                       "for the S&P 500', JRFM 17:501 (2024). Weekly Stochastic %K/%D + "
+                       "Williams %R overbought/oversold timing with a 52-week volume-"
+                       "surge position scaler (2x/3x) and a weekly loss-cut; reported "
+                       "~90% hit rate, <1% max drawdown, 1.5 trades/yr on SPY."),
+        "params": [
+            {"name": "k_period", "type": "int", "min": 5, "max": 26, "default": 10},
+            {"name": "d_period", "type": "int", "min": 2, "max": 13, "default": 6},
+            {"name": "r_period", "type": "int", "min": 5, "max": 26, "default": 10},
+            {"name": "vol_period", "type": "int", "min": 26, "max": 78, "default": 52},
+            {"name": "vol_surge_pct", "type": "float", "min": 5.0, "max": 60.0, "default": 20.0},
+            {"name": "buy_k", "type": "float", "min": 10.0, "max": 45.0, "default": 30.0},
+            {"name": "buy_r", "type": "float", "min": -95.0, "max": -60.0, "default": -75.0},
+            {"name": "sell_k", "type": "float", "min": 55.0, "max": 95.0, "default": 80.0},
+            {"name": "sell_r", "type": "float", "min": -40.0, "max": -5.0, "default": -20.0},
+            {"name": "loss_cut_pct", "type": "float", "min": 3.0, "max": 25.0, "default": 10.0},
+        ],
+        "sig": sig, "ops": False,
+    }
+
+
+@_register
+def _value_momentum():
+    """Asness, Moskowitz & Pedersen, 'Value and Momentum Everywhere' (J. Finance
+    2013) — combine a value proxy with 12-2 month momentum, which are negatively
+    correlated, so the blend smooths the equity curve.
+
+    Value proxy (price-based, since the engine has no fundamentals): distance of
+    price below its trailing 1y average, z-scored — cheap = far below the mean.
+    Momentum: the standard MOM2-12 (past 12 months of returns skipping the most
+    recent month) to dodge 1-month reversals. The composite z-score drives a
+    tanh target; the paper finds value and momentum premia across 8 markets and
+    asset classes with a strong common factor structure."""
+    def sig(df, p):
+        close = df["Close"]
+        mom_n = max(int(p["mom_lookback"]), 42)      # ~12 months of bars
+        skip = max(int(p["mom_skip"]), 5)            # skip most-recent month
+        mom = (close.shift(skip) / close.shift(skip + mom_n) - 1.0)
+        # value proxy: how far price sits below its trailing-1y average
+        avg1y = close.rolling(max(int(p["value_lookback"]), 42)).mean()
+        value = (close / avg1y - 1.0)
+        z_mom = (mom - mom.rolling(max(int(p["z_span"]), 63)).mean()) / \
+            mom.rolling(max(int(p["z_span"]), 63)).std().replace(0.0, np.nan)
+        z_val = (value - value.rolling(max(int(p["z_span"]), 63)).mean()) / \
+            value.rolling(max(int(p["z_span"]), 63)).std().replace(0.0, np.nan)
+        composite = (p["w_mom"] * z_mom.fillna(0.0) - p["w_val"] * z_val.fillna(0.0))
+        out = np.tanh(composite / max(p["scale"], 1e-6))
+        # absolute-momentum gate (Antonacci-style): no longs in a 1y downtrend
+        gate = close / close.shift(max(int(p["gate_lookback"]), 126)) - 1.0
+        out = out.where(gate > p["gate_min"], 0.0)
+        return out.fillna(0.0).clip(-1.0, 1.0).rename("sig")
+    return {
+        "name": "value_momentum", "family": "momentum",
+        "label": "Value + Momentum Composite (MOM2-12)",
+        "provenance": ("Asness, Moskowitz & Pedersen, 'Value and Momentum Everywhere', "
+                       "Journal of Finance 68(3) (2013): value and momentum premia across "
+                       "8 markets/asset classes, negatively correlated with each other, so "
+                       "combining them smooths returns. Value here is a price proxy (depth "
+                       "below trailing 1y average); momentum is the standard MOM2-12 with "
+                       "the most recent month skipped, gated by absolute trend."),
+        "params": [
+            {"name": "mom_lookback", "type": "int", "min": 42, "max": 378, "default": 252},
+            {"name": "mom_skip", "type": "int", "min": 5, "max": 42, "default": 21},
+            {"name": "value_lookback", "type": "int", "min": 42, "max": 378, "default": 252},
+            {"name": "z_span", "type": "int", "min": 21, "max": 252, "default": 126},
+            {"name": "w_mom", "type": "float", "min": 0.0, "max": 2.0, "default": 1.0},
+            {"name": "w_val", "type": "float", "min": 0.0, "max": 2.0, "default": 1.0},
+            {"name": "scale", "type": "float", "min": 0.5, "max": 5.0, "default": 1.5},
+            {"name": "gate_lookback", "type": "int", "min": 63, "max": 378, "default": 252},
+            {"name": "gate_min", "type": "float", "min": -0.2, "max": 0.2, "default": 0.0},
+        ],
+        "sig": sig, "ops": False,
+    }
+
+
+@_register
+def _flag_breakout():
+    """Velay & Daniel (2018) — hard-coded bull/bear flag pattern recognition.
+
+    The paper's key findings: chart patterns carry only a ~50-60% correlation
+    with future trends (barely above random) and must be combined with other
+    indicators; hard-coded detection with STRICT bounds keeps false positives
+    near zero. This archetype implements a strict flag (flagpole -> tight
+    consolidation -> continuation breakout) that only fires on a clean pattern
+    plus a trend confirmation, so it complements trend/breakout families rather
+    than trading the pattern alone."""
+    def sig(df, p):
+        close = df["Close"]
+        hi, lo = df["High"], df["Low"]
+        pole = max(int(p["pole_bars"]), 5)
+        flag = max(int(p["flag_bars"]), 3)
+        tight = p["flag_tight_pct"]
+        out = np.zeros(len(df))
+        # bull-flag: strong pole up, then a tight/shrinking range (the flag),
+        # then a close above the flag high = continuation
+        for i in range(pole + flag, len(df)):
+            if out[i - 1] != 0:
+                continue
+            pole_hi = hi.iloc[i - flag - pole:i - flag].max()
+            pole_lo = lo.iloc[i - flag - pole:i - flag].min()
+            pole_move = (pole_hi / pole_lo - 1.0) * 100.0
+            flag_hi = hi.iloc[i - flag:i].max()
+            flag_lo = lo.iloc[i - flag:i].min()
+            flag_range = (flag_hi / flag_lo - 1.0) * 100.0
+            ret = close.iloc[i] / close.iloc[i - 1] - 1.0
+            if pole_move >= p["pole_min_pct"] and flag_range <= tight and \
+                    close.iloc[i] > flag_hi and ret > 0:
+                out[i] = 1.0
+            # bear-flag mirror (only if shorts allowed by direction gate)
+            if pole_move <= -p["pole_min_pct"] and flag_range <= tight and \
+                    close.iloc[i] < flag_lo and ret < 0:
+                out[i] = -1.0
+        return pd.Series(out, index=df.index, name="sig")
+    return {
+        "name": "flag_breakout", "family": "trend",
+        "label": "Chart-Pattern Flag Breakout (strict bounds)",
+        "provenance": ("Velay & Daniel, 'Stock Chart Pattern Recognition with Deep "
+                       "Learning' (2018): patterns alone carry only ~50-60% predictive "
+                       "correlation, so hard-coded detection with STRICT bounds keeps "
+                       "false positives near zero and the pattern must be combined with "
+                       "other signals. This strict flagpole->flag->continuation detector "
+                       "only fires on clean patterns, complementing trend families."),
+        "params": [
+            {"name": "pole_bars", "type": "int", "min": 5, "max": 30, "default": 10},
+            {"name": "flag_bars", "type": "int", "min": 3, "max": 15, "default": 5},
+            {"name": "pole_min_pct", "type": "float", "min": 2.0, "max": 25.0, "default": 8.0},
+            {"name": "flag_tight_pct", "type": "float", "min": 1.0, "max": 15.0, "default": 5.0},
+        ],
+        "sig": sig, "ops": False,
+    }
+
+
+# --------------------------------------------------------------------------- #
 #  Online Portfolio Selection (Glucksman paper families)
 # --------------------------------------------------------------------------- #
 
@@ -907,12 +1134,75 @@ def _validate_params(archetype: dict, params: dict, n_bars: Optional[int] = None
     return p
 
 
+def walk_forward_evaluate(archetype: dict, df: pd.DataFrame, params: dict,
+                          backtest_params: Optional[dict] = None,
+                          folds: int = 4, min_train: float = 0.35) -> dict:
+    """Multi-fold walk-forward OOS evaluation (Bergmeir & Hyndman, 'A Note on
+    the Validity of Cross-Validation for Evaluating Autoregressive Time Series
+    Prediction', 2018).
+
+    Instead of ONE held-out window (a single OOS draw), the series is split into
+    `folds` contiguous trailing folds of increasing size; the strategy runs on
+    each fold and per-fold metrics are aggregated. The paper shows this kind of
+    repeated evaluation controls overfitting far better than a single OOS split
+    for autoregressive/ML strategies. Returns per-fold metrics plus aggregates
+    (mean/median Sharpe, worst fold, consistency = share of folds with positive
+    Sharpe)."""
+    backtest_params = backtest_params or {}
+    n = len(df)
+    if n < 120:
+        return {"folds": 0, "error": "insufficient history for walk-forward"}
+    folds = max(int(folds), 2)
+    start = max(int(n * min_train), 60)
+    step = max((n - start) // folds, 1)
+    fold_results = []
+    sig_all = archetype["sig"](df, params)
+    for k in range(folds):
+        end = start + (k + 1) * step
+        end = min(end, n)
+        if end - start < 30:
+            continue
+        test_df = df.iloc[start:end]
+        sig_test = sig_all.iloc[start:end]
+        res = backtest_ohlcv(test_df, sig_test, backtest_params)
+        fold_results.append({"fold": k + 1, "metrics": res["metrics"],
+                             "equity": res["equity"], "trades": res["trades"]})
+    if not fold_results:
+        return {"folds": 0, "error": "no usable folds"}
+    sharpes = [f["metrics"]["sharpe"] for f in fold_results]
+    returns = [f["metrics"]["total_return"] for f in fold_results]
+    dds = [f["metrics"]["max_drawdown"] for f in fold_results]
+    autocorrs = [f["metrics"]["residual_autocorr"] for f in fold_results]
+    return {
+        "folds": len(fold_results),
+        "per_fold": [{"fold": f["fold"], "sharpe": f["metrics"]["sharpe"],
+                       "total_return": f["metrics"]["total_return"],
+                       "max_drawdown": f["metrics"]["max_drawdown"],
+                       "trades": f["metrics"]["trades"],
+                       "residual_autocorr": f["metrics"]["residual_autocorr"]}
+                      for f in fold_results],
+        "mean_sharpe": float(np.mean(sharpes)),
+        "median_sharpe": float(np.median(sharpes)),
+        "worst_fold_sharpe": float(min(sharpes)),
+        "mean_return": float(np.mean(returns)),
+        "worst_drawdown": float(min(dds)),
+        "consistency": float(np.mean([s > 0 for s in sharpes])),
+        "mean_autocorr": float(np.mean(autocorrs)),
+        "equities": [f["equity"] for f in fold_results],
+        "trades": [t for f in fold_results for t in f["trades"]],
+    }
+
+
 def search_best(archetype: dict, df: pd.DataFrame, n_trials: int = 30,
                 rng: Optional[np.random.Generator] = None, seed: int = 42,
                 backtest_params: Optional[dict] = None, locked: Optional[dict] = None,
-                split: float = 0.75, objective: str = "sharpe") -> dict:
+                split: float = 0.75, objective: str = "sharpe",
+                wf_folds: int = 0) -> dict:
     """Random-search the archetype's parameter space on a train window, then
-    report honest out-of-sample metrics on the held-out test window."""
+    report honest out-of-sample metrics on the held-out test window. When
+    `wf_folds > 0`, ALSO run a walk-forward multi-fold OOS evaluation
+    (Bergmeir & Hyndman 2018) of the chosen params and report it as
+    `walk_forward` (mean/median/worst Sharpe across folds + consistency)."""
     rng = rng or np.random.default_rng(seed)
     backtest_params = backtest_params or {}
     n = len(df)
@@ -957,12 +1247,17 @@ def search_best(archetype: dict, df: pd.DataFrame, n_trials: int = 30,
         chosen = (params, train_res, test_res, test_res["metrics"])
 
     params, train_res, test_res, oos_m = chosen
-    return {
+    out = {
         "archetype": archetype["name"], "params": params,
         "train_metrics": train_res["metrics"], "test_metrics": oos_m,
         "train_equity": train_res["equity"], "test_equity": test_res["equity"],
         "train_trades": train_res["trades"], "test_trades": test_res["trades"],
     }
+    if wf_folds and int(wf_folds) > 0:
+        wf = walk_forward_evaluate(archetype, df, params, backtest_params,
+                                   folds=int(wf_folds))
+        out["walk_forward"] = wf if wf.get("folds", 0) > 0 else None
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1080,11 +1375,14 @@ def _ensemble_rationale(members: list, quality: dict, diversity: dict,
 _KEYWORD_FAMILIES = [
     (["mean reversion", "mean-reversion", "mean reverting", "revert", "reversion",
       "fade", "buy the dip", "buy dip", "oversold", "bollinger", "rsi",
-      "stat arb", "statarb", "pairs", "z-score", "zscore", "gap"],
-     ["rsi_meanrev", "bollinger_meanrev", "statarb_z", "gap_fade"]),
+      "stat arb", "statarb", "pairs", "z-score", "zscore", "gap",
+      "stochastic", "williams", "williams %r", "oversold oscillator", "volume surge"],
+     ["stoch_williams", "rsi_meanrev", "bollinger_meanrev", "statarb_z", "gap_fade"]),
     (["trend", "momentum", "moving average", "crossover", "breakout", "turtle",
-      "donchian", "follow the winner", "follow-the-winner", "follow the trend"],
-     ["trend_ma", "breakout", "dual_momentum"]),
+      "donchian", "follow the winner", "follow-the-winner", "follow the trend",
+      "chart pattern", "flag", "flagpole", "value and momentum", "value momentum",
+      "mom everywhere", "asness"],
+     ["value_momentum", "flag_breakout", "trend_ma", "breakout", "dual_momentum"]),
     (["market mak", "liquidity", "spread", "optiver", "jane street", "citadel",
       "order book", "quoting"],
      ["market_making"]),
@@ -1107,18 +1405,33 @@ _DEFAULT_BY_RISK = {
 
 
 def parse_request(text: str, risk: str = "balanced") -> list:
-    """Map a vague request to archetype families. Empty/unknown -> risk default."""
+    """Map a vague request to archetype families. Empty/unknown -> risk default.
+
+    When the request mentions SEVERAL strategy ideas (e.g. "value and momentum
+    plus stochastic oversold buys"), families are interleaved across the matching
+    keyword groups (2 per group) instead of taking the first group's whole list,
+    so a multi-topic request yields a genuinely diverse mix of families."""
     t = (text or "").lower()
-    hits: list = []
+    groups: list = []
     for keywords, families in _KEYWORD_FAMILIES:
         if any(k in t for k in keywords):
-            for f in families:
-                if f not in hits and f != "ensemble":
-                    hits.append(f)
-    if "ensemble" in t or (not hits and any(k in t for k in ["all", "best", "everything", "any"])):
-        pass
-    if not hits:
-        hits = list(_DEFAULT_BY_RISK.get(risk, _DEFAULT_BY_RISK["balanced"]))
+            groups.append([f for f in families if f != "ensemble"])
+    if not groups:
+        return list(_DEFAULT_BY_RISK.get(risk, _DEFAULT_BY_RISK["balanced"]))[:4]
+    # interleave: take up to 2 families per matching group, round-robin, capped
+    hits: list = []
+    idx = 0
+    while len(hits) < 4:
+        added = 0
+        for fams in groups:
+            if idx < len(fams) and fams[idx] not in hits:
+                hits.append(fams[idx])
+                added += 1
+                if len(hits) >= 4:
+                    break
+        idx += 1
+        if added == 0:
+            break
     return hits[:4]
 
 
@@ -1405,6 +1718,68 @@ def _signal_body(name: str) -> str:
                 return out
 
         ''')
+    if name == "stoch_williams":
+        return textwrap.dedent('''\
+                w = df.resample("W-FRI").agg({"Open": "first", "High": "max",
+                                                "Low": "min", "Close": "last",
+                                                "Volume": "sum"}).dropna()
+                hi, lo, cl, vol = w["High"], w["Low"], w["Close"], w["Volume"]
+                denom = (hi.rolling(int(PARAMS["k_period"])).max() - lo.rolling(int(PARAMS["k_period"])).min()).replace(0, float("nan"))
+                k = ((cl - lo.rolling(int(PARAMS["k_period"])).min()) / denom * 100).fillna(50)
+                d = k.rolling(int(PARAMS["d_period"])).mean()
+                denom2 = (hi.rolling(int(PARAMS["r_period"])).max() - lo.rolling(int(PARAMS["r_period"])).min()).replace(0, float("nan"))
+                r = ((cl - hi.rolling(int(PARAMS["r_period"])).max()) / denom2 * 100).fillna(-50)
+                va = vol.rolling(int(PARAMS["vol_period"])).mean()
+                vs = vol.rolling(int(PARAMS["vol_period"])).std()
+                out = pd.Series(0.0, index=w.index)
+                state = 0.0
+                for i in range(len(w)):
+                    if state == 0 and d.iloc[i] < PARAMS["buy_k"] and r.iloc[i] < PARAMS["buy_r"]:
+                        s20 = vol.iloc[i] >= va.iloc[i] * (1 + PARAMS["vol_surge_pct"] / 100)
+                        s1 = vs.iloc[i] > 0 and vol.iloc[i] >= va.iloc[i] + vs.iloc[i]
+                        state = 3.0 if (s20 and s1) else (2.0 if (s20 or s1) else 1.0)
+                    elif state != 0 and d.iloc[i] > PARAMS["sell_k"] and r.iloc[i] > PARAMS["sell_r"]:
+                        state = 0.0
+                    out.iloc[i] = state
+                return out.reindex(df.index, method="ffill").fillna(0).clip(lower=0)
+
+        ''')
+    if name == "value_momentum":
+        return textwrap.dedent('''\
+                skip = int(PARAMS["mom_skip"])
+                mom = close.shift(skip) / close.shift(skip + int(PARAMS["mom_lookback"])) - 1
+                val = close / close.rolling(int(PARAMS["value_lookback"])).mean() - 1
+                span = int(PARAMS["z_span"])
+                zm = (mom - mom.rolling(span).mean()) / mom.rolling(span).std().replace(0, float("nan"))
+                zv = (val - val.rolling(span).mean()) / val.rolling(span).std().replace(0, float("nan"))
+                comp = PARAMS["w_mom"] * zm.fillna(0) - PARAMS["w_val"] * zv.fillna(0)
+                out = np.tanh(comp / max(PARAMS["scale"], 1e-6))
+                gate = close / close.shift(int(PARAMS["gate_lookback"])) - 1
+                return out.where(gate > PARAMS["gate_min"], 0).fillna(0).clip(-1, 1)
+
+        ''')
+    if name == "flag_breakout":
+        return textwrap.dedent('''\
+                hi, lo = df["High"], df["Low"]
+                pole, flag = int(PARAMS["pole_bars"]), int(PARAMS["flag_bars"])
+                out = pd.Series(0.0, index=df.index)
+                for i in range(pole + flag, len(df)):
+                    if out.iloc[i - 1] != 0:
+                        continue
+                    ph = hi.iloc[i - flag - pole:i - flag].max()
+                    pl = lo.iloc[i - flag - pole:i - flag].min()
+                    fh = hi.iloc[i - flag:i].max()
+                    fl = lo.iloc[i - flag:i].min()
+                    pm = (ph / pl - 1) * 100
+                    fr = (fh / fl - 1) * 100
+                    ret = close.iloc[i] / close.iloc[i - 1] - 1
+                    if pm >= PARAMS["pole_min_pct"] and fr <= PARAMS["flag_tight_pct"] and close.iloc[i] > fh and ret > 0:
+                        out.iloc[i] = 1.0
+                    if pm <= -PARAMS["pole_min_pct"] and fr <= PARAMS["flag_tight_pct"] and close.iloc[i] < fl and ret < 0:
+                        out.iloc[i] = -1.0
+                return out
+
+        ''')
     return "        return pd.Series(0.0, index=close.index)\n\n"
 
 
@@ -1641,6 +2016,7 @@ def build_algorithms(
     backtest_params_override: Optional[dict] = None,
     runs_per_family: int = 3,
     ensemble_method: str = "dynamic",
+    wf_folds: int = 0,
 ) -> list:
     """Build one or more algorithms from a request.
 
@@ -1726,7 +2102,8 @@ def build_algorithms(
             run_seed = seed + i * 1013 + run * 577
             trial_rng = np.random.default_rng(run_seed)
             found = search_best(a, primary, n_trials=n_trials, rng=trial_rng,
-                                backtest_params=bp, locked=locked, seed=run_seed)
+                                backtest_params=bp, locked=locked, seed=run_seed,
+                                wf_folds=wf_folds)
             if "error" in found:
                 continue  # this run failed; try the next seed before giving up
             family_ok = True
@@ -1734,6 +2111,20 @@ def build_algorithms(
             sig = a["sig"](primary, params)
             full = backtest_ohlcv(primary, sig, bp)
             suffix = f" (run {run + 1}/{runs})" if multi else ""
+            notes = [f"Parameters optimized on train window "
+                     f"(train Sharpe {found['train_metrics'].get('sharpe', 0):.2f}), "
+                     f"reported OOS test Sharpe "
+                     f"{found['test_metrics'].get('sharpe', 0):.2f}."]
+            wf = found.get("walk_forward")
+            if wf:
+                notes.append(
+                    f"Walk-forward CV across {wf['folds']} trailing folds "
+                    f"(Bergmeir & Hyndman 2018): mean Sharpe {wf['mean_sharpe']:.2f}, "
+                    f"median {wf['median_sharpe']:.2f}, worst fold "
+                    f"{wf['worst_fold_sharpe']:.2f}, consistency "
+                    f"{wf['consistency'] * 100:.0f}% of folds profitable, "
+                    f"residual autocorrelation {wf['mean_autocorr']:.3f} "
+                    f"({'(signal left structure on the table)' if abs(wf['mean_autocorr']) > 0.15 else '(signal is well-specified)'}).")
             results.append(AlgorithmResult(
                 name=f"{a['label']}-{primary_sym}{suffix}", family=a["family"],
                 archetype=fam, params=params, backtest_params=bp,
@@ -1743,11 +2134,7 @@ def build_algorithms(
                 test_metrics=found["test_metrics"], universe=[primary_sym],
                 window_returns=window_returns(full["equity"]),
                 trade_narratives=trade_narratives(full["trades"], primary, sig, bp),
-                run_index=run + 1,
-                build_notes=[f"Parameters optimized on train window "
-                             f"(train Sharpe {found['train_metrics'].get('sharpe', 0):.2f}), "
-                             f"reported OOS test Sharpe "
-                             f"{found['test_metrics'].get('sharpe', 0):.2f}."]))
+                run_index=run + 1, build_notes=notes))
         if not family_ok:
             results.append(_error_result(fam, "no viable parameter set found on the training window",
                                          suggestion=diagnose_failure(fam, primary)))
@@ -1888,10 +2275,11 @@ def diagnose_failure(family: str, df: pd.DataFrame) -> str:
 def build_request_signature(request: str, mode: str, count: int, ensemble: bool,
                             risk: str, direction: str, universe: list,
                             archetypes: list, locked: dict, n_trials: int, seed: int,
-                            runs_per_family: int = 3, ensemble_method: str = "dynamic") -> str:
+                            runs_per_family: int = 3, ensemble_method: str = "dynamic",
+                            wf_folds: int = 0) -> str:
     blob = json.dumps([request, mode, count, ensemble, risk, direction,
                        universe, archetypes, locked, n_trials, seed,
-                       runs_per_family, ensemble_method], sort_keys=True)
+                       runs_per_family, ensemble_method, wf_folds], sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 

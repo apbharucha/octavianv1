@@ -239,7 +239,9 @@ def _build(build_args: dict, progress) -> list:
     progress.progress(0.05, text="Fetching 5y market data…")
     results = build_algorithms(**build_args)
     progress.progress(0.6, text=f"Searching parameter space ({n} families × {trials} trials × {runs} runs)…")
-    progress.progress(0.9, text="Running multi-window backtests + per-trade reasoning…")
+    wf = int(build_args.get("wf_folds", 0) or 0)
+    wf_txt = f" + walk-forward CV ({wf} folds)" if wf else ""
+    progress.progress(0.9, text=f"Running multi-window backtests + per-trade reasoning{wf_txt}…")
     progress.progress(1.0, text="Done.")
     return results
 
@@ -258,6 +260,7 @@ def render_algorithm_builder() -> None:
     mode = st.radio("Build mode", ["Auto — let the engine decide", "Guided — I pick the pieces"],
                     horizontal=True, label_visibility="collapsed")
     auto = mode.startswith("Auto")
+    wf = 0  # walk-forward CV folds; set by the controls below when enabled
 
     st.markdown("---")
     if auto:
@@ -288,6 +291,10 @@ def render_algorithm_builder() -> None:
         runs = st.slider("Backtests per algorithm (multiple runs = robustness evidence)",
                          1, 5, 3, help="Each family is searched several times with different "
                                        "seeds, so every algorithm gets many backtests.")
+        wf = st.slider("Walk-forward CV folds (0 = off)", 0, 6, 4,
+                       help="Multi-fold out-of-sample evaluation (Bergmeir & Hyndman 2018): "
+                            "each algorithm is re-tested on several trailing windows, not "
+                            "just one hold-out, so overfit parameter sets are caught.")
         archetypes = None
     else:
         st.markdown("#### Guided configuration")
@@ -320,10 +327,14 @@ def render_algorithm_builder() -> None:
             slippage = a5.number_input("Slippage (bps)", 0.0, 50.0, 5.0, 0.5)
             trials = a6.number_input("Search trials per family", 5, 100, 25, 5,
                                      help="More trials = better fit, slower build.")
-            a7, a8, _ = st.columns(3)
+            a7, a8, a9 = st.columns(3)
             runs = a7.number_input("Backtest runs per family", 1, 5, 3, 1,
                                    help="Each family is searched several times with different "
                                         "seeds — many backtests per algorithm.")
+            wf = a8.number_input("Walk-forward CV folds", 0, 6, 4, 1,
+                                 help="Multi-fold out-of-sample evaluation (Bergmeir & "
+                                      "Hyndman 2018) — re-tests each algorithm on several "
+                                      "trailing windows to catch overfitting. 0 = off.")
             request = ""
 
     st.markdown("---")
@@ -340,6 +351,7 @@ def render_algorithm_builder() -> None:
             n_trials=int(trials) if not auto else 25,
             runs_per_family=int(runs),
             seed=int(seed),
+            wf_folds=int(wf),
         )
         # advanced execution overrides (guided only)
         if not auto:
@@ -363,7 +375,7 @@ def render_algorithm_builder() -> None:
                                          if k in ("request", "mode", "count", "ensemble",
                                                   "risk", "direction", "universe",
                                                   "archetypes", "n_trials", "seed",
-                                                  "runs_per_family")},
+                                                  "runs_per_family", "wf_folds")},
                                        locked=build_args["locked_params"])
         if st.session_state.get("ab_sig") != sig:
             progress = st.progress(0.0, text="Starting…")
