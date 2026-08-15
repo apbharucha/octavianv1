@@ -361,3 +361,105 @@ def test_quant_portal_signal_history_is_capped_and_completes():
         assert not exc, f"Quant Portal signal raised: {exc[:2]}"
         assert 2 <= calls["n"] <= 25, (
             f"signal history loop not capped: {calls['n']} ensemble predicts")
+
+
+def test_quant_portal_evolution_progress_callback_arity():
+    """Regression: the Strategy Evolution tab crashed with
+    'render_quant_portal.<locals>._progress() takes 1 positional argument but 3
+    were given' because genetic_strategy_engine.evolve calls the callback with
+    (gen, total, fitness). The portal callback must accept all three."""
+    import genetic_strategy_engine as gse
+    from types import SimpleNamespace
+
+    def _fake_evolve(self, close, capital, progress_callback):
+        # self is bound because the patch replaces a class method
+        progress_callback(1, 20, 0.5)   # the real 3-arg call site
+        progress_callback(20, 20, 1.2)
+        return SimpleNamespace(
+            generations=[SimpleNamespace(best_fitness=0.5),
+                         SimpleNamespace(best_fitness=1.2)],
+            best_strategy=SimpleNamespace(params={"fast": 5}),
+            best_sharpe=1.2,
+        )
+
+    at = AppTest.from_file(os.path.join(ROOT, "main.py"), default_timeout=240)
+    with ExitStack() as stack:
+        for m in _build_mocks():
+            stack.enter_context(m)
+        stack.enter_context(patch("genetic_strategy_engine.GeneticStrategyEngine.evolve",
+                                  new=_fake_evolve))
+        stack.enter_context(patch("quant_portal.get_stock", side_effect=_mock_get_stock_long))
+        at.run()
+        for r in at.sidebar.radio:
+            if r.label == "Navigation":
+                r.set_value("Quant Portal")
+                at.run()
+                break
+        btns = [b for b in at.button if b.label == "Evolve Strategies"]
+        assert btns, "Evolve Strategies button not found"
+        btns[0].click()
+        at.run()
+        exc = [str(e.value) for e in at.exception]
+        assert not exc, f"Evolve Strategies raised: {exc[:2]}"
+        ok = " ".join(s.value for s in at.success)
+        assert "Evolution complete" in ok
+
+
+def test_quant_portal_backtest_uses_advanced_backtester():
+    """Regression: 'Run Backtest' crashed with
+    'AdvancedBacktester.__init__() got an unexpected keyword argument symbol'.
+    The tab must construct the backtester with its real signature, run it, and
+    render the resulting metrics without raising."""
+    at = AppTest.from_file(os.path.join(ROOT, "main.py"), default_timeout=240)
+    with ExitStack() as stack:
+        for m in _build_mocks():
+            stack.enter_context(m)
+        stack.enter_context(patch("quant_portal.get_stock", side_effect=_mock_get_stock_long))
+        at.run()
+        for r in at.sidebar.radio:
+            if r.label == "Navigation":
+                r.set_value("Quant Portal")
+                at.run()
+                break
+        btns = [b for b in at.button if b.label == "Run Backtest"]
+        assert btns, "Run Backtest button not found"
+        btns[0].click()
+        at.run()
+        exc = [str(e.value) for e in at.exception]
+        assert not exc, f"Run Backtest raised: {exc[:2]}"
+
+
+def test_quant_portal_alt_data_uses_valid_signal_fields():
+    """Regression: the Alternative Data tab crashed with
+    'AltDataSignal object has no attribute signal_type'. The display must use
+    the dataclass's real fields (name/category), not signal_type."""
+    import alternative_data_engine as ade
+    from datetime import datetime
+
+    def _fake_signals(ticker):
+        return [ade.AltDataSignal(
+            name="Satellite Footfall", category="satellite", ticker=ticker,
+            direction="BULLISH", strength=72.0, confidence=60.0, decay_days=14,
+            description="Foot traffic at retail locations rising.",
+            generated_at=datetime.utcnow().isoformat())]
+
+    at = AppTest.from_file(os.path.join(ROOT, "main.py"), default_timeout=240)
+    with ExitStack() as stack:
+        for m in _build_mocks():
+            stack.enter_context(m)
+        stack.enter_context(patch("alternative_data_engine.AlternativeDataEngine.get_all_signals",
+                                  side_effect=_fake_signals))
+        at.run()
+        for r in at.sidebar.radio:
+            if r.label == "Navigation":
+                r.set_value("Quant Portal")
+                at.run()
+                break
+        btns = [b for b in at.button if b.label == "Fetch Alternative Data"]
+        assert btns, "Fetch Alternative Data button not found"
+        btns[0].click()
+        at.run()
+        exc = [str(e.value) for e in at.exception]
+        assert not exc, f"Fetch Alternative Data raised: {exc[:2]}"
+        md = " ".join(m.value for m in at.markdown)
+        assert "Satellite Footfall" in md and "satellite" in md

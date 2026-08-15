@@ -55,6 +55,88 @@ RF = 0.0             # risk-free rate for Sharpe (0 keeps comparisons honest)
 #  Metrics
 # --------------------------------------------------------------------------- #
 
+# Trailing-window breakdown shown for every backtest: (label, trading bars).
+WINDOW_SPECS = [
+    ("5y", 5 * BARS_PER_YEAR), ("3y", 3 * BARS_PER_YEAR), ("2y", 2 * BARS_PER_YEAR),
+    ("1y", BARS_PER_YEAR), ("6m", 126), ("3m", 63), ("1m", 21),
+]
+
+
+def window_returns(equity: pd.Series) -> dict:
+    """Trailing returns of the equity curve over 5y/3y/2y/1y/6m/3m/1m windows.
+
+    Each window uses the most recent N trading bars of the strategy's own
+    equity curve, so short backtests simply omit the windows they cannot cover.
+    """
+    out = {}
+    if equity is None or len(equity) < 2:
+        for label, _ in WINDOW_SPECS:
+            out[label] = None
+        return out
+    eq = equity.dropna()
+    for label, bars in WINDOW_SPECS:
+        if len(eq) <= bars:
+            out[label] = None
+            continue
+        start = eq.iloc[-1 - bars]
+        end = eq.iloc[-1]
+        out[label] = float(end / start - 1.0) if start and start > 0 else None
+    return out
+
+
+def trade_narratives(trades: list, df: pd.DataFrame, signal: pd.Series,
+                     params: dict) -> list:
+    """Dynamic, per-trade reasoning: why this trade was entered, what the
+    market context was, why it was exited, and what it contributed."""
+    if not trades:
+        return []
+    close = df["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    rets = close.pct_change()
+    vol20 = rets.rolling(20).std() * math.sqrt(BARS_PER_YEAR)
+    notes = []
+    for t in trades:
+        try:
+            entry_ts = pd.Timestamp(t["entry_date"])
+            loc = df.index.searchsorted(entry_ts, side="left")
+            loc = min(max(loc, 0), len(df) - 1)
+            px = float(close.iloc[loc])
+            prev_px = float(close.iloc[max(loc - 5, 0)])
+            drift_5d = (px / prev_px - 1.0) * 100.0 if prev_px > 0 else 0.0
+            v = float(vol20.iloc[loc]) if loc < len(vol20) and not pd.isna(vol20.iloc[loc]) else None
+            vol_txt = f"{v * 100:.0f}% annualized" if v else "n/a"
+            pnl = t.get("exit_pnl_pct")
+            pnl_txt = f"{pnl:+.2f}%" if pnl is not None else "open"
+            reason = t.get("exit_reason") or "EXIT_RULE"
+            reason_txt = {
+                "STOP_LOSS": "hit the stop loss — the adverse move exceeded the risk budget",
+                "TAKE_PROFIT": "reached the take-profit target",
+                "TRAILING_STOP": "trailing stop triggered as the trend gave back gains",
+                "MAX_HOLD": "hit the maximum holding period",
+                "SIGNAL_FLAT": "the signal flipped flat, so the position was closed at the close",
+                "END_OF_DATA": "still open at the end of the backtest window",
+            }.get(reason, "the exit rule fired")
+            entry_px = t["entry_price"]
+            context = (f"5-day drift before entry {drift_5d:+.1f}%"
+                       + (f", {vol_txt} vol" if v else ""))
+            notes.append(
+                f"{t['entry_date']} {t.get('direction', 'LONG')} @ {entry_px:.2f}: entered "
+                f"({context}); {reason_txt} on {t.get('exit_date', '?')} "
+                f"after {t.get('hold_bars', 0)} bar(s) for {pnl_txt}."
+            )
+        except Exception:  # never let a narrative crash the build
+            continue
+    return notes
+
+
+_IMPACT_REASONS = {
+    "STOP_LOSS": "risk control", "TAKE_PROFIT": "profit taking",
+    "TRAILING_STOP": "trend protection", "MAX_HOLD": "time stop",
+    "SIGNAL_FLAT": "signal reversal", "END_OF_DATA": "end of window",
+}
+
+
 def compute_metrics(returns: pd.Series, equity: pd.Series,
                     trades: Optional[list] = None, bars_per_year: int = BARS_PER_YEAR,
                     capital: float = 100_000.0) -> dict:
@@ -673,36 +755,38 @@ def backtest_ohlcv(df: pd.DataFrame, signal: pd.Series, params: dict,
         if open_pos:
             gapped = False
             exit_price = None
+            exit_reason = None
             if stop_pct is not None:
                 stop_px = entry_price * (1 - stop_pct / 100.0) if cur_dir > 0 else entry_price * (1 + stop_pct / 100.0)
                 if (cur_dir > 0 and opn <= stop_px) or (cur_dir < 0 and opn >= stop_px):
-                    exit_price, gapped = opn, True
+                    exit_price, gapped, exit_reason = opn, True, "STOP_LOSS"
                 elif (cur_dir > 0 and price <= stop_px) or (cur_dir < 0 and price >= stop_px):
-                    exit_price = stop_px
+                    exit_price, exit_reason = stop_px, "STOP_LOSS"
             if tp_pct is not None and exit_price is None:
                 tp_px = entry_price * (1 + tp_pct / 100.0 * cur_dir)
                 if (cur_dir > 0 and opn >= tp_px) or (cur_dir < 0 and opn <= tp_px):
-                    exit_price, gapped = opn, True
+                    exit_price, gapped, exit_reason = opn, True, "TAKE_PROFIT"
                 elif (cur_dir > 0 and price >= tp_px) or (cur_dir < 0 and price <= tp_px):
-                    exit_price = tp_px
+                    exit_price, exit_reason = tp_px, "TAKE_PROFIT"
             if trail_pct is not None and exit_price is None:
                 if cur_dir > 0:
                     peak_price = max(peak_price, price)
                     trail_stop = peak_price * (1 - trail_pct / 100.0)
                     if opn <= trail_stop:
-                        exit_price, gapped = opn, True
+                        exit_price, gapped, exit_reason = opn, True, "TRAILING_STOP"
                     elif price <= trail_stop:
-                        exit_price = trail_stop
+                        exit_price, exit_reason = trail_stop, "TRAILING_STOP"
                 else:
                     peak_price = min(peak_price, price) if peak_price != 0 else price
                     trail_stop = peak_price * (1 + trail_pct / 100.0)
                     if opn >= trail_stop:
-                        exit_price, gapped = opn, True
+                        exit_price, gapped, exit_reason = opn, True, "TRAILING_STOP"
                     elif price >= trail_stop:
-                        exit_price = trail_stop
+                        exit_price, exit_reason = trail_stop, "TRAILING_STOP"
             if max_hold is not None and exit_price is None and (i - entry_bar) >= max_hold:
                 exit_price = opn
                 gapped = True
+                exit_reason = "MAX_HOLD"
             if exit_price is not None:
                 fill = exit_price if gapped else price
                 cost = commission + slippage
@@ -711,6 +795,7 @@ def backtest_ohlcv(df: pd.DataFrame, signal: pd.Series, params: dict,
                 open_trade["exit_pnl_pct"] = round(exit_pnl_pct, 4)
                 open_trade["exit_date"] = str(df.index[i].date())
                 open_trade["hold_bars"] = i - entry_bar
+                open_trade["exit_reason"] = exit_reason or "EXIT_RULE"
                 trades.append(open_trade)
                 open_trade = None
                 shares = 0.0
@@ -749,7 +834,8 @@ def backtest_ohlcv(df: pd.DataFrame, signal: pd.Series, params: dict,
                 peak_price = px
                 open_trade = {"entry_date": str(df.index[i].date()), "entry_price": round(px, 4),
                               "direction": "LONG" if cur_dir > 0 else "SHORT",
-                              "exit_pnl_pct": None, "exit_date": None, "hold_bars": None}
+                              "exit_pnl_pct": None, "exit_date": None, "hold_bars": None,
+                              "exit_reason": None}
         elif open_pos and abs(target) < 0.01 and not gapped:
             # flat signal while holding: close at close (no gap info needed)
             fill = price
@@ -758,6 +844,7 @@ def backtest_ohlcv(df: pd.DataFrame, signal: pd.Series, params: dict,
             open_trade["exit_pnl_pct"] = round((fill / entry_price - 1.0) * cur_dir * 100.0, 4)
             open_trade["exit_date"] = str(df.index[i].date())
             open_trade["hold_bars"] = i - entry_bar
+            open_trade["exit_reason"] = "SIGNAL_FLAT"
             trades.append(open_trade)
             open_trade = None
             shares = 0.0
@@ -772,6 +859,7 @@ def backtest_ohlcv(df: pd.DataFrame, signal: pd.Series, params: dict,
         open_trade["exit_pnl_pct"] = round((fill / entry_price - 1.0) * cur_dir * 100.0, 4)
         open_trade["exit_date"] = str(df.index[-1].date())
         open_trade["hold_bars"] = n - 1 - entry_bar
+        open_trade["exit_reason"] = "END_OF_DATA"
         trades.append(open_trade)
 
     eq = pd.Series(equity, index=df.index)
@@ -888,6 +976,10 @@ def build_ensemble(members: list, df: pd.DataFrame, method: str = "fast_universa
     * equal_weight       : 1/K each (static)
     * sharpe_weight      : weight by train Sharpe (static, clipped)
     * fast_universalization: wealth-proportional reweighting (Glucksman eq. 21)
+    * dynamic            : wealth-adaptive mixing tilted by each member's measured
+      quality (Sharpe, sortino, drawdown, win rate, trade robustness) and
+      penalized for redundancy (pairwise correlation) — maximizes strengths,
+      down-weights weaknesses.
     """
     if not members:
         raise ValueError("ensemble needs at least one member")
@@ -906,15 +998,79 @@ def build_ensemble(members: list, df: pd.DataFrame, method: str = "fast_universa
         w = pd.Series({k: (v / tot if tot > 0 else 1.0 / K) for k, v in sh.items()})
         combined = (rets * w).sum(axis=1)
         final_w = w.round(4).to_dict()
+    elif method == "dynamic":
+        # ---- quality score per member (strengths) ----
+        q = {}
+        for m in members:
+            mm = m.metrics
+            sh = float(np.clip(mm.get("sharpe", 0.0), -1.0, 3.0))
+            so = float(np.clip(mm.get("sortino", 0.0), -1.0, 3.0))
+            dd = float(mm.get("max_drawdown", 0.0))  # negative
+            dd_ok = float(np.clip(1.0 + dd, 0.1, 1.5))
+            wr = float(np.clip(mm.get("win_rate", 0.0), 0.0, 1.0))
+            rob = float(min(mm.get("trades", 0), 30) / 30.0)
+            q[m.name] = ((sh + so) / 2.0) * dd_ok * (0.6 + 0.4 * wr) * (0.5 + 0.5 * rob)
+        # ---- redundancy penalty (correlation with the other members) ----
+        corr = rets.corr()
+        div = {}
+        for name in rets.columns:
+            others = [c for c in rets.columns if c != name]
+            if others:
+                vals = [abs(corr.loc[name, o]) for o in others
+                        if not pd.isna(corr.loc[name, o])]
+                avg = float(np.mean(vals)) if vals else 0.5
+            else:
+                avg = 0.5
+            div[name] = 1.0 / (1.0 + avg)
+        wq = pd.Series({n: max(q[n], 0.0) * div[n] for n in q})
+        if wq.sum() <= 0:
+            wq = pd.Series({n: 1.0 / K for n in rets.columns})
+        else:
+            wq = wq / wq.sum()
+        # ---- per-bar dynamic weights: wealth-adaptive, tilted by quality ----
+        W = E.div(E.sum(axis=1), axis=0).fillna(1.0 / K)
+        W = W.mul(wq, axis=1)
+        W = W.div(W.sum(axis=1), axis=0).fillna(1.0 / K)
+        combined = (rets * W.shift(1).fillna(wq)).sum(axis=1)
+        final_w = {k: round(float(W[k].iloc[-1]), 4) for k in W.columns}
+        rationale = _ensemble_rationale(members, q, div, wq, final_w)
     else:  # fast_universalization
         W = E.div(E.sum(axis=1), axis=0).fillna(1.0 / K)
         combined = (rets * W.shift(1).fillna(1.0 / K)).sum(axis=1)
         final_w = {k: round(float(W[k].iloc[-1]), 4) for k in W.columns}
+        rationale = []
     equity = (1.0 + combined).cumprod() * capital
     returns = equity.pct_change().fillna(0.0)
     metrics = compute_metrics(returns, equity, bars_per_year=BARS_PER_YEAR, capital=capital)
     return {"equity": equity, "returns": returns, "metrics": metrics,
-            "final_weights": final_w, "method": method, "members": [m.name for m in members]}
+            "final_weights": final_w, "method": method, "members": [m.name for m in members],
+            "rationale": rationale}
+
+
+def _ensemble_rationale(members: list, quality: dict, diversity: dict,
+                        quality_weights: pd.Series, final_weights: dict) -> list:
+    """Per-member explanation of the dynamic ensemble weights: what strength the
+    weight rewards, what weakness it down-weights, and the redundancy note."""
+    notes = []
+    for m in members:
+        mm = m.metrics
+        strength = "Sharpe", mm.get("sharpe", 0.0)
+        if mm.get("sortino", 0.0) > mm.get("sharpe", 0.0):
+            strength = "Sortino", mm.get("sortino", 0.0)
+        weakness = "max drawdown", mm.get("max_drawdown", 0.0)
+        if mm.get("trades", 0) < 5:
+            weakness = "very few trades (thin evidence)", mm.get("trades", 0)
+        elif mm.get("win_rate", 0.0) < 0.35:
+            weakness = "low win rate", mm.get("win_rate", 0.0)
+        qw = float(quality_weights.get(m.name, 0.0))
+        fw = float(final_weights.get(m.name, 0.0))
+        notes.append(
+            f"• {m.name}: strength = {strength[0].lower()} {strength[1]:.2f}; "
+            f"weakness = {weakness[0]} {weakness[1]:.2f}; "
+            f"redundancy = {1 - diversity[m.name]:.2f} avg correlation with the other "
+            f"members. Quality tilt {qw * 100:.0f}% -> final blend weight {fw * 100:.0f}%."
+        )
+    return notes
 
 
 # --------------------------------------------------------------------------- #
@@ -1275,6 +1431,9 @@ class AlgorithmResult:
     ensemble_weights: Optional[dict] = None
     members: list = field(default_factory=list)
     build_notes: list = field(default_factory=list)
+    window_returns: dict = field(default_factory=dict)
+    trade_narratives: list = field(default_factory=list)
+    run_index: int = 1
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
     def to_dict(self) -> dict:
@@ -1286,7 +1445,8 @@ class AlgorithmResult:
             "train_metrics": self.train_metrics, "test_metrics": self.test_metrics,
             "universe": self.universe, "ops_algo": self.ops_algo,
             "ensemble_weights": self.ensemble_weights, "members": self.members,
-            "build_notes": self.build_notes,
+            "build_notes": self.build_notes, "window_returns": self.window_returns,
+            "run_index": self.run_index,
         }
 
     def to_json(self) -> str:
@@ -1345,6 +1505,18 @@ class AlgorithmResult:
                 f"- **Test (OOS) Sharpe: {self.test_metrics.get('sharpe', 0):.2f}** "
                 f"(drawdown {self.test_metrics.get('max_drawdown', 0) * 100:.1f}%, trades {self.test_metrics.get('trades', 0)})",
             ]
+        if self.window_returns:
+            lines += ["", "## Return by window", "", "| Window | Return |", "| --- | --- |"]
+            for k, v in self.window_returns.items():
+                lines.append(f"| {k} | {v * 100:+.2f}% |" if v is not None else f"| {k} | — |")
+        if self.trade_narratives:
+            lines += ["", "## Trade-by-trade reasoning", ""]
+            for n in self.trade_narratives[:60]:
+                lines.append(f"- {n}")
+            if len(self.trade_narratives) > 60:
+                lines.append(f"- _...and {len(self.trade_narratives) - 60} more trades_")
+        if self.build_notes:
+            lines += ["", "## Build notes", ""] + [f"- {n}" for n in self.build_notes]
         if self.ensemble_weights:
             lines += ["", "## Ensemble weights", ""]
             for k, v in self.ensemble_weights.items():
@@ -1397,14 +1569,20 @@ def build_algorithms(
     n_trials: int = 25,
     seed: int = 42,
     data_fn: Callable = _default_get_stock,
-    period: str = "3y",
+    period: str = "5y",
     backtest_params_override: Optional[dict] = None,
+    runs_per_family: int = 3,
+    ensemble_method: str = "dynamic",
 ) -> list:
     """Build one or more algorithms from a request.
 
     Auto mode parses the natural-language request; guided mode uses the explicit
-    `archetypes` list. Returns a list of AlgorithmResult. Ensemble mode appends
-    an ensemble card built from the top members.
+    `archetypes` list. Each family is searched `runs_per_family` times with
+    distinct seeds ("many backtests per algorithm"); every result carries a
+    5y/3y/2y/1y/6m/3m/1m window breakdown and per-trade reasoning. Ensemble
+    mode appends a *dynamically weighted* ensemble card — weights are tilted by
+    each member's measured strengths (Sharpe/drawdown/win rate/trade count) and
+    penalized for redundancy (correlation) on top of wealth-adaptive mixing.
     """
     rng = np.random.default_rng(seed)
     universe = universe or ["SPY"]
@@ -1441,10 +1619,11 @@ def build_algorithms(
 
     bp = backtest_params_override or _default_backtest_params(risk, direction)
     locked = locked_params or {}
+    runs = max(int(runs_per_family), 1)
+    multi = runs > 1
 
     results: list = []
     used_families = families[: max(count, 1)]
-    # diversify: rotate seeds so repeated families produce distinct configs
     for i, fam in enumerate(used_families):
         if fam == "online_ops":
             if len(dfs) < 2:
@@ -1470,36 +1649,56 @@ def build_algorithms(
                 provenance=prov, equity=res["equity"], returns=res["returns"],
                 metrics=res["metrics"], trades=[], universe=list(dfs),
                 ops_algo=ops_algo,
+                window_returns=window_returns(res["equity"]),
                 build_notes=["Portfolio-level backtest over " + ", ".join(list(dfs)[:4])]))
             continue
         a = ARCHETYPES[fam]
-        trial_rng = np.random.default_rng(seed + i * 1013)
-        found = search_best(a, primary, n_trials=n_trials, rng=trial_rng,
-                            backtest_params=bp, locked=locked,
-                            seed=seed + i * 1013)
-        if "error" in found:
-            results.append(_error_result(fam, found["error"]))
-            continue
-        params = found["params"]
-        sig = a["sig"](primary, params)
-        full = backtest_ohlcv(primary, sig, bp)
-        results.append(AlgorithmResult(
-            name=f"{a['label']}-{primary_sym}", family=a["family"], archetype=fam,
-            params=params, backtest_params=bp, provenance=a["provenance"],
-            equity=full["equity"], returns=full["returns"], metrics=full["metrics"],
-            trades=full["trades"], train_metrics=found["train_metrics"],
-            test_metrics=found["test_metrics"], universe=[primary_sym],
-            build_notes=[f"Parameters optimized on train window "
-                         f"(train Sharpe {found['train_metrics'].get('sharpe', 0):.2f}), "
-                         f"reported OOS test Sharpe "
-                         f"{found['test_metrics'].get('sharpe', 0):.2f}."]))
+        family_ok = False
+        for run in range(runs):
+            run_seed = seed + i * 1013 + run * 577
+            trial_rng = np.random.default_rng(run_seed)
+            found = search_best(a, primary, n_trials=n_trials, rng=trial_rng,
+                                backtest_params=bp, locked=locked, seed=run_seed)
+            if "error" in found:
+                continue  # this run failed; try the next seed before giving up
+            family_ok = True
+            params = found["params"]
+            sig = a["sig"](primary, params)
+            full = backtest_ohlcv(primary, sig, bp)
+            suffix = f" (run {run + 1}/{runs})" if multi else ""
+            results.append(AlgorithmResult(
+                name=f"{a['label']}-{primary_sym}{suffix}", family=a["family"],
+                archetype=fam, params=params, backtest_params=bp,
+                provenance=a["provenance"],
+                equity=full["equity"], returns=full["returns"], metrics=full["metrics"],
+                trades=full["trades"], train_metrics=found["train_metrics"],
+                test_metrics=found["test_metrics"], universe=[primary_sym],
+                window_returns=window_returns(full["equity"]),
+                trade_narratives=trade_narratives(full["trades"], primary, sig, bp),
+                run_index=run + 1,
+                build_notes=[f"Parameters optimized on train window "
+                             f"(train Sharpe {found['train_metrics'].get('sharpe', 0):.2f}), "
+                             f"reported OOS test Sharpe "
+                             f"{found['test_metrics'].get('sharpe', 0):.2f}."]))
+        if not family_ok:
+            results.append(_error_result(fam, "no viable parameter set found on the training window",
+                                         suggestion=diagnose_failure(fam, primary)))
 
     # ensemble of the built members (skip error cards)
     if ensemble and len(results) >= 2:
         members = [r for r in results if r.metrics.get("trades", 0) > 0 or r.family == "portfolio"]
+        # cap membership so the blend stays interpretable: top 6 by OOS/test Sharpe
+        members.sort(key=lambda r: (r.test_metrics or {}).get("sharpe", r.metrics.get("sharpe", 0.0)),
+                     reverse=True)
+        members = members[:6]
         if len(members) >= 2:
-            method = "fast_universalization"
+            method = ensemble_method or "dynamic"
             ens = build_ensemble(members, primary, method=method)
+            ens_notes = [f"Blend method: {method}. Per-bar weights combine wealth-adaptive "
+                         f"mixing with a quality tilt so stronger, less-redundant members "
+                         f"get more weight (weaknesses down-weighted)."]
+            if ens.get("rationale"):
+                ens_notes.extend(ens["rationale"])
             results.append(AlgorithmResult(
                 name=f"ENSEMBLE-{len(members)}-strategies", family="ensemble",
                 archetype="ensemble", params={"method": method,
@@ -1516,21 +1715,26 @@ def build_algorithms(
                                                   for m in members
                                               ]},
                 backtest_params=bp,
-                provenance=("Fast Universalization (Glucksman eq. 21): experts are "
-                            "reweighted by cumulative wealth each bar — the meta-learning "
-                            "family that beat every single strategy in the paper."),
+                provenance=("Dynamic ensemble: members are blended per-bar by cumulative "
+                            "wealth tilted by measured quality (Sharpe, drawdown, win rate, "
+                            "trade robustness) and penalized for cross-member correlation — "
+                            "maximizing each member's strengths while down-weighting its "
+                            "weaknesses."),
                 equity=ens["equity"], returns=ens["returns"], metrics=ens["metrics"],
                 trades=[], train_metrics=None, test_metrics=None,
                 universe=[primary_sym], ensemble_weights=ens["final_weights"],
                 members=[m.name for m in members],
-                build_notes=[f"Blend method: {method}. Weights drift toward "
-                             f"historically-strong members."]))
+                window_returns=window_returns(ens["equity"]),
+                build_notes=ens_notes))
     return results
 
 
-def _error_result(family: str, msg: str) -> AlgorithmResult:
+def _error_result(family: str, msg: str, suggestion: str = "") -> AlgorithmResult:
     idx = pd.date_range("2020-01-01", periods=2, freq="D")
     eq = pd.Series([100_000.0, 100_000.0], index=idx)
+    notes = ["ERROR: " + msg]
+    if suggestion:
+        notes.append("SUGGESTION: " + suggestion)
     return AlgorithmResult(
         name=f"{family}-ERROR", family=family, archetype=family,
         params={}, backtest_params={}, provenance="",
@@ -1539,14 +1743,87 @@ def _error_result(family: str, msg: str) -> AlgorithmResult:
                  "max_drawdown": 0.0, "calmar": 0.0, "volatility": 0.0, "win_rate": 0.0,
                  "profit_factor": 0.0, "trades": 0, "exposure": 0.0, "best_trade": 0.0,
                  "worst_trade": 0.0, "avg_hold_bars": 0.0, "years": 0.0},
-        trades=[], build_notes=["ERROR: " + msg])
+        trades=[], build_notes=notes)
+
+
+def _data_character(df: pd.DataFrame) -> dict:
+    """Quick statistical profile of a price series: trend strength, mean-reversion
+    potential, volatility — used to explain *why* a family failed and what to tweak."""
+    close = df["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    rets = close.pct_change().dropna()
+    out = {"bars": int(len(df)), "total_return": None, "vol": None,
+           "trend_strength": None, "autocorr1": None, "meanrev_index": None}
+    if len(rets) < 30:
+        return out
+    out["total_return"] = float(close.iloc[-1] / close.iloc[0] - 1.0)
+    vol = float(rets.std() * math.sqrt(BARS_PER_YEAR))
+    out["vol"] = vol
+    mean_d = float(rets.mean())
+    # |mean|/std over a year — high means a strong, persistent drift
+    out["trend_strength"] = float(abs(mean_d) / max(rets.std(), 1e-9) * math.sqrt(BARS_PER_YEAR))
+    out["autocorr1"] = float(rets.autocorr(1)) if len(rets) > 5 else None
+    ac = out["autocorr1"] or 0.0
+    out["meanrev_index"] = float(max(-ac, 0.0))  # negative autocorr => mean-reverting
+    return out
+
+
+def diagnose_failure(family: str, df: pd.DataFrame) -> str:
+    """Explain why a family produced no viable strategy on this data, and suggest
+    concrete tweaks plus families that suit the data's character."""
+    c = _data_character(df)
+    base = (f"{c['bars']} bars, {c['total_return'] * 100:+.0f}% over the window"
+            if c["total_return"] is not None else f"{c['bars']} bars")
+    vol_txt = f"{c['vol'] * 100:.0f}% annualized vol" if c["vol"] else ""
+    fam_label = ARCHETYPES.get(family, {}).get("label", family)
+    lines = [f"{fam_label} found no viable parameter set on your data ({base}, {vol_txt})."]
+    if family in ("rsi_meanrev", "bollinger_meanrev", "statarb_z", "gap_fade"):
+        ac = c["autocorr1"]
+        ts = c["trend_strength"]
+        if (ac is not None and ac > 0.15) or (ts is not None and ts > 2.0):
+            why = (f"lag-1 autocorrelation {ac:+.2f}" if ac is not None and ac > 0.15
+                   else f"a persistent drift ({ts:.1f} annualized sigmas)")
+            lines.append(f"Mean reversion needs oscillation, but your series is trending "
+                         f"({why}): entries almost never trigger, so no trial produced a single "
+                         f"trade.")
+            lines.append("Tweaks that could unlock it: (a) a range-bound / mean-reverting asset, "
+                         "(b) a longer backtest with more regime variety, (c) looser entry "
+                         "thresholds (e.g. higher oversold RSI, lower z-score entry) via the "
+                         "search trials.")
+            lines.append("Better-suited alternatives: trend / momentum families "
+                         "(Moving-Average Crossover, Dual Momentum, Donchian Breakout) or "
+                         "volatility targeting.")
+        else:
+            lines.append("The series is not strongly trending, but entries still never fired — "
+                         "try more search trials, a wider universe, or a volatility-targeting "
+                         "family that works in any regime.")
+    elif family in ("trend_ma", "breakout", "dual_momentum"):
+        ac = c["autocorr1"]
+        if ac is not None and ac < -0.1:
+            lines.append(f"Trend following needs persistent direction, but your series mean-reverts "
+                         f"(lag-1 autocorrelation {ac:+.2f}): breakouts and crossovers whipsaw.")
+            lines.append("Tweaks: (a) a trending asset, (b) wider breakout windows / slower "
+                         "averages, (c) an absolute-momentum gate.")
+            lines.append("Better-suited alternatives: mean-reversion families (RSI, Bollinger, "
+                         "z-score stat-arb) or gap fading.")
+        else:
+            lines.append("Breakouts never produced trades — try more search trials, a longer "
+                         "period, or a mean-reversion family on this data.")
+    else:
+        lines.append("Try more search trials, a longer history, or a different family — the "
+                     "search could not find parameters that trade at least once on the "
+                     "training window.")
+    return " ".join(lines)
 
 
 def build_request_signature(request: str, mode: str, count: int, ensemble: bool,
                             risk: str, direction: str, universe: list,
-                            archetypes: list, locked: dict, n_trials: int, seed: int) -> str:
+                            archetypes: list, locked: dict, n_trials: int, seed: int,
+                            runs_per_family: int = 3, ensemble_method: str = "dynamic") -> str:
     blob = json.dumps([request, mode, count, ensemble, risk, direction,
-                       universe, archetypes, locked, n_trials, seed], sort_keys=True)
+                       universe, archetypes, locked, n_trials, seed,
+                       runs_per_family, ensemble_method], sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 

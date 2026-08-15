@@ -751,8 +751,8 @@ def render_quant_portal():
                             pass
 
                     if close_data is not None and len(close_data) >= 200:
-                        def _progress(gen):
-                            progress_bar.progress(min(gen / generations, 1.0))
+                        def _progress(gen, total, fitness):
+                            progress_bar.progress(min(gen / max(total, 1), 1.0))
 
                         progress_bar = st.progress(0)
                         result = engine.evolve(
@@ -876,56 +876,77 @@ def render_quant_portal():
         if HAS_BT and st.button("Run Backtest", type="primary"):
             with st.spinner("Running backtest..."):
                 try:
-                    backtester = AdvancedBacktester(
-                        symbol=bt_symbol,
-                        period=bt_period,
-                        initial_capital=initial_capital
-                    )
+                    backtester = AdvancedBacktester(initial_capital=initial_capital)
                     
                     # Fetch real data for backtest
                     bt_df = get_stock(bt_symbol, period=bt_period)
+                    result = None
                     if bt_df is not None and not bt_df.empty:
-                        close_col = bt_df["Close"]
-                        if isinstance(close_col, pd.DataFrame):
-                            close_col = close_col.iloc[:, 0]
-                        close_vals = close_col.dropna().astype(float)
-                        if len(close_vals) > 30:
-                            returns_series = close_vals.pct_change().dropna()
-                        else:
-                            returns_series = pd.Series(np.random.randn(252) * 0.02)
+                        # rebalance every 10 bars keeps the quant-ensemble-driven
+                        # backtest responsive on multi-year windows
+                        result = backtester.run_backtest(bt_df, bt_symbol, rebalance_every=10)
+                    
+                    if result is not None:
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            _metric_card("Total Return", f"{result.total_return_pct*100:.1f}%", "#4caf50")
+                        with col2:
+                            _metric_card("Sharpe Ratio", f"{result.sharpe_ratio:.2f}", "#2196f3")
+                        with col3:
+                            _metric_card("Max Drawdown", f"{result.max_drawdown_pct*100:.1f}%", "#f44336")
+                        with col4:
+                            _metric_card("Win Rate", f"{result.win_rate*100:.1f}%", "#ff9800")
+                        st.caption(f"{result.total_trades} trades | profit factor {result.profit_factor:.2f} | "
+                                   f"expectancy ${result.expectancy:.0f} | alpha {result.alpha:.2f} | "
+                                   f"beta {result.beta:.2f} | benchmark (buy & hold) {result.benchmark_return*100:.1f}%")
+                        
+                        # Equity curve from the real backtester
+                        if result.equity_curve and result.equity_timestamps:
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=result.equity_timestamps,
+                                y=result.equity_curve,
+                                mode='lines',
+                                line=dict(color="#2196f3", width=2),
+                                name="Portfolio Value"
+                            ))
+                            fig.update_layout(
+                                title=f"Equity Curve — {strategy_type} on {bt_symbol} ({bt_period})",
+                                template="plotly_dark",
+                                xaxis_title="Date",
+                                yaxis_title="Portfolio Value ($)"
+                            )
+                            st.plotly_chart(fig, width='stretch')
                     else:
+                        # Fallback: synthetic series so the tab still renders a curve
                         returns_series = pd.Series(np.random.randn(252) * 0.02)
-                    
-                    metrics = _calculate_advanced_metrics(returns_series)
-                    
-                    # Display metrics
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        _metric_card("Total Return", f"{metrics.get('total_return', 0)*100:.1f}%", "#4caf50")
-                    with col2:
-                        _metric_card("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0):.2f}", "#2196f3")
-                    with col3:
-                        _metric_card("Max Drawdown", f"{metrics.get('max_drawdown', 0)*100:.1f}%", "#f44336")
-                    with col4:
-                        _metric_card("Win Rate", f"{metrics.get('win_rate', 0)*100:.1f}%", "#ff9800")
-                    
-                    # Equity curve
-                    cumulative = (1 + returns_series).cumprod() * initial_capital
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=cumulative.index,
-                        y=cumulative.values,
-                        mode='lines',
-                        line=dict(color="#2196f3", width=2),
-                        name="Portfolio Value"
-                    ))
-                    fig.update_layout(
-                        title="Equity Curve",
-                        template="plotly_dark",
-                        xaxis_title="Trading Days",
-                        yaxis_title="Portfolio Value ($)"
-                    )
-                    st.plotly_chart(fig, width='stretch')
+                        metrics = _calculate_advanced_metrics(returns_series)
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            _metric_card("Total Return", f"{metrics.get('total_return', 0)*100:.1f}%", "#4caf50")
+                        with col2:
+                            _metric_card("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0):.2f}", "#2196f3")
+                        with col3:
+                            _metric_card("Max Drawdown", f"{metrics.get('max_drawdown', 0)*100:.1f}%", "#f44336")
+                        with col4:
+                            _metric_card("Win Rate", f"{metrics.get('win_rate', 0)*100:.1f}%", "#ff9800")
+                        st.warning("Insufficient data for the quant-ensemble backtester; showing a synthetic curve.")
+                        cumulative = (1 + returns_series).cumprod() * initial_capital
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=cumulative.index,
+                            y=cumulative.values,
+                            mode='lines',
+                            line=dict(color="#2196f3", width=2),
+                            name="Portfolio Value"
+                        ))
+                        fig.update_layout(
+                            title="Equity Curve (synthetic fallback)",
+                            template="plotly_dark",
+                            xaxis_title="Trading Days",
+                            yaxis_title="Portfolio Value ($)"
+                        )
+                        st.plotly_chart(fig, width='stretch')
                     
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -1001,8 +1022,8 @@ def render_quant_portal():
                             st.success(f"Found {len(signals)} alternative data signals")
                             
                             for sig in signals[:3]:
-                                with st.expander(f"{sig.signal_type}", expanded=True):
-                                    st.markdown(f"**Signal Type:** {sig.signal_type}")
+                                with st.expander(f"{sig.name}", expanded=True):
+                                    st.markdown(f"**Signal:** {sig.name} ({sig.category})")
                                     st.markdown(f"**Strength:** {sig.strength:.1f}")
                                     st.markdown(f"**Direction:** {sig.direction}")
                                     if sig.description:

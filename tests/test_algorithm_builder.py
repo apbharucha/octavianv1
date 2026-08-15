@@ -253,9 +253,9 @@ def test_search_respects_history_length(df_trend):
 def test_build_multi_and_deterministic(df_trend, df_second):
     fn = _mk_data_fn(df_trend, df_second)
     a = build_algorithms("momentum and trend", count=3, universe=["SPY", "QQQ"],
-                         risk="aggressive", seed=42, data_fn=fn)
+                         risk="aggressive", seed=42, data_fn=fn, runs_per_family=1)
     b = build_algorithms("momentum and trend", count=3, universe=["SPY", "QQQ"],
-                         risk="aggressive", seed=42, data_fn=fn)
+                         risk="aggressive", seed=42, data_fn=fn, runs_per_family=1)
     assert len(a) == 3
     names_a = [r.name for r in a]
     assert len(set(names_a)) == 3  # diverse
@@ -270,7 +270,7 @@ def test_build_multi_and_deterministic(df_trend, df_second):
 def test_build_ensemble_weights_sum_to_one(df_trend, df_second):
     fn = _mk_data_fn(df_trend, df_second)
     res = build_algorithms("", count=3, ensemble=True, universe=["SPY", "QQQ"],
-                           risk="balanced", seed=9, data_fn=fn)
+                           risk="balanced", seed=9, data_fn=fn, runs_per_family=1)
     ens = [r for r in res if r.family == "ensemble"]
     assert len(ens) == 1
     e = ens[0]
@@ -282,7 +282,7 @@ def test_build_ensemble_weights_sum_to_one(df_trend, df_second):
 def test_build_respects_count_and_locked_universe(df_trend, df_second):
     fn = _mk_data_fn(df_trend, df_second)
     res = build_algorithms("", count=1, ensemble=False, universe=["NVDA"],
-                           risk="conservative", seed=2, data_fn=fn)
+                           risk="conservative", seed=2, data_fn=fn, runs_per_family=1)
     assert len(res) == 1
     assert res[0].universe == ["NVDA"]
 
@@ -436,6 +436,112 @@ def test_generated_ops_script_runs(df_trend):
     code = generate_python("online_ops", {"eps": 0.005, "C": 1.0},
                            {"direction": "long_only"}, ["SPY", "QQQ"], ops_algo="pamr")
     _exec_with_mock_data(code, df_trend)
+
+
+# --------------------------------------------------------------------------- #
+#  Advanced backtests: multi-window returns, many runs, trade reasoning,
+#  failure diagnosis, dynamic ensemble weighting
+# --------------------------------------------------------------------------- #
+
+def test_window_returns_breakdown(df_trend):
+    """Every healthy result carries a 5y/3y/2y/1y/6m/3m/1m trailing-return
+    breakdown; windows longer than the available history are None, covered
+    windows are finite numbers."""
+    res = build_algorithms("momentum and trend", count=1, universe=["SPY"],
+                           seed=4, data_fn=_mk_data_fn(df_trend), runs_per_family=1)
+    r = res[0]
+    assert r.window_returns, "window_returns must be populated"
+    for label in ("5y", "3y", "2y", "1y", "6m", "3m", "1m"):
+        assert label in r.window_returns, f"missing window {label}"
+    # fixture is ~500 bars (~2y) -> 1y covered, 5y/3y/2y unavailable
+    assert r.window_returns["1y"] is not None
+    assert r.window_returns["5y"] is None and r.window_returns["3y"] is None
+    assert np.isfinite(r.window_returns["1y"])
+
+
+def test_multiple_runs_per_family(df_trend):
+    """runs_per_family>1 produces several distinct backtests per family
+    (different seeds -> different fitted parameters), each labelled with its
+    run index."""
+    res = build_algorithms(mode="guided", archetypes=["trend_ma"], count=1,
+                           universe=["SPY"], seed=7, data_fn=_mk_data_fn(df_trend),
+                           runs_per_family=3)
+    assert len(res) == 3
+    assert {r.run_index for r in res} == {1, 2, 3}
+    assert len({r.params["fast"] for r in res}) >= 2, "runs must not all be identical"
+    assert all("(run " in r.name for r in res)
+    for r in res:
+        assert r.window_returns
+        assert r.metrics["trades"] >= 0
+
+
+def test_dynamic_ensemble_downweights_weak_members(df_osc):
+    """The dynamic ensemble weights by measured quality + redundancy, not
+    equally: on mean-reverting sine data the strong trend runs get most of the
+    weight while the weak mean-reversion runs are down-weighted, and each
+    member gets an explanation of its strength/weakness."""
+    res = build_algorithms(mode="guided", archetypes=["trend_ma", "bollinger_meanrev"],
+                           count=2, ensemble=True, universe=["SPY", "QQQ", "IWM"],
+                           seed=7, data_fn=_mk_data_fn(df_osc),
+                           runs_per_family=2, ensemble_method="dynamic")
+    ens = [r for r in res if r.family == "ensemble"]
+    assert len(ens) == 1
+    e = ens[0]
+    w = e.ensemble_weights
+    assert abs(sum(w.values()) - 1.0) < 0.02
+    trend_w = sum(v for k, v in w.items() if "Crossover" in k)
+    boll_w = sum(v for k, v in w.items() if "Bollinger" in k)
+    assert trend_w > 0.5, f"strong members must get the majority weight, got trend {trend_w:.2f}"
+    assert boll_w < 0.5
+    assert any("strength" in n and "weakness" in n for n in e.build_notes), \
+        "ensemble must explain each member's strengths/weaknesses"
+    assert e.window_returns
+    assert e.metrics["total_return"] != 0.0
+
+
+def test_dynamic_ensemble_differs_from_equal(df_osc):
+    """Dynamic weights are not just 1/K each when members differ in quality."""
+    res = build_algorithms(mode="guided", archetypes=["trend_ma", "bollinger_meanrev"],
+                           count=2, ensemble=True, universe=["SPY", "QQQ", "IWM"],
+                           seed=7, data_fn=_mk_data_fn(df_osc),
+                           runs_per_family=2, ensemble_method="dynamic")
+    e = [r for r in res if r.family == "ensemble"][0]
+    vals = sorted(e.ensemble_weights.values())
+    assert vals[-1] > vals[0] + 0.05, f"weights look equal: {vals}"
+
+
+def test_failed_family_gets_diagnosed_suggestion():
+    """When a family finds no viable strategy, the error card must explain
+    WHY (data character) and suggest concrete tweaks + better-suited families."""
+    strong_trend = _make_ohlc(seed=3, trend=0.005)  # RSI entries never trigger
+    res = build_algorithms(mode="guided", archetypes=["rsi_meanrev"], count=1,
+                           universe=["SPY"], seed=3,
+                           data_fn=_mk_data_fn(strong_trend), runs_per_family=1)
+    r = res[0]
+    assert any(n.startswith("ERROR:") for n in r.build_notes)
+    sug = [n for n in r.build_notes if n.startswith("SUGGESTION:")]
+    assert sug, "failed family must carry a SUGGESTION note"
+    assert "Mean reversion" in sug[0] and "trending" in sug[0]
+    assert "alternatives" in sug[0] or "Better-suited" in sug[0]
+
+
+def test_trade_narratives_and_exit_reasons(df_trend):
+    """Trades record why they exited (stop/target/trail/time/flat/end) and the
+    result exposes dynamic per-trade reasoning for the user."""
+    res = build_algorithms("momentum and trend", count=1, universe=["SPY"],
+                           seed=9, data_fn=_mk_data_fn(df_trend), runs_per_family=1)
+    r = res[0]
+    if r.metrics["trades"] == 0:
+        return  # some configs trade rarely; nothing to narrate
+    known = {"STOP_LOSS", "TAKE_PROFIT", "TRAILING_STOP", "MAX_HOLD",
+             "SIGNAL_FLAT", "END_OF_DATA"}
+    for t in r.trades:
+        assert t.get("exit_reason") in known, f"bad exit_reason {t.get('exit_reason')}"
+    assert r.trade_narratives, "healthy result must expose per-trade reasoning"
+    first = r.trade_narratives[0]
+    assert "entered" in first and "@" in first
+    assert any(k in first for k in ("stop", "target", "trailing", "holding", "flat", "end")),\
+        f"narrative should say why the trade exited: {first}"
 
 
 def test_ensemble_result_code_does_not_raise(df_trend):

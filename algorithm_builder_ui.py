@@ -86,6 +86,42 @@ def _metric_row(m: dict) -> None:
     c[5].metric("Exposure", _pct(m.get("exposure", 0.0)))
 
 
+def _swot(r: AlgorithmResult) -> tuple:
+    """Strengths / weaknesses / unknowns narrative from the backtest metrics."""
+    m = r.metrics
+    strengths, weaknesses, unknowns = [], [], []
+    if m.get("sharpe", 0) > 1.0:
+        strengths.append(f"strong risk-adjusted return (Sharpe {m['sharpe']:.2f})")
+    if m.get("win_rate", 0) >= 0.5:
+        strengths.append(f"win rate {m['win_rate'] * 100:.0f}%")
+    if m.get("max_drawdown", 0) > -0.15:
+        strengths.append(f"shallow drawdowns (max DD {m['max_drawdown'] * 100:.1f}%)")
+    if (r.test_metrics or {}).get("sharpe", 0) > 0.5:
+        strengths.append(f"positive out-of-sample Sharpe "
+                         f"{(r.test_metrics or {}).get('sharpe', 0):.2f}")
+    if not strengths:
+        strengths.append("no standout positive metric — worth testing live at small size")
+    if m.get("max_drawdown", 0) < -0.25:
+        weaknesses.append(f"deep drawdowns (max DD {m['max_drawdown'] * 100:.1f}%)")
+    if m.get("win_rate", 0) < 0.4 and m.get("trades", 0) >= 5:
+        weaknesses.append(f"low win rate ({m['win_rate'] * 100:.0f}%) — relies on large winners")
+    if m.get("trades", 0) < 8:
+        weaknesses.append(f"few trades ({m['trades']}) — limited evidence")
+    if (r.test_metrics or {}).get("sharpe", 0) < (r.train_metrics or {}).get("sharpe", 0) - 0.5:
+        weaknesses.append("out-of-sample Sharpe well below train — possible overfit")
+    if m.get("trades", 0) < 20:
+        unknowns.append("small trade sample — metrics may not persist out of sample")
+    if not r.window_returns or all(v is None for v in r.window_returns.values()):
+        unknowns.append("history too short to judge multi-year horizon stability")
+    elif r.window_returns.get("5y") is None:
+        unknowns.append("no 5-year window yet — longer-term behavior unknown")
+    if m.get("trades", 0) == 0:
+        unknowns.append("no discrete trades to reason about (portfolio/rebalance style)")
+    if not unknowns:
+        unknowns.append("regime changes outside the tested window are always unknown")
+    return strengths, weaknesses, unknowns
+
+
 def _render_result(r: AlgorithmResult, idx: int, expanded: bool = False) -> None:
     is_error = any(n.startswith("ERROR:") for n in r.build_notes)
     title = f"{idx}. {r.name}" + (" (error)" if is_error else "")
@@ -102,9 +138,15 @@ def _render_result(r: AlgorithmResult, idx: int, expanded: bool = False) -> None
                 f"**Test (OOS) Sharpe {om.get('sharpe', 0):.2f}** (DD {om.get('max_drawdown', 0) * 100:.1f}%, "
                 f"{om.get('trades', 0)} trades) — parameters were chosen on the train window only."
             )
+        if r.window_returns:
+            wr = [f"<b>{k}</b>: {v * 100:+.1f}%" if v is not None else f"<b>{k}</b>: —"
+                  for k, v in r.window_returns.items()]
+            st.markdown(
+                f"<div style='color:{MUTED};font-size:0.85rem;'>Return by window — "
+                + " · ".join(wr) + "</div>", unsafe_allow_html=True)
         st.plotly_chart(_equity_fig(r), use_container_width=True)
         if r.ensemble_weights:
-            _card("<b>Ensemble weights (Fast Universalization)</b><br>" +
+            _card("<b>Dynamic ensemble weights (quality-tilted)</b><br>" +
                   "<br>".join(f"• {k}: {v * 100:.1f}%" for k, v in r.ensemble_weights.items()))
         if r.family == "portfolio" and r.params:
             _card(f"<b>Final portfolio weights</b><br>" +
@@ -115,8 +157,17 @@ def _render_result(r: AlgorithmResult, idx: int, expanded: bool = False) -> None
                         unsafe_allow_html=True)
         if r.build_notes:
             for n in r.build_notes:
-                if not n.startswith("ERROR:"):
+                if not n.startswith("ERROR:") and not n.startswith("SUGGESTION:"):
                     st.caption(n)
+        if r.trade_narratives:
+            with st.expander(f"Trade-by-trade reasoning ({len(r.trade_narratives)} trades)"):
+                for n in r.trade_narratives:
+                    st.markdown(f"- {n}")
+        s, w, u = _swot(r)
+        st.markdown("**Strengths / weaknesses / unknowns**")
+        st.markdown(" - " + "; ".join(s))
+        st.markdown(" - " + "; ".join(w) if w else " - no material weaknesses detected")
+        st.markdown(" - " + "; ".join(u))
         with st.expander("Parameters"):
             st.json({"strategy": r.params, "execution": r.backtest_params,
                      "universe": r.universe})
@@ -177,10 +228,12 @@ not financial advice.
 def _build(build_args: dict, progress) -> list:
     """Run a build with a progress bar (fetch -> search -> ensemble)."""
     n = max(build_args["count"], 1)
-    progress.progress(0.05, text="Fetching market data…")
+    runs = int(build_args.get("runs_per_family", 3))
+    trials = int(build_args.get("n_trials", 25))
+    progress.progress(0.05, text="Fetching 5y market data…")
     results = build_algorithms(**build_args)
-    progress.progress(0.6, text=f"Searching parameter space ({n} families × trials)…")
-    progress.progress(0.9, text="Running honest out-of-sample validation…")
+    progress.progress(0.6, text=f"Searching parameter space ({n} families × {trials} trials × {runs} runs)…")
+    progress.progress(0.9, text="Running multi-window backtests + per-trade reasoning…")
     progress.progress(1.0, text="Done.")
     return results
 
@@ -226,6 +279,9 @@ def render_algorithm_builder() -> None:
                                                              "single-asset strategies. Add ≥2 for the "
                                                              "online-portfolio-selection family.")
         universe = [s.strip() for s in uni_text.split(",") if s.strip()][:6]
+        runs = st.slider("Backtests per algorithm (multiple runs = robustness evidence)",
+                         1, 5, 3, help="Each family is searched several times with different "
+                                       "seeds, so every algorithm gets many backtests.")
         archetypes = None
     else:
         st.markdown("#### Guided configuration")
@@ -258,6 +314,10 @@ def render_algorithm_builder() -> None:
             slippage = a5.number_input("Slippage (bps)", 0.0, 50.0, 5.0, 0.5)
             trials = a6.number_input("Search trials per family", 5, 100, 25, 5,
                                      help="More trials = better fit, slower build.")
+            a7, a8, _ = st.columns(3)
+            runs = a7.number_input("Backtest runs per family", 1, 5, 3, 1,
+                                   help="Each family is searched several times with different "
+                                        "seeds — many backtests per algorithm.")
             request = ""
 
     st.markdown("---")
@@ -272,6 +332,7 @@ def render_algorithm_builder() -> None:
             direction=str(direction), universe=universe,
             archetypes=archetypes, locked_params={},
             n_trials=int(trials) if not auto else 25,
+            runs_per_family=int(runs),
             seed=int(seed),
         )
         # advanced execution overrides (guided only)
@@ -295,7 +356,8 @@ def render_algorithm_builder() -> None:
         sig = build_request_signature(**{k: v for k, v in build_args.items()
                                          if k in ("request", "mode", "count", "ensemble",
                                                   "risk", "direction", "universe",
-                                                  "archetypes", "n_trials", "seed")},
+                                                  "archetypes", "n_trials", "seed",
+                                                  "runs_per_family")},
                                        locked=build_args["locked_params"])
         if st.session_state.get("ab_sig") != sig:
             progress = st.progress(0.0, text="Starting…")
@@ -319,6 +381,62 @@ def render_algorithm_builder() -> None:
             unsafe_allow_html=True)
         for i, r in enumerate(results, 1):
             _render_result(r, i, expanded=(i == 1 and not any(x.startswith("ERROR:") for x in r.build_notes)))
+
+        # ---- no-viable-strategy alert: why it failed + what to tweak + alternatives ----
+        errs = [r for r in results if any(n.startswith("ERROR:") for n in r.build_notes)]
+        healthy = [r for r in results if not any(n.startswith("ERROR:") for n in r.build_notes)]
+        if errs:
+            with st.expander(
+                    f"{len(errs)} strategy famil(y/ies) could not be built — why, and what to tweak",
+                    expanded=True):
+                for r in errs:
+                    st.markdown(f"**{r.name}**")
+                    for n in r.build_notes:
+                        st.warning(n)
+                alts = [r for r in healthy if r.family != "ensemble"]
+                if alts:
+                    st.markdown("**Alternative strategies that DID work on this data** "
+                                "(with their backtests):")
+                    for r in alts[:5]:
+                        m = r.metrics
+                        oos = (r.test_metrics or {}).get("sharpe")
+                        st.markdown(
+                            f"- **{r.name}**: return {_pct(m.get('total_return', 0))}, "
+                            f"Sharpe {m.get('sharpe', 0):.2f}" +
+                            (f", OOS Sharpe {oos:.2f}" if oos is not None else "") +
+                            f", {m.get('trades', 0)} trades")
+                st.caption("Tip: adjust the universe, risk profile, direction, or search trials "
+                           "above and rebuild — the engine re-fits everything to your new wants.")
+
+        # ---- which algorithm is best: comparative read + strengths/weaknesses/unknowns ----
+        singles = [r for r in healthy if r.family != "ensemble"]
+        if singles:
+            st.markdown("#### Which algorithm is best?")
+            key = lambda r: (r.test_metrics or {}).get("sharpe", r.metrics.get("sharpe", 0.0))
+            best = max(singles, key=key)
+            worst = min(singles, key=key)
+            bm, wm = best.metrics, worst.metrics
+            bs, bw, bu = _swot(best)
+            st.markdown(
+                f"**Best on out-of-sample data: {best.name}** — OOS Sharpe "
+                f"{(best.test_metrics or {}).get('sharpe', 0):.2f}, "
+                f"return {_pct(bm.get('total_return', 0))}, "
+                f"max DD {_pct(bm.get('max_drawdown', 0))}, {bm.get('trades', 0)} trades. "
+                f"Strengths: {'; '.join(bs)}. Weaknesses: {'; '.join(bw)}. "
+                f"Unknowns: {'; '.join(bu)}.")
+            ws_, ww_, wu_ = _swot(worst)
+            st.markdown(
+                f"**Weakest: {worst.name}** — OOS Sharpe "
+                f"{(worst.test_metrics or {}).get('sharpe', 0):.2f}, "
+                f"return {_pct(wm.get('total_return', 0))}, "
+                f"max DD {_pct(wm.get('max_drawdown', 0))}, {wm.get('trades', 0)} trades. "
+                f"Strengths: {'; '.join(ws_)}. Weaknesses: {'; '.join(ww_)}. "
+                f"Unknowns: {'; '.join(wu_)}.")
+            if len(singles) > 2:
+                st.caption("Ranking note: sorted by out-of-sample (test) Sharpe — the number "
+                           "that matters most, because it is the only one the search never "
+                           "looked at while fitting.")
+
         # combined research note for the whole build
         st.markdown("---")
         st.markdown("#### Export everything")
@@ -332,10 +450,17 @@ def render_algorithm_builder() -> None:
         summary_rows = []
         for r in results:
             m = r.metrics
+            oos = (r.test_metrics or {}).get("sharpe")
+            wr = r.window_returns or {}
             summary_rows.append({
                 "Algorithm": r.name, "Family": r.family,
-                "Return": _pct(m.get("total_return", 0)), "Sharpe": round(m.get("sharpe", 0), 2),
+                "Return": _pct(m.get("total_return", 0)),
+                "OOS Sharpe": round(oos, 2) if oos is not None else None,
+                "Sharpe": round(m.get("sharpe", 0), 2),
                 "Max DD": _pct(m.get("max_drawdown", 0)), "Trades": m.get("trades", 0),
+                "5y": _pct(wr["5y"]) if wr.get("5y") is not None else "—",
+                "1y": _pct(wr["1y"]) if wr.get("1y") is not None else "—",
+                "6m": _pct(wr["6m"]) if wr.get("6m") is not None else "—",
             })
         st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
     else:
