@@ -954,6 +954,72 @@ class PaperTradingSystem:
             logger.error(f"Error updating automation settings: {e}")
             return False
 
+    def _set_automation_config(self, account_id: str, config: Dict) -> bool:
+        """Replace an account's automation config without touching its enabled flag.
+
+        Used by strategy deployment so deploying an Algorithm Builder strategy to
+        an account never silently starts (or stops) automation."""
+        try:
+            with self.db_manager._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE paper_trading_accounts
+                    SET automation_config = ?,
+                        updated_at = ?
+                    WHERE account_id = ?
+                """, (json.dumps(config or {}), datetime.now(), account_id))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error writing automation config for {account_id}: {e}")
+            return False
+
+    def deploy_strategy(self, account_id: str, strategy_spec: Dict) -> bool:
+        """Deploy an Algorithm Builder strategy onto a paper trading account.
+
+        The strategy is stored in the account's automation_config under
+        ``strategy_spec`` (preserving any existing keys such as risk rules). It
+        does NOT toggle automation on/off — the user starts it from the Paper
+        Trading dashboard or the automation controls.
+        """
+        try:
+            account = self.get_account(account_id)
+            if not account:
+                return False
+            config = dict(account.automation_config or {})
+            config["strategy_spec"] = strategy_spec
+            ok = self._set_automation_config(account_id, config)
+            if ok:
+                logger.info(f"Deployed strategy '{strategy_spec.get('name', '')}' to {account_id}")
+            return ok
+        except Exception as e:
+            logger.error(f"Error deploying strategy to {account_id}: {e}")
+            return False
+
+    def get_deployed_strategy(self, account_id: str) -> Optional[Dict]:
+        """Return the strategy currently deployed on an account, or None."""
+        try:
+            account = self.get_account(account_id)
+            if not account:
+                return None
+            spec = (account.automation_config or {}).get("strategy_spec")
+            return spec if isinstance(spec, dict) else None
+        except Exception:
+            return None
+
+    def remove_strategy(self, account_id: str) -> bool:
+        """Remove the deployed strategy from an account (keeps everything else)."""
+        try:
+            account = self.get_account(account_id)
+            if not account:
+                return False
+            config = dict(account.automation_config or {})
+            config.pop("strategy_spec", None)
+            return self._set_automation_config(account_id, config)
+        except Exception as e:
+            logger.error(f"Error removing strategy from {account_id}: {e}")
+            return False
+
 
 # Global instance
 _paper_trading_system = None

@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from enum import Enum
 import json
 
+import pandas as pd
+
 from paper_trading_system import (
     get_paper_trading_system, 
     PaperTradingAccount, 
@@ -134,17 +136,26 @@ class AutomatedTradingEngine:
         # Configurable scan interval per account (default 60s)
         self.scan_intervals: Dict[str, int] = {}
         
+        # Deployed Algorithm Builder strategies (account_id -> strategy spec).
+        # When present, the account runs in strategy mode: signals from the
+        # deployed algorithm drive entries/exits instead of the market scan.
+        self._strategy_specs: Dict[str, Dict[str, Any]] = {}
+        
         # Lock for thread safety
         self.lock = threading.Lock()
     
     def start_automation(self, account_id: str, 
-                        risk_rules: Optional[RiskManagementRules] = None) -> bool:
+                        risk_rules: Optional[RiskManagementRules] = None,
+                        strategy_spec: Optional[Dict[str, Any]] = None) -> bool:
         """
         Start automated trading for an account.
         
         Args:
             account_id: Paper trading account ID
             risk_rules: Risk management rules (uses defaults if None)
+            strategy_spec: Optional deployed Algorithm Builder strategy. If None,
+                any strategy previously deployed on the account is used, so a
+                deployed algorithm survives restarts of the app.
             
         Returns:
             True if automation started successfully
@@ -167,6 +178,15 @@ class AutomatedTradingEngine:
                 if risk_rules is None:
                     risk_rules = RiskManagementRules()
                 
+                # Resolve the strategy spec: explicit arg wins, else whatever is
+                # deployed on the account (survives app restarts).
+                if strategy_spec is None:
+                    strategy_spec = (account.automation_config or {}).get("strategy_spec")
+                if strategy_spec:
+                    self._strategy_specs[account_id] = strategy_spec
+                else:
+                    self._strategy_specs.pop(account_id, None)
+                
                 # Update account automation config
                 config = {
                     'risk_rules': {
@@ -181,6 +201,8 @@ class AutomatedTradingEngine:
                     },
                     'started_at': datetime.now().isoformat()
                 }
+                if strategy_spec:
+                    config['strategy_spec'] = strategy_spec
                 
                 self.paper_trading.update_automation_settings(
                     account_id, enabled=True, config=config
@@ -276,6 +298,7 @@ class AutomatedTradingEngine:
                 
                 # Update status
                 self.active_automations[account_id] = AutomationStatus.STOPPED
+                self._strategy_specs.pop(account_id, None)
                 
                 # Update account settings
                 self.paper_trading.update_automation_settings(
@@ -288,6 +311,10 @@ class AutomatedTradingEngine:
         except Exception as e:
             logger.error(f"Error stopping automation for {account_id}: {e}")
             return False
+
+    def get_strategy_spec(self, account_id: str) -> Optional[Dict[str, Any]]:
+        """Return the strategy spec currently driving an account's automation, or None."""
+        return self._strategy_specs.get(account_id)
     
     def set_scan_interval(self, account_id: str, seconds: int) -> None:
         """Set the scan interval for an account."""
@@ -374,16 +401,26 @@ class AutomatedTradingEngine:
     
     async def _execute_trading_cycle(self, account_id: str, 
                                      risk_rules: RiskManagementRules):
-        """Execute one trading cycle: manage positions, scan market, evaluate, trade."""
+        """Execute one trading cycle: manage positions, scan market, evaluate, trade.
+
+        When the account has a deployed Algorithm Builder strategy, the cycle runs
+        in strategy mode: the algorithm's own signals drive entries and exits on
+        its universe instead of the generic market scan."""
         try:
-            logger.info(f"Executing trading cycle for {account_id}")
-            self._log_activity(account_id, 'SCAN_START', 'Starting market scan cycle')
-            
             # Get account state
             account = self.paper_trading.get_account(account_id)
             if not account:
                 logger.error(f"Account {account_id} not found")
                 return
+            
+            spec = self._strategy_specs.get(account_id) or \
+                (account.automation_config or {}).get("strategy_spec")
+            if spec:
+                await self._execute_strategy_cycle(account_id, spec, risk_rules, account)
+                return
+            
+            logger.info(f"Executing trading cycle for {account_id}")
+            self._log_activity(account_id, 'SCAN_START', 'Starting market scan cycle')
             
             positions = self.paper_trading.get_positions(account_id)
             
@@ -468,6 +505,191 @@ class AutomatedTradingEngine:
         except Exception as e:
             logger.error(f"Error in trading cycle for {account_id}: {e}")
             self._log_activity(account_id, 'ERROR', f'Cycle error: {str(e)[:200]}')
+
+    # ---------------------------------------------------------------------- #
+    #  Strategy mode — run a deployed Algorithm Builder strategy
+    # ---------------------------------------------------------------------- #
+
+    def _fetch_strategy_ohlcv(self, symbol: str, period: str = "5y") -> Optional[Any]:
+        """Fetch OHLCV for a strategy symbol (daily bars, cached by the provider)."""
+        try:
+            from data_sources import get_stock
+            df = get_stock(symbol, period=period, interval="1d")
+            if df is None or len(df) < 60:
+                return None
+            close = df["Close"]
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            df = df.copy()
+            df["Close"] = close
+            for col in ("Open", "High", "Low", "Volume"):
+                if col not in df.columns:
+                    df[col] = df.get(col) if col != "Open" else close.shift(1).fillna(close)
+            return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        except Exception as e:
+            logger.error(f"Strategy data fetch failed for {symbol}: {e}")
+            return None
+
+    def _strategy_signal(self, spec: Dict[str, Any], symbol: str):
+        """Compute (df, signal_series, last_target) for a deployed strategy on a symbol."""
+        df = self._fetch_strategy_ohlcv(symbol)
+        if df is None:
+            return None, None, 0.0
+        from algorithm_builder_engine import strategy_spec_to_signal
+        sig = strategy_spec_to_signal(spec, df)
+        if sig is None or len(sig) == 0:
+            return df, None, 0.0
+        return df, sig, float(sig.iloc[-1])
+
+    def _strategy_position_size(self, capital: float, price: float, spec: Dict[str, Any],
+                                risk_rules: RiskManagementRules) -> float:
+        """Size a new position the same way the backtester did: risk-budget by ATR,
+        capped by max leverage and the account risk rules."""
+        if price <= 0:
+            return 0.0
+        bp = spec.get("backtest_params", {}) or {}
+        risk_pct = float(bp.get("risk_pct", 0.15))
+        max_lev = float(bp.get("max_leverage", 1.5))
+        try:
+            from algorithm_builder_engine import _atr
+            df = self._fetch_strategy_ohlcv(spec.get("universe", ["SPY"])[0])
+            if df is not None and len(df) >= 20:
+                atr_i = float(_atr(df, int(bp.get("atr_period", 14))).iloc[-1])
+                atr_pct = max(atr_i / price, 1e-4)
+            else:
+                atr_pct = 0.02
+        except Exception:
+            atr_pct = 0.02
+        notional = capital * risk_pct / atr_pct
+        notional = min(notional, capital * max_lev)
+        notional = min(notional, capital * risk_rules.max_position_size_pct)
+        return max(notional, 0.0)
+
+    async def _execute_strategy_cycle(self, account_id: str, spec: Dict[str, Any],
+                                      risk_rules: RiskManagementRules, account):
+        """One strategy-mode cycle: manage existing positions and enter new ones
+        based on the deployed algorithm's current signal on each universe symbol."""
+        try:
+            strat_name = str(spec.get("name", "Deployed Strategy"))
+            archetype = str(spec.get("archetype", ""))
+            self._log_activity(account_id, 'STRATEGY_SCAN',
+                               f'Strategy cycle: {strat_name} (archetype {archetype})')
+            positions = self.paper_trading.get_positions(account_id)
+            universe = [s for s in (spec.get("universe") or ["SPY"])[:6] if s]
+            capital = account.current_balance if account.current_balance > 0 else account.initial_balance
+
+            if archetype == "online_ops":
+                await self._execute_ops_strategy_cycle(account_id, spec, risk_rules,
+                                                       account, positions, universe, strat_name)
+                return
+
+            for symbol in universe:
+                df, sig, target = self._strategy_signal(spec, symbol)
+                if df is None or sig is None:
+                    continue
+                price = self._fetch_live_price(symbol)
+                if not price or price <= 0:
+                    continue
+
+                # Exit: signal flat or flipped -> close the position
+                pos = next((p for p in positions if p.symbol == symbol), None)
+                if pos is not None:
+                    exit_side = (abs(target) < 0.5) or \
+                        ((target > 0) != (pos.side == "LONG"))
+                    if exit_side:
+                        action = TradeAction.SELL if pos.side == "LONG" else TradeAction.COVER
+                        self.paper_trading.execute_trade(
+                            account_id, symbol, action, pos.quantity, price,
+                            strategy_name=strat_name,
+                            ai_reasoning=f"Strategy signal flat/opposite (target {target:+.2f}) — close.")
+                        self._log_activity(account_id, 'STRATEGY_EXIT',
+                                           f'Closed {symbol} (target {target:+.2f})')
+                        positions = self.paper_trading.get_positions(account_id)
+                    continue
+
+                # Entry: strong signal, no position, risk limits OK
+                if abs(target) < 0.5:
+                    continue
+                if target < 0 and spec.get("direction", "long_only") == "long_only":
+                    continue  # long-only strategy never shorts
+                if not self._check_risk_limits(account, positions, risk_rules):
+                    self._log_activity(account_id, 'RISK_LIMIT', 'Risk limits reached, skipping entry')
+                    return
+                notional = self._strategy_position_size(capital, price, spec, risk_rules)
+                qty = max(notional / price, 0.0)
+                if qty * price < 50:
+                    continue
+                action = TradeAction.BUY if target > 0 else TradeAction.SELL
+                side_txt = "LONG" if action == TradeAction.BUY else "SHORT"
+                self.paper_trading.execute_trade(
+                    account_id, symbol, action, qty, price,
+                    strategy_name=strat_name,
+                    ai_reasoning=f"Algorithm signal {target:+.2f} ({archetype}) — open {side_txt}.")
+                self._log_activity(account_id, 'STRATEGY_TRADE',
+                                   f'{action.value} {qty:.2f} {symbol} @ ${price:.2f} (signal {target:+.2f})')
+                positions = self.paper_trading.get_positions(account_id)
+                account = self.paper_trading.get_account(account_id)
+                capital = account.current_balance if account.current_balance > 0 else account.initial_balance
+
+            if account_id in self.automation_metrics:
+                self.automation_metrics[account_id]['last_scan_time'] = datetime.now().isoformat()
+                self.automation_metrics[account_id]['symbols_scanned'] += len(universe)
+            self._log_activity(account_id, 'STRATEGY_DONE',
+                               f'Strategy cycle complete ({len(universe)} symbols)')
+        except Exception as e:
+            logger.error(f"Strategy cycle error for {account_id}: {e}")
+            self._log_activity(account_id, 'ERROR', f'Strategy cycle error: {str(e)[:200]}')
+
+    async def _execute_ops_strategy_cycle(self, account_id: str, spec: Dict[str, Any],
+                                          risk_rules: RiskManagementRules, account,
+                                          positions, universe: List[str], strat_name: str):
+        """Strategy-mode cycle for portfolio-level (online_ops) algorithms: rebalance
+        each held symbol toward the algorithm's current target weight."""
+        try:
+            from algorithm_builder_engine import strategy_spec_to_weights
+            dfs = {}
+            for symbol in universe:
+                df = self._fetch_strategy_ohlcv(symbol)
+                if df is not None:
+                    dfs[symbol] = df
+            if len(dfs) < 2:
+                self._log_activity(account_id, 'STRATEGY_SKIP', 'OPS needs >= 2 assets with data')
+                return
+            weights = strategy_spec_to_weights(spec, dfs)
+            if not weights:
+                return
+            capital = account.current_balance if account.current_balance > 0 else account.initial_balance
+            for symbol, w in weights.items():
+                if symbol not in dfs:
+                    continue
+                price = self._fetch_live_price(symbol)
+                if not price or price <= 0:
+                    continue
+                pos = next((p for p in positions if p.symbol == symbol), None)
+                current_notional = pos.quantity * price if pos else 0.0
+                target_notional = w * capital
+                delta = target_notional - current_notional
+                if abs(delta) < 0.01 * capital:
+                    continue
+                qty = abs(delta) / price
+                if qty * price < 50:
+                    continue
+                if delta > 0 and self._check_risk_limits(account, positions, risk_rules):
+                    self.paper_trading.execute_trade(
+                        account_id, symbol, TradeAction.BUY, qty, price,
+                        strategy_name=strat_name,
+                        ai_reasoning=f"OPS rebalance toward weight {w:.1%} (delta ${delta:,.0f}).")
+                elif delta < 0 and pos:
+                    self.paper_trading.execute_trade(
+                        account_id, symbol, TradeAction.SELL, qty, price,
+                        strategy_name=strat_name,
+                        ai_reasoning=f"OPS rebalance down toward weight {w:.1%}.")
+                self._log_activity(account_id, 'STRATEGY_REBALANCE',
+                                   f'{symbol} toward {w:.1%} (delta ${delta:,.0f})')
+                positions = self.paper_trading.get_positions(account_id)
+        except Exception as e:
+            logger.error(f"OPS strategy cycle error for {account_id}: {e}")
+            self._log_activity(account_id, 'ERROR', f'OPS strategy cycle error: {str(e)[:200]}')
 
     def _manage_existing_positions(self, account_id: str, positions: List,
                                     risk_rules: RiskManagementRules,

@@ -1449,6 +1449,30 @@ class AlgorithmResult:
             "run_index": self.run_index,
         }
 
+    def strategy_spec(self) -> dict:
+        """Serialize this algorithm into a deployable paper-trading strategy spec.
+
+        Carries everything needed to re-run the strategy live: the archetype and
+        its fitted parameters, the execution/risk parameters, the universe, and a
+        summary of the backtest that justified it. Consumed by the paper-trading
+        strategy runner (`strategy_spec_to_signal` / `strategy_spec_to_weights`)
+        and shown back to the user when they deploy it."""
+        return {
+            "name": self.name,
+            "family": self.family,
+            "archetype": self.archetype,
+            "params": dict(self.params),
+            "backtest_params": dict(self.backtest_params),
+            "universe": list(self.universe),
+            "ops_algo": self.ops_algo,
+            "direction": str(self.backtest_params.get("direction", "long_only")),
+            "provenance": self.provenance or "",
+            "metrics": {k: round(v, 4) if isinstance(v, float) else v
+                        for k, v in self.metrics.items()},
+            "window_returns": dict(self.window_returns),
+            "source": "algorithm_builder",
+        }
+
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), indent=2)
 
@@ -1554,6 +1578,50 @@ def _fmt_metric(v) -> str:
     if isinstance(v, float):
         return f"{v:.4f}"
     return str(v)
+
+
+def strategy_spec_to_signal(spec: dict, df: pd.DataFrame) -> Optional[pd.Series]:
+    """Recompute a deployed strategy's target-exposure signal on fresh OHLCV data.
+
+    Returns a Series in [-1, 1] (per-bar target exposure), or None for
+    portfolio-level (online_ops) strategies — those are rebalanced by weights via
+    `strategy_spec_to_weights`. The direction is applied the same way the
+    backtester did (long_only clips shorts)."""
+    if not spec or df is None:
+        return None
+    archetype = spec.get("archetype", "")
+    if archetype == "online_ops" or archetype not in ARCHETYPES:
+        return None
+    try:
+        a = ARCHETYPES[archetype]
+        params = {p["name"]: spec.get("params", {}).get(p["name"], p["default"])
+                  for p in a["params"]}
+        sig = a["sig"](df, params).fillna(0.0).clip(-1.0, 1.0)
+        if spec.get("direction", "long_only") == "long_only":
+            sig = sig.clip(lower=0.0)
+        return sig
+    except Exception:
+        return None
+
+
+def strategy_spec_to_weights(spec: dict, dfs: dict) -> Optional[dict]:
+    """For portfolio-level (online_ops) strategies: recompute the current target
+    weights across the universe from a price matrix, or None if not applicable."""
+    if not spec or spec.get("archetype") != "online_ops" or len(dfs) < 2:
+        return None
+    try:
+        prices = pd.DataFrame({s: dfs[s]["Close"] for s in dfs})
+        ops_algo = spec.get("ops_algo") or "pamr"
+        if ops_algo not in OPS_ALGOS:
+            ops_algo = "pamr"
+        params = {p["name"]: p["default"] for p in OPS_ALGOS[ops_algo]["params"]}
+        for p in OPS_ALGOS[ops_algo]["params"]:
+            if p["name"] in spec.get("params", {}):
+                params[p["name"]] = spec["params"][p["name"]]
+        res = run_ops_basket(prices, ops_algo, params)
+        return res["final_weights"]
+    except Exception:
+        return None
 
 
 def build_algorithms(

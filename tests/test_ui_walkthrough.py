@@ -321,6 +321,123 @@ def test_algorithm_builder_build_click_does_not_raise():
             f"expected build summary, got markdown: {md[:200]}")
 
 
+def test_algorithm_builder_deploy_button_opens_panel():
+    """Regression: the 'Test in paper trading' button on a built algorithm
+    must open the deploy panel (new account / existing portfolio) with no
+    exception, and 'Create account & deploy' must deploy the strategy."""
+    import algorithm_builder_engine as abe
+
+    class _FakeAccount:
+        def __init__(self, aid, name, balance):
+            self.account_id = aid
+            self.account_name = name
+            self.current_balance = balance
+
+    fake_system = type("FakePT", (), {})()
+    # the existing account already runs a strategy -> deploying must ask to override
+    fake_system.deployed = {"PT_U_1": {"name": "Old Strategy", "metrics": {"sharpe": 0.7}}}
+    fake_system.accounts = [_FakeAccount("PT_U_1", "My Portfolio", 100000.0)]
+
+    def _create_account(user_id, account_name, initial_balance=100000.0):
+        acc = _FakeAccount(f"PT_{user_id}_NEW", account_name, initial_balance)
+        fake_system.accounts.append(acc)
+        return acc
+
+    def _deploy(account_id, spec):
+        fake_system.deployed[account_id] = spec
+        return True
+
+    def _get_deployed(account_id):
+        return fake_system.deployed.get(account_id)
+
+    def _list_accounts(user_id):
+        return list(fake_system.accounts)
+
+    fake_system.create_account = _create_account
+    fake_system.deploy_strategy = _deploy
+    fake_system.get_deployed_strategy = _get_deployed
+    fake_system.list_accounts = _list_accounts
+
+    at = AppTest.from_file(os.path.join(ROOT, "main.py"), default_timeout=240)
+    with ExitStack() as stack:
+        for m in _build_mocks():
+            stack.enter_context(m)
+        _defaults = list(abe.build_algorithms.__defaults__)
+        _defaults[11] = _mock_get_stock_long  # data_fn
+        stack.enter_context(patch.object(abe.build_algorithms, "__defaults__",
+                                         tuple(_defaults)))
+        # The deploy panel imports get_paper_trading_system inside the function
+        stack.enter_context(patch("paper_trading_system.get_paper_trading_system",
+                                  return_value=fake_system))
+        at.run()
+        for r in at.sidebar.radio:
+            if r.label == "Navigation":
+                r.set_value("Algorithm Builder")
+                at.run()
+                break
+        btns = [b for b in at.button if b.label == "Build algorithms"]
+        assert btns, "Build algorithms button not found"
+        btns[0].click()
+        at.run()
+        exc = [str(e.value) for e in at.exception]
+        assert not exc, f"Algorithm Builder build raised: {exc[:2]}"
+        # Click 'Test in paper trading' on the first algorithm
+        deploy_btns = [b for b in at.button if b.label == "Test in paper trading"]
+        assert deploy_btns, "'Test in paper trading' button not found"
+        deploy_btns[0].click()
+        at.run()
+        exc = [str(e.value) for e in at.exception]
+        assert not exc, f"Deploy panel raised: {exc[:2]}"
+        md = " ".join(m.value for m in at.markdown)
+        assert "Test in paper trading" in md, (
+            f"deploy panel header missing: {md[:200]}")
+
+        # -- New paper trading account path --
+        radios = [r for r in at.radio if r.label == "Deploy to"]
+        assert radios, "deploy target radio missing"
+        create_btns = [b for b in at.button if b.label == "Create account & deploy"]
+        assert create_btns, "create-account button missing"
+        create_btns[0].click()
+        at.run()
+        exc = [str(e.value) for e in at.exception]
+        assert not exc, f"Create & deploy raised: {exc[:2]}"
+        assert len(fake_system.accounts) == 2, "new account not created"
+        assert len(fake_system.deployed) == 2, "strategy not deployed to new account"
+        assert any(aid != "PT_U_1" for aid in fake_system.deployed), (
+            "deployed strategy should be on the new account")
+
+        # -- Existing portfolio with a strategy already in place --
+        # open the panel again for a fresh algorithm result id
+        deploy_btns = [b for b in at.button if b.label == "Test in paper trading"]
+        assert deploy_btns, "deploy button missing after first deploy"
+        deploy_btns[0].click()
+        at.run()
+        radios = [r for r in at.radio if r.label == "Deploy to"]
+        assert radios, "deploy target radio missing"
+        radios[0].set_value("Existing portfolio")
+        at.run()
+        exc = [str(e.value) for e in at.exception]
+        assert not exc, f"Existing-portfolio panel raised: {exc[:2]}"
+        # a strategy is already deployed -> override confirmation is required
+        warns = [w.value for w in at.warning]
+        assert any("currently deployed" in w for w in warns), (
+            f"expected override warning, got warnings: {warns[:3]}")
+        # deploy button is disabled until the override checkbox is checked
+        deploy_existing = [b for b in at.button
+                           if b.label == "Deploy to this account"]
+        assert deploy_existing, "deploy-to-existing button missing"
+        assert deploy_existing[0].disabled, (
+            "deploy button must be disabled before override confirmation")
+        boxes = [c for c in at.checkbox if "replace" in c.label]
+        assert boxes, "override checkbox missing"
+        boxes[0].set_value(True)
+        at.run()
+        deploy_existing = [b for b in at.button
+                           if b.label == "Deploy to this account"]
+        assert deploy_existing and not deploy_existing[0].disabled, (
+            "deploy button must enable after override confirmation")
+
+
 def test_quant_portal_signal_history_is_capped_and_completes():
     """Regression: 'Generate Quant Signal' ran one full ensemble training per
     history window (~100 windows x ~10s each), hanging the tab for minutes.

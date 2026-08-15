@@ -145,6 +145,12 @@ def _render_result(r: AlgorithmResult, idx: int, expanded: bool = False) -> None
                 f"<div style='color:{MUTED};font-size:0.85rem;'>Return by window — "
                 + " · ".join(wr) + "</div>", unsafe_allow_html=True)
         st.plotly_chart(_equity_fig(r), use_container_width=True)
+        if r.family != "ensemble":
+            if st.button("Test in paper trading", key=f"pt_deploy_{r.id}",
+                         help="Deploy this algorithm to a paper trading account "
+                              "(new or existing) and run it with live signals."):
+                st.session_state["ab_deploy"] = r.id
+                st.session_state["ab_deploy_spec"] = r.strategy_spec()
         if r.ensemble_weights:
             _card("<b>Dynamic ensemble weights (quality-tilted)</b><br>" +
                   "<br>".join(f"• {k}: {v * 100:.1f}%" for k, v in r.ensemble_weights.items()))
@@ -468,4 +474,74 @@ def render_algorithm_builder() -> None:
                 "Auto mode can work from a blank description.")
 
     st.markdown("---")
+    _render_deploy_panel(st.session_state.get("ab_results") or [])
     _render_methodology()
+
+
+def _render_deploy_panel(results: list) -> None:
+    """Deploy a built algorithm to paper trading: new account or existing
+    portfolio, with an explicit override confirmation when the target account
+    already has a strategy in place."""
+    deploy_id = st.session_state.get("ab_deploy")
+    if not deploy_id:
+        return
+    r = next((x for x in results if x.id == deploy_id), None)
+    if r is None:
+        return
+    from paper_trading_system import get_paper_trading_system
+
+    spec = r.strategy_spec()
+    st.markdown("---")
+    st.markdown("#### Test in paper trading")
+    m = r.metrics
+    _card(f"<b>{r.name}</b> — {r.family} · Sharpe {m.get('sharpe', 0):.2f} · "
+          f"return {m.get('total_return', 0) * 100:.1f}% · {m.get('trades', 0)} trades. "
+          f"<span style='color:{MUTED};'>Signals are recomputed from this algorithm's "
+          f"fitted parameters on live daily data; positions are sized with the same "
+          f"risk budget the backtest used.</span>")
+
+    user_id = st.session_state.get("user_id", "default_user")
+    pt = get_paper_trading_system()
+    accounts = pt.list_accounts(user_id)
+    target = st.radio("Deploy to", ["New paper trading account", "Existing portfolio"],
+                      horizontal=True, key="ab_deploy_target")
+
+    if target == "New paper trading account":
+        name = st.text_input("Account name", value=r.name[:40], key="ab_deploy_name")
+        balance = st.number_input("Initial balance ($)", 1000.0, 10_000_000.0,
+                                  100_000.0, step=10_000.0, key="ab_deploy_balance")
+        if st.button("Create account & deploy", type="primary", key="ab_deploy_create"):
+            acc = pt.create_account(user_id, name.strip() or "Algorithm Strategy", float(balance))
+            if acc and pt.deploy_strategy(acc.account_id, spec):
+                st.success(f"Deployed '{r.name}' to new account '{name.strip() or 'Algorithm Strategy'}'. "
+                           "Open the **Paper Trading** tab and enable Automation to start "
+                           "running this strategy live.")
+                st.session_state["ab_deploy"] = None
+            else:
+                st.error("Failed to create the account / deploy the strategy.")
+    else:
+        if not accounts:
+            st.info("You don't have any paper trading accounts yet — choose "
+                    "'New paper trading account' above to create one.")
+            return
+        acc_map = {f"{a.account_name} (${a.current_balance:,.2f})": a for a in accounts}
+        sel = st.selectbox("Target account", list(acc_map.keys()), key="ab_deploy_account")
+        acc = acc_map[sel]
+        existing = pt.get_deployed_strategy(acc.account_id)
+        override_ok = True
+        if existing:
+            st.warning(
+                f"'{existing.get('name', 'an algorithm')}' is currently deployed on this "
+                f"account (Sharpe {existing.get('metrics', {}).get('sharpe', '?')}). "
+                "Deploying will replace it.")
+            override_ok = st.checkbox("Yes — replace the strategy currently in place",
+                                      key="ab_deploy_override")
+        if st.button("Deploy to this account", type="primary",
+                     key="ab_deploy_existing", disabled=not override_ok):
+            if pt.deploy_strategy(acc.account_id, spec):
+                st.success(f"Deployed '{r.name}' to account '{acc.account_name}'. "
+                           "Open the **Paper Trading** tab and enable Automation to start "
+                           "running this strategy live.")
+                st.session_state["ab_deploy"] = None
+            else:
+                st.error("Failed to deploy the strategy to this account.")

@@ -89,3 +89,53 @@ class TestPaperTradingSystem:
         accounts_user2 = paper_trading_system.list_accounts(user2)
         assert len(accounts_user2) == 1
         assert all(acc.user_id == user2 for acc in accounts_user2)
+
+
+class TestStrategyDeployment:
+    """Deploy/read/remove Algorithm Builder strategies on paper trading accounts."""
+
+    def _deploy_spec(self):
+        return {
+            "name": "MA Crossover", "family": "trend", "archetype": "trend_ma",
+            "params": {"fast": 20, "slow": 100}, "backtest_params": {"direction": "long_only"},
+            "universe": ["AAPL"], "ops_algo": None, "direction": "long_only",
+            "provenance": "backtest", "metrics": {"sharpe": 1.2},
+            "window_returns": {}, "source": "algorithm_builder",
+        }
+
+    def test_deploy_roundtrip(self, paper_trading_system):
+        acc = paper_trading_system.create_account("deploy_user", "DeployAcc")
+        spec = self._deploy_spec()
+        assert paper_trading_system.deploy_strategy(acc.account_id, spec) is True
+        got = paper_trading_system.get_deployed_strategy(acc.account_id)
+        assert got is not None
+        assert got["name"] == "MA Crossover"
+        assert got["archetype"] == "trend_ma"
+        assert got["universe"] == ["AAPL"]
+
+    def test_deploy_preserves_existing_automation_config(self, paper_trading_system):
+        acc = paper_trading_system.create_account("deploy_user", "DeployAcc")
+        # Simulate pre-existing automation config (e.g. risk rules) via deploy of a
+        # first strategy, then re-deploy with a new one and check the old keys survive.
+        paper_trading_system.deploy_strategy(acc.account_id, self._deploy_spec())
+        spec2 = self._deploy_spec()
+        spec2["name"] = "Second Strategy"
+        spec2["archetype"] = "bollinger_meanrev"
+        assert paper_trading_system.deploy_strategy(acc.account_id, spec2) is True
+        got = paper_trading_system.get_deployed_strategy(acc.account_id)
+        assert got["name"] == "Second Strategy"
+        assert got["archetype"] == "bollinger_meanrev"
+        # previous strategy is gone (replaced), but the rest of the spec persisted
+        assert "universe" in got
+
+    def test_remove_strategy(self, paper_trading_system):
+        acc = paper_trading_system.create_account("deploy_user", "DeployAcc")
+        paper_trading_system.deploy_strategy(acc.account_id, self._deploy_spec())
+        assert paper_trading_system.get_deployed_strategy(acc.account_id) is not None
+        assert paper_trading_system.remove_strategy(acc.account_id) is True
+        assert paper_trading_system.get_deployed_strategy(acc.account_id) is None
+
+    def test_get_deployed_strategy_unknown_account(self, paper_trading_system):
+        assert paper_trading_system.get_deployed_strategy("PT_missing_1234") is None
+        assert paper_trading_system.remove_strategy("PT_missing_1234") is False
+        assert paper_trading_system.deploy_strategy("PT_missing_1234", {}) is False

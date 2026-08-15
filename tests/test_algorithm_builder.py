@@ -35,6 +35,8 @@ from algorithm_builder_engine import (  # noqa: E402
     generate_python,
     parse_request,
     run_ops_basket,
+    strategy_spec_to_signal,
+    strategy_spec_to_weights,
 )
 
 
@@ -574,3 +576,60 @@ def test_insufficient_history_raises():
     fn = _mk_data_fn(short)
     with pytest.raises(RuntimeError, match="insufficient history"):
         build_algorithms("", count=1, universe=["SPY"], data_fn=fn)
+
+
+# --------------------------------------------------------------------------- #
+#  Paper-trading bridge (strategy_spec serialization + signal reconstruction)
+# --------------------------------------------------------------------------- #
+
+def test_strategy_spec_roundtrip_signal(df_trend):
+    """A built algorithm's strategy_spec() must serialize every field needed to
+    re-run the strategy, and strategy_spec_to_signal must reproduce a live
+    target-exposure series in [-1, 1] that matches the backtest signal."""
+    res = build_algorithms(mode="guided", archetypes=["trend_ma"], count=1,
+                           universe=["SPY"], seed=7, runs_per_family=1,
+                           data_fn=_mk_data_fn(df_trend))
+    assert len(res) == 1
+    r = res[0]
+    spec = r.strategy_spec()
+    assert spec["archetype"] == r.archetype
+    assert spec["name"] == r.name
+    assert spec["family"] == r.family
+    assert spec["universe"] == ["SPY"]
+    assert spec["source"] == "algorithm_builder"
+    assert "metrics" in spec and "window_returns" in spec
+
+    sig = strategy_spec_to_signal(spec, df_trend)
+    assert sig is not None
+    assert len(sig) == len(df_trend)
+    assert float(sig.min()) >= -1.0 - 1e-9 and float(sig.max()) <= 1.0 + 1e-9
+    # long-only direction clips shorts
+    assert float(sig.min()) >= -1e-9
+
+
+def test_strategy_spec_online_ops_returns_none_for_signal(df_trend):
+    """Portfolio-level (online_ops) strategies return None from the per-symbol
+    signal helper; their weights come from strategy_spec_to_weights instead."""
+    spec = {
+        "name": "OPS", "family": "online_ops", "archetype": "online_ops",
+        "params": {"window": 5}, "backtest_params": {"direction": "long_only"},
+        "universe": ["SPY", "QQQ"], "ops_algo": "pamr", "direction": "long_only",
+        "provenance": "", "metrics": {}, "window_returns": {}, "source": "algorithm_builder",
+    }
+    assert strategy_spec_to_signal(spec, df_trend) is None
+
+    dfs = {"SPY": df_trend.copy(), "QQQ": df_trend.copy()}
+    dfs["QQQ"]["Close"] = dfs["QQQ"]["Close"] * 1.01
+    weights = strategy_spec_to_weights(spec, dfs)
+    assert weights is not None
+    keys = set(weights)
+    assert keys == {"SPY", "QQQ"}
+    total = sum(weights.values())
+    assert abs(total - 1.0) < 1e-6
+
+
+def test_strategy_spec_bad_archetype_returns_none(df_trend):
+    spec = {"name": "x", "archetype": "not_a_real_archetype", "params": {},
+            "direction": "long_only", "universe": ["SPY"], "ops_algo": None}
+    assert strategy_spec_to_signal(spec, df_trend) is None
+    assert strategy_spec_to_signal(None, df_trend) is None
