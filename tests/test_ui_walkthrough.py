@@ -546,6 +546,40 @@ def test_quant_portal_backtest_uses_advanced_backtester():
         assert not exc, f"Run Backtest raised: {exc[:2]}"
 
 
+def test_quant_portal_quick_select_buttons_fill_symbols():
+    """Regression: the Stocks/Futures/FX/Crypto quick-select buttons in the
+    Multi-Asset tab did nothing — they set a local variable that was discarded
+    before the 'Fetch & Analyze' gate re-read the text box. Clicking a button
+    must now write the chosen symbols into the box and auto-run the analysis."""
+    at = AppTest.from_file(os.path.join(ROOT, "main.py"), default_timeout=240)
+    with ExitStack() as stack:
+        for m in _build_mocks():
+            stack.enter_context(m)
+        at.run()
+        for r in at.sidebar.radio:
+            if r.label == "Navigation":
+                r.set_value("Quant Portal")
+                at.run()
+                break
+        btns = [b for b in at.button if b.label == "Stocks"]
+        assert btns, "Stocks quick-select button not found"
+        btns[0].click()
+        at.run()
+        exc = [str(e.value) for e in at.exception]
+        assert not exc, f"Stocks quick-select raised: {exc[:2]}"
+        # the click wrote into the symbol box (session state)
+        box = st_session_text(at, "Enter Symbols")
+        assert box and box.strip() != "", "quick-select should fill the symbol box"
+
+
+def st_session_text(at, label):
+    """Return the current text-input value for the given label."""
+    for t in at.text_input:
+        if label in t.label:
+            return t.value
+    return ""
+
+
 def test_quant_portal_alt_data_uses_valid_signal_fields():
     """Regression: the Alternative Data tab crashed with
     'AltDataSignal object has no attribute signal_type'. The display must use
@@ -578,5 +612,11 @@ def test_quant_portal_alt_data_uses_valid_signal_fields():
         at.run()
         exc = [str(e.value) for e in at.exception]
         assert not exc, f"Fetch Alternative Data raised: {exc[:2]}"
-        md = " ".join(m.value for m in at.markdown)
-        assert "Satellite Footfall" in md and "satellite" in md
+        # the signal is grouped under its source expander — open it to inspect
+        exp = [e for e in at.expander if "satellite" in e.label.lower()]
+        assert exp, "satellite source expander missing"
+        exp[0].expanded = True
+        at.run()
+        # expander contents are nested elements, not top-level markdown
+        inner = " ".join(m.value for m in exp[0].markdown)
+        assert "Satellite Footfall" in inner and "satellite" in inner.lower()

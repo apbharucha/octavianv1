@@ -97,8 +97,13 @@ class AdvancedBacktester:
         self.max_position_pct = 0.15  # Max 15% per position
 
     def run_backtest(self, df: pd.DataFrame, symbol: str,
-                     lookback_window: int = 40, rebalance_every: int = 1,
+                     lookback_window: int = 60, rebalance_every: int = 1,
                      use_stop_loss: bool = True, use_take_profit: bool = True) -> Optional[BacktestResult]:
+        # The quant ensemble needs >= 50 bars (_prepare_data requires lookback 30
+        # + 20 warmup) to produce a directional signal; a 40-bar window always
+        # returned NEUTRAL, so the backtest silently traded nothing (all-zeros
+        # metrics). Floor the lookback at 60 bars.
+        lookback_window = max(int(lookback_window), 60)
         if df is None or df.empty or len(df) < lookback_window + 10:
             return None
         

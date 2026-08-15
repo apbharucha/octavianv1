@@ -330,10 +330,15 @@ def render_quant_portal():
     with main_tabs[0]:
         _section("Multi-Asset Analysis")
         
-        # Symbol Input
+        # Symbol Input — quick-select buttons WRITE into this text input (via
+        # session state) so the whole portal sees the chosen symbols and analysis
+        # auto-runs. Previously the buttons only set a local variable that was
+        # discarded on the next rerun, so clicking Stocks/Futures/FX/Crypto did
+        # nothing.
         symbol_input = st.text_input(
             "Enter Symbols (comma-separated)",
             value="AAPL, MSFT, NVDA",
+            key="qp_symbol_input",
             help="Stocks (AAPL), futures (ES=F), FX (EURUSD=X), crypto (BTC-USD)"
         )
         
@@ -355,26 +360,44 @@ def render_quant_portal():
         except Exception:
             _all_stocks, _futures, _fx, _crypto = [], [], [], []
 
+        def _make_quick_select(family_list):
+            """Return an on_click callback that fills the symbol input. Callbacks
+            run BEFORE the rerun instantiates the widget, so writing its session
+            state here is legal (unlike writing it inside the script body)."""
+            def _cb():
+                st.session_state["qp_symbol_input"] = ", ".join(family_list)
+                st.session_state["qp_auto_analyze"] = True
+            return _cb
+
         col_q1, col_q2, col_q3, col_q4 = st.columns(4)
         with col_q1:
-            if st.button("Stocks", width='stretch'):
-                symbols = (_all_stocks or [])[:6]
+            st.button("Stocks", width='stretch',
+                      on_click=_make_quick_select((_all_stocks or [])[:6]))
         with col_q2:
-            if st.button("Futures", width='stretch'):
-                symbols = (_futures or [])[:4]
+            st.button("Futures", width='stretch',
+                      on_click=_make_quick_select((_futures or [])[:4]))
         with col_q3:
-            if st.button("FX", width='stretch'):
-                symbols = (_fx or [])[:4]
+            st.button("FX", width='stretch',
+                      on_click=_make_quick_select((_fx or [])[:4]))
         with col_q4:
-            if st.button("Crypto", width='stretch'):
-                symbols = (_crypto or [])[:3]
+            st.button("Crypto", width='stretch',
+                      on_click=_make_quick_select((_crypto or [])[:3]))
+        
+        # If a quick-select button just fired, re-read the symbols it wrote into
+        # the box (session state is updated even though this rerun already
+        # instantiated the widget) so the auto-analysis uses the right tickers.
+        _auto_analyze = st.session_state.pop("qp_auto_analyze", False)
+        if _auto_analyze:
+            symbol_input = st.session_state.get("qp_symbol_input", "")
+            symbols = [s.strip().upper() for s in symbol_input.split(',') if s.strip()]
         
         if len(symbols) < 1:
             st.info("Enter at least 1 symbol to begin.")
             return
         
-        # Fetch and analyze data
-        if st.button("Fetch & Analyze", type="primary"):
+        # Fetch and analyze data — runs when the button is clicked OR when a
+        # quick-select button just filled the symbol box (qp_auto_analyze).
+        if st.button("Fetch & Analyze", type="primary") or _auto_analyze:
             with st.spinner("Loading market data..."):
                 try:
                     data = {}
@@ -1006,28 +1029,61 @@ def render_quant_portal():
         _section("Alternative Data Intelligence")
         
         if HAS_ALT:
-            alt_col1, alt_col2 = st.columns(2)
-            with alt_col1:
-                alt_ticker = st.text_input("Ticker", value=bt_symbol if 'bt_symbol' in locals() else "AAPL")
-            with alt_col2:
-                alt_source = st.selectbox("Data Source", ["Satellite", "Social Media", "Credit Cards", "Web Traffic", "Hiring"], key="alt_source_select")
+            alt_ticker = st.text_input("Ticker", value=bt_symbol if 'bt_symbol' in locals() else "AAPL")
+            st.caption("All alternative-data sources are fetched together (satellite, social, "
+                       "hiring, web traffic, credit cards, ESG, dark pool, options flow) and "
+                       "labelled by source — no need to pick one.")
             
             if st.button("Fetch Alternative Data", type="primary"):
-                with st.spinner(f"Fetching {alt_source} data..."):
+                with st.spinner(f"Fetching all alternative data sources for {alt_ticker}..."):
                     try:
                         engine = AlternativeDataEngine()
                         signals = engine.get_all_signals(alt_ticker)
                         
                         if signals:
-                            st.success(f"Found {len(signals)} alternative data signals")
+                            st.success(f"Found {len(signals)} alternative data signals across "
+                                       f"{len({s.category for s in signals})} sources")
                             
-                            for sig in signals[:3]:
-                                with st.expander(f"{sig.name}", expanded=True):
-                                    st.markdown(f"**Signal:** {sig.name} ({sig.category})")
-                                    st.markdown(f"**Strength:** {sig.strength:.1f}")
-                                    st.markdown(f"**Direction:** {sig.direction}")
-                                    if sig.description:
-                                        st.markdown(f"**Description:** {sig.description}")
+                            # Composite verdict first
+                            comp = engine.get_composite_score(alt_ticker)
+                            if comp:
+                                _metric_card("Composite Score", f"{comp.get('composite_score', 50):.0f}/100",
+                                             "#4caf50" if comp.get('direction') == 'BULLISH'
+                                             else "#f44336" if comp.get('direction') == 'BEARISH'
+                                             else "#ff9800")
+                                _metric_card("Composite Direction", comp.get('direction', 'NEUTRAL'),
+                                             "#4caf50" if comp.get('direction') == 'BULLISH'
+                                             else "#f44336" if comp.get('direction') == 'BEARISH'
+                                             else "#ff9800")
+                            
+                            # Group signals by their actual source (category)
+                            by_source: dict = {}
+                            for sig in signals:
+                                by_source.setdefault(sig.category, []).append(sig)
+                            
+                            for source, sigs in by_source.items():
+                                bulls = sum(1 for s in sigs if s.direction == "BULLISH")
+                                bears = sum(1 for s in sigs if s.direction == "BEARISH")
+                                dir_txt = "BULLISH" if bulls > bears else "BEARISH" if bears > bulls else "MIXED"
+                                src_key = str(source).lower()
+                                with st.expander(
+                                    f"{source} — {len(sigs)} signal(s), {dir_txt} "
+                                    f"({bulls} bull / {bears} bear)",
+                                    expanded=(src_key in ("satellite", "social media", "social"))):
+                                    for sig in sigs:
+                                        color = "#4caf50" if sig.direction == "BULLISH" else \
+                                                "#f44336" if sig.direction == "BEARISH" else "#ff9800"
+                                        st.markdown(
+                                            f"<span style='color:{color};font-weight:600;'>"
+                                            f"{sig.direction}</span> **{sig.name}** — "
+                                            f"strength {sig.strength:.0f}/100 · confidence "
+                                            f"{sig.confidence:.0f}%",
+                                            unsafe_allow_html=True)
+                                        if sig.description:
+                                            st.markdown(f"<span style='color:#8b949e;font-size:0.85rem;'>"
+                                                        f"{sig.description}</span>",
+                                                        unsafe_allow_html=True)
+                                        st.markdown("")
                         else:
                             st.info("No alternative data signals available")
                             

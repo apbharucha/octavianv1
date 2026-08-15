@@ -122,6 +122,107 @@ def _swot(r: AlgorithmResult) -> tuple:
     return strengths, weaknesses, unknowns
 
 
+def _render_window_breakdown(r: AlgorithmResult) -> None:
+    """Per-window table (5y/3y/2y/1y/6m/3m/1m): return, Sharpe, max DD, trades."""
+    rows = []
+    for label in ("5y", "3y", "2y", "1y", "6m", "3m", "1m"):
+        w = r.window_metrics.get(label)
+        if not isinstance(w, dict):
+            rows.append({"Window": label, "Return": "—", "Sharpe": "—",
+                         "Max DD": "—", "Trades": "—"})
+            continue
+        rows.append({
+            "Window": label,
+            "Return": f"{w.get('total_return', 0) * 100:+.1f}%",
+            "Sharpe": f"{w.get('sharpe', 0):.2f}",
+            "Max DD": f"{w.get('max_drawdown', 0) * 100:.1f}%",
+            "Trades": f"{w.get('trades', 0)}",
+        })
+    st.markdown("**Return / risk by time window**")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def _render_trade_table(r: AlgorithmResult) -> None:
+    """Trade-by-trade table with best / worst / riskiest highlights."""
+    closed = [t for t in r.trades if t.get("exit_pnl_pct") is not None]
+    if not closed:
+        return
+    df = pd.DataFrame(closed)
+    df = df.rename(columns={
+        "entry_date": "Entry", "exit_date": "Exit", "direction": "Side",
+        "entry_price": "Entry Px", "exit_pnl_pct": "P&L %",
+        "hold_bars": "Hold (bars)", "exit_reason": "Exit reason",
+    })
+    cols = [c for c in ("Entry", "Exit", "Side", "Entry Px", "P&L %",
+                        "Hold (bars)", "Exit reason") if c in df.columns]
+    df = df[cols]
+    pnl_num = df["P&L %"].astype(float)
+    hold_num = df["Hold (bars)"].astype(float).clip(lower=1.0)
+    df["P&L %"] = pnl_num.map(lambda v: f"{v:+.2f}%")
+    best_idx = int(pnl_num.idxmax())
+    worst_idx = int(pnl_num.idxmin())
+    risk_eff = pnl_num / hold_num
+    risky_idx = int(risk_eff.idxmin())
+    with st.expander(f"Trades ({len(closed)} closed)", expanded=False):
+        if len(closed) >= 3:
+            best, worst = df.loc[best_idx], df.loc[worst_idx]
+            risky = df.loc[risky_idx]
+            st.markdown(
+                f"<span style='color:{GREEN};'>▲ Best: {best['Entry']} → "
+                f"{best['Exit']} ({best['Side']}) {best['P&L %']} "
+                f"via {best['Exit reason']}</span> · "
+                f"<span style='color:{RED};'>▼ Worst: {worst['Entry']} → "
+                f"{worst['Exit']} ({worst['Side']}) "
+                f"{worst['P&L %']} via {worst['Exit reason']}</span>",
+                unsafe_allow_html=True)
+            st.markdown(
+                f"<span style='color:{MUTED};'>⚠ Riskiest: {risky['Entry']} → {risky['Exit']} "
+                f"({risky['Side']}) {risky['P&L %']} over {risky['Hold (bars)']} bars "
+                f"({risk_eff.loc[risky_idx]:+.2f}%/bar)</span>",
+                unsafe_allow_html=True)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def _render_factor_ranking(universe: list) -> None:
+    """Cross-sectional factor ranking of the build universe — momentum, value
+    proxy, low-vol, trend, volume momentum (WorldQuant smart-beta methodology)."""
+    from algorithm_builder_engine import rank_factors
+    from data_sources import get_stock
+
+    uni = [u for u in (universe or []) if u][:10]
+    if len(uni) < 2:
+        return
+    with st.expander("Factor ranking of the universe (which symbols are rich in which factor)",
+                     expanded=False):
+        try:
+            dfs = {}
+            for sym in uni:
+                try:
+                    df = get_stock(sym, period="1y")
+                    if df is not None and len(df) >= 63:
+                        dfs[sym] = df
+                except Exception:
+                    continue
+            if len(dfs) < 2:
+                st.info("Need at least 2 symbols with 1y of history to rank factors.")
+                return
+            fr = rank_factors(dfs)
+            cols = {
+                "symbol": "Symbol", "mom_12_2": "Momentum (12-2m)",
+                "value_proxy": "Value proxy", "low_vol": "Low-vol (neg vol)",
+                "trend": "Trend", "volume_mom": "Volume mom",
+                "composite": "Composite", "rank": "Rank",
+            }
+            fr = fr.rename(columns=cols)[list(cols.values())]
+            st.dataframe(fr, use_container_width=True, hide_index=True)
+            st.caption("Factors are z-scored cross-sectionally and equal-weight averaged into "
+                       "a composite (WorldQuant retail smart-beta methodology). Momentum is "
+                       "the Asness MOM2-12; value is a price proxy (depth below the trailing "
+                       "1y average) since the engine has no fundamentals.")
+        except Exception as e:  # noqa: BLE001
+            st.info(f"Could not fetch universe data for factor ranking: {e}")
+
+
 def _render_result(r: AlgorithmResult, idx: int, expanded: bool = False) -> None:
     is_error = any(n.startswith("ERROR:") for n in r.build_notes)
     title = f"{idx}. {r.name}" + (" (error)" if is_error else "")
@@ -138,13 +239,15 @@ def _render_result(r: AlgorithmResult, idx: int, expanded: bool = False) -> None
                 f"**Test (OOS) Sharpe {om.get('sharpe', 0):.2f}** (DD {om.get('max_drawdown', 0) * 100:.1f}%, "
                 f"{om.get('trades', 0)} trades) — parameters were chosen on the train window only."
             )
-        if r.window_returns:
+        if r.window_metrics:
+            _render_window_breakdown(r)
+        elif r.window_returns:
             wr = [f"<b>{k}</b>: {v * 100:+.1f}%" if v is not None else f"<b>{k}</b>: —"
                   for k, v in r.window_returns.items()]
             st.markdown(
                 f"<div style='color:{MUTED};font-size:0.85rem;'>Return by window — "
                 + " · ".join(wr) + "</div>", unsafe_allow_html=True)
-        st.plotly_chart(_equity_fig(r), use_container_width=True)
+        st.plotly_chart(_equity_fig(r), use_container_width=True, key=f"eq_{r.id}")
         if r.family != "ensemble":
             if st.button("Test in paper trading", key=f"pt_deploy_{r.id}",
                          help="Deploy this algorithm to a paper trading account "
@@ -165,6 +268,7 @@ def _render_result(r: AlgorithmResult, idx: int, expanded: bool = False) -> None
             for n in r.build_notes:
                 if not n.startswith("ERROR:") and not n.startswith("SUGGESTION:"):
                     st.caption(n)
+        _render_trade_table(r)
         if r.trade_narratives:
             with st.expander(f"Trade-by-trade reasoning ({len(r.trade_narratives)} trades)"):
                 for n in r.trade_narratives:
@@ -454,6 +558,10 @@ def render_algorithm_builder() -> None:
                 st.caption("Ranking note: sorted by out-of-sample (test) Sharpe — the number "
                            "that matters most, because it is the only one the search never "
                            "looked at while fitting.")
+
+        # ---- factor ranking of the universe (WorldQuant retail smart-beta
+        # methodology: z-score each factor, weighted composite) ----
+        _render_factor_ranking(st.session_state["ab_args"].get("universe", []))
 
         # combined research note for the whole build
         st.markdown("---")

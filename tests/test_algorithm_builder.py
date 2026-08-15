@@ -35,10 +35,12 @@ from algorithm_builder_engine import (  # noqa: E402
     build_algorithms,
     generate_python,
     parse_request,
+    rank_factors,
     run_ops_basket,
     search_best,
     strategy_spec_to_signal,
     strategy_spec_to_weights,
+    window_metrics,
 )
 
 
@@ -756,3 +758,68 @@ def test_generated_research_scripts_compile_and_run(df_trend):
                                _default_backtest_params("balanced", "long_only"),
                                ["SPY"])
         _exec_with_mock_data(code, _long_df(seed=9, trend=0.0010))
+
+
+def test_window_metrics_breakdown_shape(df_trend):
+    """Per-window breakdown must carry return/sharpe/drawdown/trades for each
+    window the history covers, and None (or missing) for windows it cannot."""
+    df = _long_df(seed=11, trend=0.0010)
+    sig = pd.Series(1.0, index=df.index)  # always-long -> trades on exit only
+    res = backtest_ohlcv(df, sig, _default_backtest_params("balanced", "long_only"))
+    wm = window_metrics(res["equity"], res["returns"], res["trades"])
+    assert "1y" in wm and "6m" in wm and "1m" in wm
+    for label, w in wm.items():
+        if w is None:
+            continue
+        assert set(w) == {"total_return", "sharpe", "max_drawdown", "trades"}
+        assert isinstance(w["sharpe"], float)
+        assert w["trades"] >= 0
+    # a build result carries the breakdown end-to-end
+    out = build_algorithms(mode="guided", archetypes=["trend_ma"], count=1,
+                           universe=["SPY"], seed=7, runs_per_family=1,
+                           data_fn=_mk_data_fn(_long_df(seed=5)))
+    assert out[0].window_metrics.get("1y") is not None
+
+
+def test_rank_factors_sorts_universe(df_trend):
+    """Cross-sectional factor ranking must z-score each factor, produce a
+    composite, assign ranks, and keep symbol as a first-class column."""
+    base = _long_df(seed=3)
+    dfs = {"SPY": base, "QQQ": base * 1.03, "IWM": base * 0.97, "GLD": base * 0.92}
+    fr = rank_factors(dfs)
+    assert "symbol" in fr.columns
+    assert "composite" in fr.columns and "rank" in fr.columns
+    assert len(fr) == 4
+    assert list(fr["rank"]) == [1, 2, 3, 4]  # sorted by composite desc
+    # composite is sorted descending by construction
+    assert fr["composite"].is_monotonic_decreasing
+
+
+def test_rank_factors_short_history_empty(df_trend):
+    short = _long_df(n=40, seed=1)
+    fr = rank_factors({"SPY": short, "QQQ": short})
+    assert fr.empty or "symbol" in fr.columns
+
+
+def test_advanced_backtester_lookback_floor_trades(df_trend):
+    """Regression: the Advanced Backtester defaulted to a 40-bar lookback, but
+    the quant ensemble needs >= 50 bars to produce a directional signal, so the
+    backtest silently traded nothing (all-zero metrics across the board). The
+    lookback must be floored at 60 so signals actually fire."""
+    from unittest.mock import patch as _patch
+    from advanced_backtester import AdvancedBacktester
+
+    class _FakeSignal:
+        direction = "BULLISH"
+        confidence = 0.7
+        optimal_position_size = 0.1
+
+    df = _long_df(seed=5, trend=0.0012)
+    bt = AdvancedBacktester(initial_capital=100000.0)
+    with _patch.object(bt.quant_model, "predict", return_value=_FakeSignal()):
+        res = bt.run_backtest(df, "TEST", rebalance_every=5)
+    assert res is not None
+    assert res.total_trades > 0, "backtest should trade with the lookback floor"
+    assert res.total_return_pct != 0.0 or res.total_trades > 0
+    # equity curve is not flat
+    assert len(set(res.equity_curve)) > 2

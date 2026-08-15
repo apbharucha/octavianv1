@@ -84,6 +84,96 @@ def window_returns(equity: pd.Series) -> dict:
     return out
 
 
+def window_metrics(equity: pd.Series, returns: pd.Series, trades: list) -> dict:
+    """Per-window breakdown (5y/3y/2y/1y/6m/3m/1m) of return, Sharpe, max
+    drawdown and trade count — the 'what happened in this time period' table.
+
+    Each window is sliced from the most recent N trading bars of the strategy's
+    own equity/returns series; trades are attributed to the window they EXITED
+    in (the exit bar decides), so window trade counts sum to the full run.
+    """
+    out = {}
+    if equity is None or len(equity) < 2 or returns is None:
+        for label, _ in WINDOW_SPECS:
+            out[label] = None
+        return out
+    eq = equity.dropna()
+    ret = returns.dropna()
+    for label, bars in WINDOW_SPECS:
+        if len(eq) <= bars:
+            out[label] = None
+            continue
+        eq_w = eq.iloc[-1 - bars:]
+        ret_w = ret.iloc[-1 - bars:]
+        total = float(eq_w.iloc[-1] / eq_w.iloc[0] - 1.0) if eq_w.iloc[0] > 0 else 0.0
+        sd = float(ret_w.std())
+        sharpe = float(ret_w.mean() / sd * math.sqrt(bars_per_year := 252)) if sd > 0 else 0.0
+        peak = eq_w.cummax()
+        dd = float((eq_w / peak - 1.0).min())
+        if trades:
+            exit_ts = pd.to_datetime([t.get("exit_date") for t in trades if t.get("exit_date")],
+                                     errors="coerce")
+            start_ts = eq_w.index[0]
+            n_trades = int((exit_ts >= start_ts).sum())
+        else:
+            n_trades = 0
+        out[label] = {"total_return": total, "sharpe": sharpe, "max_drawdown": dd,
+                      "trades": n_trades}
+    return out
+
+
+def rank_factors(dfs: dict) -> pd.DataFrame:
+    """Cross-sectional factor ranking of a symbol universe (WorldQuant retail
+    smart-beta methodology: z-score each factor, weighted-average composite).
+
+    Uses price-based factors computable from OHLCV (the engine has no
+    fundamentals): 12-2 momentum (Asness et al.), a value proxy (depth below
+    trailing 1y average), low-volatility, trend strength (distance above its
+    200d average) and volume momentum. Returns a DataFrame of z-scores, the
+    composite, and a rank (higher = more attractive), sorted by composite.
+    """
+    rows = []
+    for sym, df in dfs.items():
+        close = df["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        close = close.dropna().astype(float)
+        if len(close) < 63:
+            continue
+        mom = float(close.iloc[-21] / close.iloc[-252] - 1.0) if len(close) > 252 else float("nan")
+        value = float(close.iloc[-1] / close.iloc[-252:].mean() - 1.0)
+        vol = float(close.pct_change().tail(126).std() * math.sqrt(252))
+        trend = float(close.iloc[-1] / close.iloc[-200:].mean() - 1.0) if len(close) >= 200 else float("nan")
+        vol_mom = float("nan")
+        if "Volume" in df.columns:
+            v = df["Volume"]
+            if isinstance(v, pd.DataFrame):
+                v = v.iloc[:, 0]
+            v = v.dropna().astype(float)
+            if len(v) >= 42:
+                vol_mom = float(v.iloc[-21:].mean() / max(v.iloc[-252:-21].mean(), 1e-9) - 1.0)
+        rows.append({"symbol": sym, "mom_12_2": mom, "value_proxy": value,
+                     "low_vol": -vol, "trend": trend, "volume_mom": vol_mom})
+    if not rows:
+        return pd.DataFrame(columns=["symbol", "mom_12_2", "value_proxy", "low_vol",
+                                     "trend", "volume_mom", "composite", "rank"])
+    fdf = pd.DataFrame(rows).set_index("symbol")
+    for col in ("mom_12_2", "value_proxy", "low_vol", "trend", "volume_mom"):
+        mu, sd = fdf[col].mean(), fdf[col].std()
+        fdf[col + "_z"] = (fdf[col] - mu) / sd if sd and sd > 0 else 0.0
+        fdf[col + "_z"] = fdf[col + "_z"].fillna(0.0)
+    # composite = equal-weight average of the available factor z-scores
+    zcols = [c for c in ("mom_12_2_z", "value_proxy_z", "low_vol_z", "trend_z", "volume_mom_z")
+             if c in fdf.columns]
+    fdf["composite"] = fdf[zcols].mean(axis=1)
+    fdf = fdf.sort_values("composite", ascending=False)
+    fdf["rank"] = range(1, len(fdf) + 1)
+    fdf = fdf.reset_index()  # keep symbol as a first-class column
+    cols = ["symbol", "mom_12_2", "value_proxy", "low_vol", "trend", "volume_mom",
+            "composite", "rank"]
+    return fdf[cols].round(4)
+
+
 def trade_narratives(trades: list, df: pd.DataFrame, signal: pd.Series,
                      params: dict) -> list:
     """Dynamic, per-trade reasoning: why this trade was entered, what the
@@ -1807,6 +1897,7 @@ class AlgorithmResult:
     members: list = field(default_factory=list)
     build_notes: list = field(default_factory=list)
     window_returns: dict = field(default_factory=dict)
+    window_metrics: dict = field(default_factory=dict)
     trade_narratives: list = field(default_factory=list)
     run_index: int = 1
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -1821,7 +1912,7 @@ class AlgorithmResult:
             "universe": self.universe, "ops_algo": self.ops_algo,
             "ensemble_weights": self.ensemble_weights, "members": self.members,
             "build_notes": self.build_notes, "window_returns": self.window_returns,
-            "run_index": self.run_index,
+            "window_metrics": self.window_metrics, "run_index": self.run_index,
         }
 
     def strategy_spec(self) -> dict:
@@ -1845,6 +1936,8 @@ class AlgorithmResult:
             "metrics": {k: round(v, 4) if isinstance(v, float) else v
                         for k, v in self.metrics.items()},
             "window_returns": dict(self.window_returns),
+            "window_metrics": {k: (dict(v) if isinstance(v, dict) else v)
+                               for k, v in self.window_metrics.items()},
             "source": "algorithm_builder",
         }
 
@@ -1904,10 +1997,32 @@ class AlgorithmResult:
                 f"- **Test (OOS) Sharpe: {self.test_metrics.get('sharpe', 0):.2f}** "
                 f"(drawdown {self.test_metrics.get('max_drawdown', 0) * 100:.1f}%, trades {self.test_metrics.get('trades', 0)})",
             ]
-        if self.window_returns:
+        if self.window_metrics:
+            lines += ["", "## Breakdown by time window", "",
+                      "| Window | Return | Sharpe | Max DD | Trades |", "| --- | --- | --- | --- | --- |"]
+            for k, v in self.window_metrics.items():
+                if isinstance(v, dict):
+                    lines.append(f"| {k} | {v.get('total_return', 0) * 100:+.2f}% | "
+                                 f"{v.get('sharpe', 0):.2f} | {v.get('max_drawdown', 0) * 100:.2f}% | "
+                                 f"{v.get('trades', 0)} |")
+                else:
+                    lines.append(f"| {k} | — | — | — | — |")
+        elif self.window_returns:
             lines += ["", "## Return by window", "", "| Window | Return |", "| --- | --- |"]
             for k, v in self.window_returns.items():
                 lines.append(f"| {k} | {v * 100:+.2f}% |" if v is not None else f"| {k} | — |")
+        closed_t = [t for t in self.trades if t.get("exit_pnl_pct") is not None]
+        if closed_t:
+            lines += ["", "## Trade log", "",
+                      "| Entry | Exit | Side | P&L % | Hold | Exit reason |",
+                      "| --- | --- | --- | --- | --- | --- |"]
+            for t in closed_t[:100]:
+                lines.append(f"| {t.get('entry_date', '')} | {t.get('exit_date', '')} | "
+                             f"{t.get('direction', '')} | "
+                             f"{t.get('exit_pnl_pct', 0):+.2f}% | "
+                             f"{t.get('hold_bars', 0)} | {t.get('exit_reason', '')} |")
+            if len(closed_t) > 100:
+                lines.append(f"| _...and {len(closed_t) - 100} more trades_ | | | | | |")
         if self.trade_narratives:
             lines += ["", "## Trade-by-trade reasoning", ""]
             for n in self.trade_narratives[:60]:
@@ -2094,6 +2209,7 @@ def build_algorithms(
                 metrics=res["metrics"], trades=[], universe=list(dfs),
                 ops_algo=ops_algo,
                 window_returns=window_returns(res["equity"]),
+                window_metrics=window_metrics(res["equity"], res["returns"], []),
                 build_notes=["Portfolio-level backtest over " + ", ".join(list(dfs)[:4])]))
             continue
         a = ARCHETYPES[fam]
@@ -2133,6 +2249,8 @@ def build_algorithms(
                 trades=full["trades"], train_metrics=found["train_metrics"],
                 test_metrics=found["test_metrics"], universe=[primary_sym],
                 window_returns=window_returns(full["equity"]),
+                window_metrics=window_metrics(full["equity"], full["returns"],
+                                               full["trades"]),
                 trade_narratives=trade_narratives(full["trades"], primary, sig, bp),
                 run_index=run + 1, build_notes=notes))
         if not family_ok:
@@ -2180,6 +2298,7 @@ def build_algorithms(
                 universe=[primary_sym], ensemble_weights=ens["final_weights"],
                 members=[m.name for m in members],
                 window_returns=window_returns(ens["equity"]),
+                window_metrics=window_metrics(ens["equity"], ens["returns"], []),
                 build_notes=ens_notes))
     return results
 
