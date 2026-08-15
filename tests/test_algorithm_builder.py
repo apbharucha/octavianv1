@@ -387,6 +387,71 @@ def test_generated_ops_code_compiles():
     compile(code, "gen_ops.py", "exec")
 
 
+def test_generated_ensemble_code_compiles(df_trend):
+    """Regression: rendering an ensemble result used to call
+    generate_python("ensemble", ...) which did ARCHETYPES["ensemble"] and
+    raised KeyError, crashing the Algorithm Builder tab after any build with
+    an ensemble (the default). The exported ensemble script must compile and
+    embed the member specs for the wealth-weighted blend."""
+    m = _sample_result(df_trend)
+    specs = [{"name": m.name, "archetype": m.archetype, "params": m.params,
+              "ops_algo": m.ops_algo, "backtest_params": m.backtest_params,
+              "universe": m.universe}]
+    params = {"method": "fast_universalization", "members": [m.name],
+              "members_detail": specs}
+    code = generate_python("ensemble", params, {"direction": "long_only"},
+                           ["SPY", "QQQ"], ops_algo=None)
+    compile(code, "gen_ensemble.py", "exec")
+    assert "MEMBERS = " in code
+    assert '"archetype"' in code, "member specs (archetype/params) must be embedded"
+    assert "run_ops_basket" in code and "backtest_ohlcv" in code
+    assert "cumulative wealth" in code or "wealth" in code
+
+
+def _exec_with_mock_data(code: str, df):
+    """Compile AND run a generated strategy script against mocked get_stock.
+
+    Regression: exported scripts used json.dumps for the embedded params, which
+    emits JSON tokens (null/true/false) that are invalid Python — the script
+    NameError'd the moment it ran (e.g. backtest_params' take_profit_pct: None
+    and boolean strategy params). compile() alone never caught it."""
+    import unittest.mock as um
+    import data_sources
+    compile(code, "generated.py", "exec")
+    with um.patch("data_sources.get_stock", side_effect=_mk_data_fn(df)):
+        exec(compile(code, "generated.py", "exec"), {"__name__": "__main__"})
+
+
+def test_generated_single_script_runs(df_trend):
+    """A single-instrument export with None/bool params must run end-to-end."""
+    r = _sample_result(df_trend)
+    # force the exact shape that used to break: None + bool in backtest params
+    r.backtest_params = {"direction": "long_only", "take_profit_pct": None,
+                         "trailing_pct": None, "stop_loss_pct": 6.0,
+                         "sizing": "vol_target", "max_leverage": 1.5}
+    _exec_with_mock_data(r.code(), df_trend)
+
+
+def test_generated_ops_script_runs(df_trend):
+    code = generate_python("online_ops", {"eps": 0.005, "C": 1.0},
+                           {"direction": "long_only"}, ["SPY", "QQQ"], ops_algo="pamr")
+    _exec_with_mock_data(code, df_trend)
+
+
+def test_ensemble_result_code_does_not_raise(df_trend):
+    """End-to-end: a built ensemble AlgorithmResult (as produced by
+    build_algorithms) must export Python that compiles AND runs."""
+    # Guided families that reliably trade on the drifting fixture series, so the
+    # ensemble (>= 2 healthy members) is actually built.
+    res = build_algorithms(mode="guided", archetypes=["trend_ma", "bollinger_meanrev"],
+                           count=2, ensemble=True, universe=["SPY", "QQQ", "IWM"],
+                           seed=7, data_fn=_mk_data_fn(df_trend))
+    ens = [r for r in res if r.family == "ensemble"]
+    assert ens, "expected an ensemble card in the build"
+    for r in res:
+        _exec_with_mock_data(r.code(), df_trend)
+
+
 # --------------------------------------------------------------------------- #
 #  Failure modes
 # --------------------------------------------------------------------------- #

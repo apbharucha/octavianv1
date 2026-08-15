@@ -110,6 +110,24 @@ def test_13f_simulation_only_when_opted_in(monkeypatch):
     assert filings[0].data_source == m.PROVENANCE_SIMULATED
 
 
+def test_global_smart_money_flow_is_cached_within_ttl():
+    """Regression: get_global_smart_money_flow() rebuilt the aggregate from
+    raw filings on every call (~3s each), and the ML ensemble called it twice
+    per predict — a 100-window signal-history loop burned minutes re-computing
+    identical data. The aggregate must be computed once per TTL window."""
+    import sec_13f_engine as m
+
+    engine = m.SEC13FEngine()
+    m.SEC13FEngine._FLOW_CACHE = None      # clear any session state
+    m.SEC13FEngine._FLOW_CACHE_TS = 0.0
+    with patch.object(engine, "fetch_latest_filings", return_value=[]) as fetcher:
+        r1 = engine.get_global_smart_money_flow()
+        r2 = engine.get_global_smart_money_flow()
+        r3 = engine.get_global_smart_money_flow()
+    assert fetcher.call_count == 1, "aggregate must be computed once per TTL window"
+    assert r1 == r2 == r3
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Discovery engine — real realized volatility (no placeholder)
 # ─────────────────────────────────────────────────────────────────────────────

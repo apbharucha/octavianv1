@@ -268,7 +268,11 @@ class PositionOptimizerEngine:
                     try:
                         expiry_dt_ctx = datetime.strptime(expiry_ctx, "%Y-%m-%d")
                         dte_days_ctx = max(1, (expiry_dt_ctx - datetime.now()).days)
-                        iv_ctx = float(max(vol, 0.05))
+                        # implied vol from metadata when available, else realized
+                        # vol from the asset's own returns, else a neutral floor
+                        realized_vol = (float(data['Close'].pct_change().std() * np.sqrt(252))
+                                        if len(data) > 20 else 0.25)
+                        iv_ctx = float(max(float(metadata.get("iv") or realized_vol), 0.05))
                         options_context = {
                             "spot": float(current_price),
                             "strike": float(strike_ctx),

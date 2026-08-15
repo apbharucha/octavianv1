@@ -15,6 +15,9 @@ Author: AI Market Team
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 
+import numpy as np
+import pandas as pd
+
 # Optional dependencies — the API backend degrades gracefully (in-memory
 # cache, no rate limiting, no Redis) when they are not installed, so the
 # module always imports and the REST endpoints stay available.

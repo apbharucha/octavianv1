@@ -17,6 +17,8 @@ No emojis — CSS microanimations throughout.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objs as go

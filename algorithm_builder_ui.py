@@ -290,10 +290,13 @@ def render_algorithm_builder() -> None:
             bp_override["n_trials"] = int(trials)
             build_args["backtest_params_override"] = bp_override
 
-        sig = build_request_signature(**{k: build_args[k] for k in
-                                         ("request", "mode", "count", "ensemble", "risk",
-                                          "direction", "universe", "archetypes", "locked_params",
-                                          "n_trials", "seed")})
+        # build_request_signature names the execution-lock dict `locked` while
+        # build_algorithms calls it `locked_params` — pass it under the right name.
+        sig = build_request_signature(**{k: v for k, v in build_args.items()
+                                         if k in ("request", "mode", "count", "ensemble",
+                                                  "risk", "direction", "universe",
+                                                  "archetypes", "n_trials", "seed")},
+                                       locked=build_args["locked_params"])
         if st.session_state.get("ab_sig") != sig:
             progress = st.progress(0.0, text="Starting…")
             try:

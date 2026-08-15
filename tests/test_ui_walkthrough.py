@@ -264,3 +264,100 @@ def test_dark_pool_modes_are_actually_different():
         assert "Evidence for inference" in t
         assert "Sector / Pressure Matrix" in t
         assert "**Provenance**" in t
+
+
+def _mock_get_stock_long(symbol, *a, **k):
+    """300-bar deterministic OHLCV so Algorithm Builder's train/test split
+    (needs >= 60 train + >= 30 test bars) actually produces healthy results."""
+    import numpy as np
+    import pandas as pd
+    n = 300
+    idx = pd.bdate_range(end=pd.Timestamp("2026-08-01"), periods=n)
+    rng = np.random.default_rng(7)
+    close = 100 * np.cumprod(1 + rng.normal(0.0006, 0.01, n))
+    return pd.DataFrame({
+        "Open": close * 0.995, "High": close * 1.01, "Low": close * 0.99,
+        "Close": close, "Adj Close": close,
+        "Volume": rng.integers(1_000_000, 5_000_000, n),
+    }, index=idx)
+
+
+def test_algorithm_builder_build_click_does_not_raise():
+    """Regression: clicking 'Build algorithms' crashed with
+
+        TypeError: build_request_signature() got an unexpected keyword
+        argument 'locked_params'
+
+    because the UI passed the execution-lock dict under `locked_params` while
+    build_request_signature names that parameter `locked`. The click must
+    complete and render results with no exception."""
+    import algorithm_builder_engine as abe
+
+    at = AppTest.from_file(os.path.join(ROOT, "main.py"), default_timeout=240)
+    with ExitStack() as stack:
+        for m in _build_mocks():
+            stack.enter_context(m)
+        # build_algorithms binds data_fn as a *default argument value*, so
+        # swapping the module-level binding is not enough — patch __defaults__.
+        _defaults = list(abe.build_algorithms.__defaults__)
+        _defaults[11] = _mock_get_stock_long  # data_fn
+        stack.enter_context(patch.object(abe.build_algorithms, "__defaults__",
+                                         tuple(_defaults)))
+        at.run()
+        for r in at.sidebar.radio:
+            if r.label == "Navigation":
+                r.set_value("Algorithm Builder")
+                at.run()
+                break
+        btns = [b for b in at.button if b.label == "Build algorithms"]
+        assert btns, "Build algorithms button not found"
+        btns[0].click()
+        at.run()
+        exc = [str(e.value) for e in at.exception]
+        assert not exc, f"Algorithm Builder build raised: {exc[:2]}"
+        # Results rendered: summary line mentions the built algorithms
+        md = " ".join(m.value for m in at.markdown)
+        assert "Built" in md and "algorithm" in md, (
+            f"expected build summary, got markdown: {md[:200]}")
+
+
+def test_quant_portal_signal_history_is_capped_and_completes():
+    """Regression: 'Generate Quant Signal' ran one full ensemble training per
+    history window (~100 windows x ~10s each), hanging the tab for minutes.
+
+    The history loop is now capped at 24 windows. Assert the click completes
+    with no exception and predict() is called <= 25 times (1 current + 24
+    history windows)."""
+    calls = {"n": 0}
+
+    def _fake_predict(self, prices, *a, **k):
+        calls["n"] += 1
+        return type("Sig", (), {
+            "direction": "NEUTRAL", "probability": 0.5, "confidence": 0.3,
+            "expected_return": 0.0, "sub_model_signals": {},
+        })()
+
+    at = AppTest.from_file(os.path.join(ROOT, "main.py"), default_timeout=240)
+    with ExitStack() as stack:
+        for m in _build_mocks():
+            stack.enter_context(m)
+        stack.enter_context(patch("quant_ensemble_model.QuantEnsembleModel.predict",
+                                  new=_fake_predict))
+        # quant_portal imports get_stock at module import time; the walkthrough's
+        # data_sources.* patches never reach it, so bind its own.
+        stack.enter_context(patch("quant_portal.get_stock",
+                                  side_effect=_mock_get_stock))
+        at.run()
+        for r in at.sidebar.radio:
+            if r.label == "Navigation":
+                r.set_value("Quant Portal")
+                at.run()
+                break
+        btns = [b for b in at.button if b.label == "Generate Quant Signal"]
+        assert btns, "Generate Quant Signal button not found"
+        btns[0].click()
+        at.run()
+        exc = [str(e.value) for e in at.exception]
+        assert not exc, f"Quant Portal signal raised: {exc[:2]}"
+        assert 2 <= calls["n"] <= 25, (
+            f"signal history loop not capped: {calls['n']} ensemble predicts")

@@ -1315,8 +1315,22 @@ Be highly analytical, signal-dense, and directional. NO EMOJIS.
     # AGGREGATE ANALYSIS METHODS
     # -----------------------------------------------------------------------
 
+    # Aggregate flow is rebuilt from raw filings on every call, and the build
+    # (parse + aggregate 10 funds) costs seconds. The ML ensemble calls it once
+    # per predict (and sometimes twice per analysis), so scanners / signal loops
+    # would otherwise pay seconds of redundant work per symbol. Filings only
+    # refresh daily, so a short TTL cache is safe and makes repeated reads free.
+    _FLOW_CACHE: Optional[Dict[str, Any]] = None
+    _FLOW_CACHE_TS: float = 0.0
+    _FLOW_CACHE_TTL_S: float = 600.0  # 10 min — filings refresh at most daily
+
     def get_global_smart_money_flow(self) -> Dict[str, Any]:
         """Aggregate net institutional equity flow across all funds."""
+        _now = time.time()
+        if (SEC13FEngine._FLOW_CACHE is not None
+                and (_now - SEC13FEngine._FLOW_CACHE_TS) < SEC13FEngine._FLOW_CACHE_TTL_S):
+            return SEC13FEngine._FLOW_CACHE
+
         filings = [f for f in self.fetch_latest_filings() if f.data_available]
         ticker_net_flow: Dict[str, float] = {}
 
@@ -1330,11 +1344,14 @@ Be highly analytical, signal-dense, and directional. NO EMOJIS.
         top_inflows = [x for x in sorted_flows if x[1] > 0][:8]
         top_outflows = sorted([x for x in sorted_flows if x[1] < 0], key=lambda x: x[1])[:8]
 
-        return {
+        result = {
             "top_inflows": top_inflows,
             "top_outflows": top_outflows,
             "net_flow_map": ticker_net_flow,
         }
+        SEC13FEngine._FLOW_CACHE = result
+        SEC13FEngine._FLOW_CACHE_TS = _now
+        return result
 
     def get_cross_fund_options_flow(self) -> Dict[str, Any]:
         """Aggregate options positioning across all funds — net calls vs puts by underlying."""

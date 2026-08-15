@@ -402,11 +402,14 @@ def render_quant_portal():
                         
                         if returns_data:
                             returns_df = pd.DataFrame(returns_data)
-                            total_returns = ((1 + returns_df) - 1).tail(1).iloc[0]
+                            # True cumulative return per symbol over the whole period
+                            total_returns = (1 + returns_df).prod() - 1
                         else:
                             returns_df = None
-                            
-                            # Display returns
+                            total_returns = pd.Series(dtype=float)
+
+                        # Display returns
+                        if not total_returns.empty:
                             cols = st.columns(min(len(total_returns), 6))
                             for i, (sym, ret) in enumerate(total_returns.items()):
                                 with cols[i % 6]:
@@ -506,7 +509,11 @@ def render_quant_portal():
                         df = get_stock(signal_symbol, period="2y")
                         if df is not None:
                             quant = get_quant_ensemble()
-                            prices = df['Close'].values
+                            close = df['Close']
+                            if isinstance(close, pd.DataFrame):
+                                close = close.iloc[:, 0]
+                            close = close.dropna()
+                            prices = close.values
                             
                             # Get signals
                             # Get current signal only (most recent window)
@@ -525,15 +532,26 @@ def render_quant_portal():
                             _metric_card("Probability", f"{current_signal.probability:.1%}", signal_color)
                             
                             # Generate signal history
+                            # Each predict() online-trains the full ensemble (LSTM +
+                            # Transformer + MLP/RF/GBM), so an uncapped loop over every
+                            # bar used to run ~100 full trainings and hang the tab for
+                            # minutes. Cap at ~24 evenly-spaced windows: same curve
+                            # shape, finishes in seconds.
                             signal_probs = []
                             window = 60
-                            step = max(1, (len(prices) - window) // 100)  # Limit to ~100 points
-                            for i in range(window, len(prices), step):
+                            history_ends = list(range(window, len(prices)))
+                            max_points = 24
+                            if len(history_ends) > max_points:
+                                step = len(history_ends) / float(max_points)
+                                idxs = sorted({history_ends[int(i * step)] for i in range(max_points)})
+                            else:
+                                idxs = history_ends
+                            for i in idxs:
                                 pred = quant.predict(prices[i-window:i])
                                 signal_probs.append(pred.probability - 0.5)
                             
                             # Signal history chart
-                            signal_dates = df.index[window::step][:len(signal_probs)]
+                            signal_dates = close.index[idxs][:len(signal_probs)]
                             signal_df = pd.DataFrame({
                                 'Date': signal_dates,
                                 'Signal': signal_probs
@@ -549,7 +567,7 @@ def render_quant_portal():
                             ))
                             fig.add_hline(y=0, line_dash="dash", line_color="gray")
                             fig.update_layout(
-                                title="Signal History (Probability - 0.5)",
+                                title=f"Signal History ({len(signal_probs)} windows, Probability - 0.5)",
                                 template="plotly_dark",
                                 height=300
                             )
@@ -622,7 +640,10 @@ def render_quant_portal():
                     # Fetch data
                     df = get_stock(regime_symbol, period="2y")
                     if df is not None:
-                        returns = df['Close'].pct_change().dropna()
+                        close_col = df['Close']
+                        if isinstance(close_col, pd.DataFrame):
+                            close_col = close_col.iloc[:, 0]
+                        returns = close_col.pct_change().dropna()
                         
                         # Simulate regime detection (in production, would use actual HMM)
                         # Generate realistic regime labels
