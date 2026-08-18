@@ -287,15 +287,22 @@ class AdvancedBacktester:
                 n - 1 - entry_idx,
                 "END_OF_PERIOD", max_fav, max_adv))
             position = 0.0
+            # Re-record the last equity point as true cash AFTER the exit costs,
+            # so the plotted curve's final value and Total Return agree exactly
+            # with the account's final capital (previously the curve kept the
+            # open position marked at raw price, without exit commission).
+            if equity:
+                equity[-1] = capital
 
-        final_capital = capital if position == 0 else capital
-        # Recalculate final from last equity point
-        if equity:
-            final_capital = equity[-1]
+        final_capital = capital
             
-        return self._compute_metrics(symbol, equity, equity_ts, trades, prices, timestamps, final_capital)
+        # Buy & hold benchmark spans the SAME window as the strategy (from the
+        # first bar the strategy traded on), not the whole price series.
+        return self._compute_metrics(symbol, equity, equity_ts, trades, prices, timestamps,
+                                     final_capital, bench_start=lookback_window - 1)
 
-    def _compute_metrics(self, symbol, equity, equity_ts, trades, prices, timestamps, final_capital) -> BacktestResult:
+    def _compute_metrics(self, symbol, equity, equity_ts, trades, prices, timestamps,
+                         final_capital, bench_start: int = 0) -> BacktestResult:
         ea = np.array(equity, dtype=float)
         n_eq = len(ea)
         trp = (final_capital - self.initial_capital) / self.initial_capital
@@ -304,9 +311,11 @@ class AdvancedBacktester:
         ann = (1 + trp) ** (1 / n_years) - 1 if trp > -1 else -1
         er = np.diff(ea) / ea[:-1]
         er = er[np.isfinite(er)]
-        sharpe = (np.mean(er) / np.std(er)) * np.sqrt(252) if len(er) > 1 and np.std(er) > 0 else 0.0
+        # Sample std (ddof=1) to match pandas .std() everywhere else in the app,
+        # so the same backtest shows the same Sharpe on every page.
+        sharpe = (np.mean(er) / np.std(er, ddof=1)) * np.sqrt(252) if len(er) > 1 and np.std(er, ddof=1) > 0 else 0.0
         neg_r = er[er < 0]
-        sortino = (np.mean(er) / np.std(neg_r)) * np.sqrt(252) if len(neg_r) > 0 and np.std(neg_r) > 0 else 0.0
+        sortino = (np.mean(er) / np.std(neg_r, ddof=1)) * np.sqrt(252) if len(neg_r) > 1 and np.std(neg_r, ddof=1) > 0 else 0.0
         peak = np.maximum.accumulate(ea)
         dd_curve = (ea - peak) / peak
         max_dd = float(np.abs(np.min(dd_curve)))
@@ -360,7 +369,8 @@ class AdvancedBacktester:
         if w > 5:
             for i in range(w, len(er)):
                 ch = er[i - w:i]
-                rs_vals.append(float(np.mean(ch) / np.std(ch) * np.sqrt(252)) if np.std(ch) > 0 else 0.0)
+                sd = float(np.std(ch, ddof=1))
+                rs_vals.append(float(np.mean(ch) / sd * np.sqrt(252)) if sd > 0 else 0.0)
 
         # Rolling win rate
         rw_vals = []
@@ -383,8 +393,10 @@ class AdvancedBacktester:
             except Exception:
                 pass
 
-        # Benchmark & alpha/beta
-        br = (prices[-1] / prices[0] - 1) if prices[0] > 0 else 0
+        # Benchmark & alpha/beta — benchmark spans the strategy's trading window
+        # (first bar the strategy could trade on through the last bar), so the
+        # buy & hold comparison is apples-to-apples with the equity curve.
+        br = (prices[-1] / prices[bench_start] - 1) if 0 <= bench_start < len(prices) and prices[bench_start] > 0 else 0
         alpha_val = 0.0
         beta_val = 1.0
         ir = 0.0

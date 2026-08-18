@@ -242,19 +242,25 @@ def _calculate_advanced_metrics(returns: pd.Series) -> dict:
     if len(returns) == 0:
         return {}
     
-    # Basic metrics
-    total_return = (1 + returns).prod() - 1
-    annual_return = (1 + total_return) ** (252 / len(returns)) - 1
-    volatility = returns.std() * np.sqrt(252)
-    sharpe = annual_return / volatility if volatility > 0 else 0
+    # Basic metrics. Sharpe/Sortino use the standard definition — mean daily
+    # excess return over the sample std of daily returns, annualized by sqrt(252)
+    # (pandas std, ddof=1) — NOT the annual_return/volatility approximation,
+    # which diverges when returns compound unevenly.
+    r = returns.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(r) == 0:
+        return {}
+    total_return = (1 + r).prod() - 1
+    annual_return = (1 + total_return) ** (252 / len(r)) - 1
+    volatility = r.std() * np.sqrt(252)
+    sharpe = (r.mean() / r.std() * np.sqrt(252)) if r.std() > 0 else 0
     
     # Advanced metrics
-    downside_returns = returns[returns < 0]
-    downside_std = downside_returns.std() * np.sqrt(252) if len(downside_returns) > 0 else 0
-    sortino = annual_return / downside_std if downside_std > 0 else 0
+    downside_returns = r[r < 0]
+    downside_dev = downside_returns.std() if len(downside_returns) > 0 else 0
+    sortino = (r.mean() / downside_dev * np.sqrt(252)) if downside_dev > 0 else 0
     
     # Drawdown
-    cumulative = (1 + returns).cumprod()
+    cumulative = (1 + r).cumprod()
     running_max = cumulative.cummax()
     drawdown = (cumulative - running_max) / running_max
     max_drawdown = drawdown.min()
@@ -263,7 +269,7 @@ def _calculate_advanced_metrics(returns: pd.Series) -> dict:
     calmar = annual_return / abs(max_drawdown) if max_drawdown != 0 else 0
     
     # Win rate
-    win_rate = (returns > 0).sum() / len(returns)
+    win_rate = (r > 0).sum() / len(r)
     
     return {
         "total_return": total_return,
@@ -275,6 +281,137 @@ def _calculate_advanced_metrics(returns: pd.Series) -> dict:
         "calmar_ratio": calmar,
         "win_rate": win_rate
     }
+
+
+# What each alternative-data source actually measures and the mechanism by which
+# it feeds into the company's fundamentals / price. Used to explain every signal
+# in plain language instead of dumping raw numbers.
+_ALT_DATA_MECHANICS = {
+    "satellite": (
+        "Satellite and aerial imagery measure physical activity at the company's operations - "
+        "parking-lot occupancy, storefootfall, shipping-container flows, oil-tank fill levels. "
+        "This is a *leading* indicator: physical activity today typically shows up in same-store "
+        "sales and reported revenue 1-2 quarters ahead."
+    ),
+    "social": (
+        "Social media and forum activity measure retail attention and sentiment toward the ticker. "
+        "Mentions lead trading volume, and a fast-rising sentiment score can pull in momentum "
+        "buyers. At extreme levels the signal flips contrarian: crowd euphoria often marks a top."
+    ),
+    "hiring": (
+        "Job-posting data measures the company's hiring pace, a leading indicator of growth "
+        "plans. Companies staff up 2-3 quarters before revenue materializes, so rising postings "
+        "foreshadow future capacity and sales; aggressive cuts signal cost pressure or weakness."
+    ),
+    "digital": (
+        "Web-traffic data measures customer acquisition and engagement - site visits, app usage, "
+        "and referral sources. Traffic is a high-frequency read on demand: it converts to revenue "
+        "within the same quarter and often moves before quarterly earnings are printed."
+    ),
+    "consumer": (
+        "Card-spending data tracks real consumer purchases at the company (and its peers), the "
+        "closest high-frequency proxy for same-store sales. Spend trends feed top-line growth "
+        "directly and are a reliable near-quarter revenue signal."
+    ),
+    "esg": (
+        "ESG and regulatory intelligence score environmental, social, and governance risk. It "
+        "affects the ticker through the risk premium investors demand: positive scores lower the "
+        "cost of capital and support valuation multiples, while controversies raise regulatory "
+        "and reputational risk and compress multiples."
+    ),
+    "dark pool": (
+        "Dark-pool and off-exchange print data reveal institutional block positioning that is "
+        "invisible on lit order books. Sustained institutional buying (relative to normal) points "
+        "to accumulation ahead of expected news; sustained selling points to distribution."
+    ),
+    "options": (
+        "Options-flow data shows where dealers and speculators are hedging - call/coll flow, "
+        "put/call ratios, and gamma exposure. Heavy call buying pulls dealers into buying the "
+        "stock to hedge (positive drift), while put-heavy flow adds selling pressure. It is a "
+        "near-term supply/demand signal that decays within days."
+    ),
+}
+
+
+def _alt_data_what_it_means(sig) -> str:
+    """In-depth explanation for one alt-data signal: what the reading is saying
+    in plain language, why that source matters for the business, and how it is
+    expected to affect the ticker. Dynamic per signal (uses its real values)."""
+    cat = (sig.category or "").lower()
+    strength = float(getattr(sig, "strength", 0) or 0)
+    z = float(getattr(sig, "z_score", 0) or 0)
+    pct = float(getattr(sig, "percentile", 50) or 50)
+    val = getattr(sig, "value", None)
+    ticker = (sig.ticker or "").upper()
+    direction = (sig.direction or "NEUTRAL").upper()
+
+    # 1) What the data is saying - plain-language interpretation of the reading.
+    if strength >= 75:
+        reading = "an exceptionally strong reading"
+    elif strength >= 60:
+        reading = "a strong reading"
+    elif strength >= 40:
+        reading = "a moderate reading"
+    else:
+        reading = "a weak reading"
+    value_txt = f" (value {val:.1f})" if isinstance(val, (int, float)) and not (isinstance(val, float) and np.isnan(val)) else ""
+    stats_txt = f"z-score {z:+.2f}, {pct:.0f}th percentile" if abs(z) > 0.01 else f"{pct:.0f}th percentile"
+    if direction == "BULLISH":
+        saying = (
+            f"The data shows {reading} in {ticker}'s favor: the underlying metric is "
+            f"running above its normal range ({stats_txt}{value_txt})."
+        )
+    elif direction == "BEARISH":
+        saying = (
+            f"The data shows {reading} AGAINST {ticker}: the underlying metric has "
+            f"deteriorated relative to its normal range ({stats_txt}{value_txt})."
+        )
+    elif direction == "WATCH":
+        saying = (
+            f"The data is flagging unusual activity in {ticker} that has not yet "
+            f"resolved in either direction ({stats_txt}{value_txt}) - worth monitoring."
+        )
+    else:
+        saying = (
+            f"The data is broadly in line with {ticker}'s normal range "
+            f"({stats_txt}{value_txt}) - no directional edge yet."
+        )
+
+    # 2) Why this source matters for the business (mechanism).
+    mechanism = next((txt for key, txt in _ALT_DATA_MECHANICS.items() if key in cat), None)
+    if mechanism is None:
+        mechanism = (
+            "This source tracks a non-standard activity stream for the company; its readings "
+            "lead the fundamentals only when they persist across several periods."
+        )
+
+    # 3) Expected effect on the ticker, given the direction.
+    if direction == "BULLISH":
+        effect = (
+            f"**Expected effect on {ticker}:** if the reading persists, it typically flows into "
+            f"revenue/earnings within the metric's lead window and supports upward revisions - "
+            f"a bullish tailwind for the stock. Confidence {sig.confidence:.0f}%, decays over "
+            f"~{sig.decay_days} days."
+        )
+    elif direction == "BEARISH":
+        effect = (
+            f"**Expected effect on {ticker}:** if the deterioration persists, it typically "
+            f"feeds into weaker reported results and downward revisions - a bearish headwind. "
+            f"Confidence {sig.confidence:.0f}%, decays over ~{sig.decay_days} days."
+        )
+    elif direction == "WATCH":
+        effect = (
+            f"**Expected effect on {ticker}:** unresolved - a break in either direction would "
+            f"likely move the stock as the market prices the new information. Confidence "
+            f"{sig.confidence:.0f}%."
+        )
+    else:
+        effect = (
+            f"**Expected effect on {ticker}:** neutral for now - the signal adds information "
+            f"only when it moves out of its normal range. Confidence {sig.confidence:.0f}%."
+        )
+
+    return f"{saying}\n\n{mechanism}\n\n{effect}"
 
 # 
 # MAIN PORTAL FUNCTION
@@ -335,9 +472,13 @@ def render_quant_portal():
         # auto-runs. Previously the buttons only set a local variable that was
         # discarded on the next rerun, so clicking Stocks/Futures/FX/Crypto did
         # nothing.
+        # Seed the widget's value through Session State (never via the `value=`
+        # parameter): the quick-select buttons write into qp_symbol_input via
+        # on_click callbacks, and Streamlit forbids a widget that has BOTH a
+        # default value and a session-state value.
+        st.session_state.setdefault("qp_symbol_input", "AAPL, MSFT, NVDA")
         symbol_input = st.text_input(
             "Enter Symbols (comma-separated)",
-            value="AAPL, MSFT, NVDA",
             key="qp_symbol_input",
             help="Stocks (AAPL), futures (ES=F), FX (EURUSD=X), crypto (BTC-USD)"
         )
@@ -941,35 +1082,17 @@ def render_quant_portal():
                             )
                             st.plotly_chart(fig, width='stretch')
                     else:
-                        # Fallback: synthetic series so the tab still renders a curve
-                        returns_series = pd.Series(np.random.randn(252) * 0.02)
-                        metrics = _calculate_advanced_metrics(returns_series)
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            _metric_card("Total Return", f"{metrics.get('total_return', 0)*100:.1f}%", "#4caf50")
-                        with col2:
-                            _metric_card("Sharpe Ratio", f"{metrics.get('sharpe_ratio', 0):.2f}", "#2196f3")
-                        with col3:
-                            _metric_card("Max Drawdown", f"{metrics.get('max_drawdown', 0)*100:.1f}%", "#f44336")
-                        with col4:
-                            _metric_card("Win Rate", f"{metrics.get('win_rate', 0)*100:.1f}%", "#ff9800")
-                        st.warning("Insufficient data for the quant-ensemble backtester; showing a synthetic curve.")
-                        cumulative = (1 + returns_series).cumprod() * initial_capital
-                        fig = go.Figure()
-                        fig.add_trace(go.Scatter(
-                            x=cumulative.index,
-                            y=cumulative.values,
-                            mode='lines',
-                            line=dict(color="#2196f3", width=2),
-                            name="Portfolio Value"
-                        ))
-                        fig.update_layout(
-                            title="Equity Curve (synthetic fallback)",
-                            template="plotly_dark",
-                            xaxis_title="Trading Days",
-                            yaxis_title="Portfolio Value ($)"
+                        # Honest no-result path. Previously this rendered RANDOM
+                        # synthetic returns (np.random.randn) as if they were a
+                        # real backtest — a made-up Total Return and Sharpe. Never
+                        # fabricate metrics: say why there is no result instead.
+                        n_bars = 0 if bt_df is None else len(bt_df)
+                        st.warning(
+                            f"Not enough price history for {bt_symbol} ({n_bars} bars fetched; "
+                            "the quant-ensemble backtester needs ~70+ daily bars including "
+                            "a 60-bar signal lookback). Pick a longer period or a different "
+                            "symbol."
                         )
-                        st.plotly_chart(fig, width='stretch')
                     
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -1083,6 +1206,10 @@ def render_quant_portal():
                                             st.markdown(f"<span style='color:#8b949e;font-size:0.85rem;'>"
                                                         f"{sig.description}</span>",
                                                         unsafe_allow_html=True)
+                                        # In-depth interpretation: what the data
+                                        # is actually saying and how it feeds into
+                                        # the ticker's fundamentals / price.
+                                        st.markdown(_alt_data_what_it_means(sig))
                                         st.markdown("")
                         else:
                             st.info("No alternative data signals available")

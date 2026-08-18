@@ -35,6 +35,7 @@ import json
 import math
 import re
 import textwrap
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -2156,14 +2157,30 @@ def build_algorithms(
     if not families:
         families = _DEFAULT_BY_RISK.get(risk, _DEFAULT_BY_RISK["balanced"])
 
-    # fetch data (single-symbol archetypes)
+    # fetch data (single-symbol archetypes). Transient provider outages are
+    # common (yfinance cooldown, stooq timeout), so a symbol is retried once
+    # after a short pause before being declared "insufficient history" — the
+    # retry rides through most hiccups that previously killed the whole build.
     dfs: dict = {}
     fetch_errors: list = []
     for sym in universe[:6]:
+        df = None
+        for attempt in range(2):
+            try:
+                df = data_fn(sym, period=period, interval="1d")
+                if df is None or len(df) < 60:
+                    df = None
+                    raise ValueError(f"insufficient history for {sym}")
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                if attempt == 0:
+                    time.sleep(1.5)  # brief pause; outages often clear in a second
+                else:
+                    fetch_errors.append(f"{sym}: {last_err}")
+        if df is None:
+            continue
         try:
-            df = data_fn(sym, period=period, interval="1d")
-            if df is None or len(df) < 60:
-                raise ValueError(f"insufficient history for {sym}")
             for col in ("Open", "High", "Low", "Close", "Volume"):
                 if col not in df.columns:
                     df[col] = df["Close"] if col == "Close" else df.get(col)

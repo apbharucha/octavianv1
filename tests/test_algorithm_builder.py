@@ -584,6 +584,25 @@ def test_fetch_failure_raises(df_trend):
         build_algorithms("", count=1, universe=["SPY"], data_fn=bad_fn)
 
 
+def test_fetch_retries_transient_failure(df_trend):
+    """Regression: a transient provider outage (first fetch returns too little
+    data, second succeeds) must NOT kill the whole build — the engine retries
+    each symbol once before declaring insufficient history."""
+    calls = {"n": 0}
+
+    def flaky_fn(symbol, period="3y", interval="1d"):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _make_ohlc(n=30, seed=1)  # too short -> triggers retry
+        return df_trend
+
+    res = build_algorithms("", count=1, universe=["SPY"], data_fn=flaky_fn,
+                           runs_per_family=1)
+    assert calls["n"] >= 2, "symbol should have been retried once"
+    assert res, "build should succeed after the retry"
+    assert not any(n.startswith("ERROR:") for r in res for n in r.build_notes)
+
+
 def test_insufficient_history_raises():
     short = _make_ohlc(n=30, seed=1)
     fn = _mk_data_fn(short)
@@ -823,3 +842,65 @@ def test_advanced_backtester_lookback_floor_trades(df_trend):
     assert res.total_return_pct != 0.0 or res.total_trades > 0
     # equity curve is not flat
     assert len(set(res.equity_curve)) > 2
+    # Metrics must be internally consistent (the reported Total Return IS the
+    # equity curve's return; Sharpe matches the sample-std definition):
+    ea = np.array(res.equity_curve, dtype=float)
+    assert abs(res.final_capital - ea[-1]) < 1e-6, "final capital must equal last equity point"
+    assert abs(res.total_return_pct - (ea[-1] / ea[0] - 1)) < 1e-9, \
+        "total return must equal the equity curve's return"
+    er = np.diff(ea) / ea[:-1]
+    exp_sharpe = er.mean() / np.std(er, ddof=1) * np.sqrt(252)
+    assert abs(res.sharpe_ratio - exp_sharpe) < 1e-6, "sharpe must use sample std (ddof=1)"
+    # Benchmark spans the strategy's own window, not the whole series:
+    closes = df["Close"].astype(float).values
+    assert abs(res.benchmark_return - (closes[-1] / closes[59] - 1)) < 1e-6, \
+        "benchmark return must span the strategy window (first traded bar -> end)"
+
+
+def test_advanced_metrics_sharpe_accuracy():
+    """The portal's _calculate_advanced_metrics must use the standard Sharpe
+    definition (mean/std * sqrt(252), pandas ddof=1) — not the annual-return /
+    volatility approximation, which diverges when returns compound unevenly."""
+    from quant_portal import _calculate_advanced_metrics
+
+    rng = np.random.default_rng(7)
+    # non-trivial drift + volatility so the two formulas disagree
+    rets = pd.Series(rng.normal(0.0006, 0.012, 500))
+    m = _calculate_advanced_metrics(rets)
+    expected = rets.mean() / rets.std() * np.sqrt(252)
+    assert abs(m["sharpe_ratio"] - expected) < 1e-9
+    # and it must differ from the old approximation when compounding matters
+    old_approx = m["annual_return"] / m["volatility"] if m["volatility"] > 0 else 0
+    assert abs(m["sharpe_ratio"] - old_approx) > 1e-3
+    # sortino uses the standard downside-deviation definition too
+    dd = rets[rets < 0]
+    exp_sortino = rets.mean() / dd.std() * np.sqrt(252)
+    assert abs(m["sortino_ratio"] - exp_sortino) < 1e-9
+
+
+def test_alt_data_explanation_dynamic():
+    """The in-depth alt-data explanation must be dynamic (uses the signal's own
+    values) and explain both what the data says and its expected effect."""
+    from quant_portal import _alt_data_what_it_means
+    from alternative_data_engine import AltDataSignal
+    from datetime import datetime
+
+    def _sig(category, direction, strength, z, pct, val, ticker="AAPL"):
+        return AltDataSignal(
+            name="x", category=category, ticker=ticker, direction=direction,
+            strength=strength, confidence=60.0, decay_days=14, description="d",
+            z_score=z, percentile=pct, value=val,
+            generated_at=datetime.utcnow().isoformat())
+
+    bull = _alt_data_what_it_means(_sig("Satellite Imagery", "BULLISH", 82.0, 1.4, 92.0, 83.0))
+    assert "AAPL" in bull and "z-score +1.40" in bull
+    assert "Expected effect on AAPL" in bull and "bullish tailwind" in bull
+    assert "parking-lot occupancy" in bull  # mechanism for this source
+
+    bear = _alt_data_what_it_means(_sig("Social / Crowd Intelligence", "BEARISH", 20.0, -1.1, 12.0, -35.0))
+    assert "Expected effect on AAPL" in bear and "bearish headwind" in bear
+    assert "crowd euphoria" in bear  # social mechanism
+
+    neu = _alt_data_what_it_means(_sig("Dark Pool", "NEUTRAL", 50.0, 0.0, 50.0, 0.0))
+    assert "neutral for now" in neu
+    assert "institutional block positioning" in neu

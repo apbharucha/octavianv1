@@ -620,3 +620,7 @@ def test_quant_portal_alt_data_uses_valid_signal_fields():
         # expander contents are nested elements, not top-level markdown
         inner = " ".join(m.value for m in exp[0].markdown)
         assert "Satellite Footfall" in inner and "satellite" in inner.lower()
+        # in-depth explanation (what the data says + expected effect on the
+        # ticker) must render for every signal
+        assert "Expected effect on" in inner, "in-depth alt-data explanation missing"
+        assert "foot traffic" in inner.lower() or "parking-lot" in inner.lower()
