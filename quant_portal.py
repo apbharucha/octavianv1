@@ -488,8 +488,19 @@ def render_quant_portal():
         else:
             symbols = []
         
-        # Quick select buttons — dynamically sampled from the live universe
-        # (never frozen preset lists, so the buttons always reflect the market).
+        # Quick select buttons — “most relevant” assets per class: curated
+        # mega-liquid names first (so clicking Stocks never lands on obscure
+        # alphabetical tickers), then filled out from the live universe so the
+        # buttons still reflect what the universe actually knows.
+        _CURATED = {
+            "stocks": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META",
+                        "TSLA", "AVGO", "JPM", "BRK-B"],
+            "futures": ["ES=F", "NQ=F", "CL=F", "GC=F", "ZN=F", "ZB=F"],
+            "fx": ["EURUSD=X", "USDJPY=X", "GBPUSD=X", "AUDUSD=X",
+                    "USDCAD=X", "USDCHF=X"],
+            "crypto": ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD",
+                        "BNB-USD", "DOGE-USD"],
+        }
         try:
             from ticker_universe import get_ticker_universe
             _tu = get_ticker_universe()
@@ -500,6 +511,17 @@ def render_quant_portal():
             _crypto = _tu.get_crypto()
         except Exception:
             _all_stocks, _futures, _fx, _crypto = [], [], [], []
+
+        def _most_relevant(curated, universe_cands, cap):
+            uni = {str(u).strip().upper() for u in (universe_cands or []) if u}
+            picked = [s for s in curated if s in uni]
+            picked += [s for s in sorted(uni) if s not in picked]
+            return picked[:cap]
+
+        _stocks_pick = _most_relevant(_CURATED["stocks"], _all_stocks, 6)
+        _futures_pick = _most_relevant(_CURATED["futures"], _futures, 4) or _CURATED["futures"][:4]
+        _fx_pick = _most_relevant(_CURATED["fx"], _fx, 4) or _CURATED["fx"][:4]
+        _crypto_pick = _most_relevant(_CURATED["crypto"], _crypto, 3) or _CURATED["crypto"][:3]
 
         def _make_quick_select(family_list):
             """Return an on_click callback that fills the symbol input. Callbacks
@@ -513,16 +535,16 @@ def render_quant_portal():
         col_q1, col_q2, col_q3, col_q4 = st.columns(4)
         with col_q1:
             st.button("Stocks", width='stretch',
-                      on_click=_make_quick_select((_all_stocks or [])[:6]))
+                      on_click=_make_quick_select(_stocks_pick))
         with col_q2:
             st.button("Futures", width='stretch',
-                      on_click=_make_quick_select((_futures or [])[:4]))
+                      on_click=_make_quick_select(_futures_pick))
         with col_q3:
             st.button("FX", width='stretch',
-                      on_click=_make_quick_select((_fx or [])[:4]))
+                      on_click=_make_quick_select(_fx_pick))
         with col_q4:
             st.button("Crypto", width='stretch',
-                      on_click=_make_quick_select((_crypto or [])[:3]))
+                      on_click=_make_quick_select(_crypto_pick))
         
         # If a quick-select button just fired, re-read the symbols it wrote into
         # the box (session state is updated even though this rerun already

@@ -79,7 +79,7 @@ def window_returns(equity: pd.Series) -> dict:
         if len(eq) <= bars:
             out[label] = None
             continue
-        start = eq.iloc[-1 - bars]
+        start = eq.iloc[-bars]
         end = eq.iloc[-1]
         out[label] = float(end / start - 1.0) if start and start > 0 else None
     return out
@@ -104,8 +104,12 @@ def window_metrics(equity: pd.Series, returns: pd.Series, trades: list) -> dict:
         if len(eq) <= bars:
             out[label] = None
             continue
-        eq_w = eq.iloc[-1 - bars:]
-        ret_w = ret.iloc[-1 - bars:]
+        # EXACTLY `bars` observations (last N trading days) for equity AND
+        # returns, so the reported bar count, the mean/std Sharpe and the
+        # window return all use the same slice (previously the slice was
+        # bars+1 points long while the field reported `bars`).
+        eq_w = eq.iloc[-bars:]
+        ret_w = ret.iloc[-bars:]
         total = float(eq_w.iloc[-1] / eq_w.iloc[0] - 1.0) if eq_w.iloc[0] > 0 else 0.0
         sd = float(ret_w.std())
         sharpe = float(ret_w.mean() / sd * math.sqrt(bars_per_year := 252)) if sd > 0 else 0.0
@@ -119,7 +123,7 @@ def window_metrics(equity: pd.Series, returns: pd.Series, trades: list) -> dict:
         else:
             n_trades = 0
         out[label] = {"total_return": total, "sharpe": sharpe, "max_drawdown": dd,
-                      "trades": n_trades}
+                      "trades": n_trades, "bars": int(len(ret_w))}
     return out
 
 
@@ -211,10 +215,12 @@ def trade_narratives(trades: list, df: pd.DataFrame, signal: pd.Series,
             entry_px = t["entry_price"]
             context = (f"5-day drift before entry {drift_5d:+.1f}%"
                        + (f", {vol_txt} vol" if v else ""))
+            who = f"{t.get('symbol', '')} ({t.get('asset_type', '')})" if t.get("symbol") else "the instrument"
+            src = f" [{t.get('source', '')}]" if t.get("source") else ""
             notes.append(
-                f"{t['entry_date']} {t.get('direction', 'LONG')} @ {entry_px:.2f}: entered "
-                f"({context}); {reason_txt} on {t.get('exit_date', '?')} "
-                f"after {t.get('hold_bars', 0)} bar(s) for {pnl_txt}."
+                f"{t['entry_date']} {who} {t.get('direction', 'LONG')}: entered @ "
+                f"{entry_px:.2f} ({context}); {reason_txt} on {t.get('exit_date', '?')} "
+                f"after {t.get('hold_bars', 0)} bar(s) for {pnl_txt}.{src}"
             )
         except Exception:  # never let a narrative crash the build
             continue
@@ -270,6 +276,50 @@ def compute_metrics(returns: pd.Series, equity: pd.Series,
         "years": years,
         "residual_autocorr": residual_autocorr,
     }
+
+
+def classify_asset_type(symbol: str) -> str:
+    """Map a symbol to its asset class for trade attribution.
+
+    * futures   : ...=F (ES=F, NQ=F, CL=F)
+    * FX        : ...=X (EURUSD=X)
+    * crypto    : X-USD / X-XXX style (BTC-USD) or bare well-known coins
+    * index     : ^ prefix (^GSPC)
+    * ETF       : known broad ETFs (SPY/QQQ/IWM/DIA/VTI/VOO/...)
+    * equity    : everything else
+    """
+    s = str(symbol).strip().upper()
+    if s.endswith("=F"):
+        return "Futures"
+    if s.endswith("=X"):
+        return "FX"
+    if s.startswith("^"):
+        return "Index"
+    if "-" in s and s.split("-")[-1] in ("USD", "EUR", "GBP", "JPY", "USDT", "USDC"):
+        return "Crypto"
+    if s in _ETF_LIKE_SYMBOLS:
+        return "ETF"
+    return "Equity"
+
+
+_ETF_LIKE_SYMBOLS = {
+    "SPY", "QQQ", "DIA", "IWM", "VTI", "VOO", "VEA", "VWO", "VGT", "XLK",
+    "XLF", "XLV", "XLE", "XLI", "XLP", "XLU", "XLB", "XLRE", "EEM", "FXI",
+    "EWJ", "EWZ", "INDA", "ICLN", "HACK", "GDX", "GDXJ", "SIL", "COPX",
+    "REMX", "URA", "LIT", "MSOS", "GLD", "SLV", "TLT", "IEF", "AGG", "LQD",
+    "HYG", "VIX", "UVXY", "TQQQ", "SOXL", "SMH", "NVDA",  # NVDA listed below
+}
+_ETF_LIKE_SYMBOLS.discard("NVDA")  # NVDA is a stock, not an ETF
+
+
+def _stamp_trades(trades: list, symbol: str) -> list:
+    """Attach symbol + asset-type to every trade record (in place) so the
+    trade table tells the user what was traded, not just when."""
+    asset = classify_asset_type(symbol)
+    for t in trades:
+        t.setdefault("symbol", symbol)
+        t.setdefault("asset_type", asset)
+    return trades
 
 
 def _lag1_autocorr(s: pd.Series) -> float:
@@ -2014,16 +2064,26 @@ class AlgorithmResult:
                 lines.append(f"| {k} | {v * 100:+.2f}% |" if v is not None else f"| {k} | — |")
         closed_t = [t for t in self.trades if t.get("exit_pnl_pct") is not None]
         if closed_t:
+            has_sym = any(t.get("symbol") for t in closed_t)
+            has_src = any(t.get("source") for t in closed_t)
+            cols = (["Symbol", "Asset type"] if has_sym else []) + \
+                   ["Entry", "Exit", "Side", "P&L %", "Hold", "Exit reason"] + \
+                   (["Source strategy", "Weight"] if has_src else [])
             lines += ["", "## Trade log", "",
-                      "| Entry | Exit | Side | P&L % | Hold | Exit reason |",
-                      "| --- | --- | --- | --- | --- | --- |"]
+                      "| " + " | ".join(cols) + " |",
+                      "| " + " | ".join(["---"] * len(cols)) + " |"]
             for t in closed_t[:100]:
-                lines.append(f"| {t.get('entry_date', '')} | {t.get('exit_date', '')} | "
-                             f"{t.get('direction', '')} | "
-                             f"{t.get('exit_pnl_pct', 0):+.2f}% | "
-                             f"{t.get('hold_bars', 0)} | {t.get('exit_reason', '')} |")
+                cells = [t.get("symbol", ""), t.get("asset_type", "")] if has_sym else []
+                cells += [t.get("entry_date", ""), t.get("exit_date", ""),
+                          t.get("direction", ""),
+                          f"{t.get('exit_pnl_pct', 0):+.2f}%",
+                          f"{t.get('hold_bars', 0)}", t.get("exit_reason", "")]
+                if has_src:
+                    cells += [t.get("source", ""),
+                              f"{t.get('weight', 0) * 100:.1f}%"]
+                lines.append("| " + " | ".join(cells) + " |")
             if len(closed_t) > 100:
-                lines.append(f"| _...and {len(closed_t) - 100} more trades_ | | | | | |")
+                lines.append(f"| _...and {len(closed_t) - 100} more trades_ |" + " |" * (len(cols) - 1))
         if self.trade_narratives:
             lines += ["", "## Trade-by-trade reasoning", ""]
             for n in self.trade_narratives[:60]:
@@ -2243,6 +2303,7 @@ def build_algorithms(
             params = found["params"]
             sig = a["sig"](primary, params)
             full = backtest_ohlcv(primary, sig, bp)
+            full["trades"] = _stamp_trades(full["trades"], primary_sym)
             suffix = f" (run {run + 1}/{runs})" if multi else ""
             notes = [f"Parameters optimized on train window "
                      f"(train Sharpe {found['train_metrics'].get('sharpe', 0):.2f}), "
@@ -2289,6 +2350,25 @@ def build_algorithms(
                          f"get more weight (weaknesses down-weighted)."]
             if ens.get("rationale"):
                 ens_notes.extend(ens["rationale"])
+            # ---- Aggregate the members' discrete trades so the ensemble's
+            # trade count / win rate are REAL (the old behavior computed
+            # return + Sharpe from the blended curve but left trades empty -
+            # a card showing 0 trades with a nonzero return was contradictory).
+            final_w = ens.get("final_weights") or {}
+            ens_trades = []
+            for m in members:
+                w = float(final_w.get(m.name, 1.0 / max(len(members), 1)))
+                for t in m.trades or []:
+                    t2 = dict(t)
+                    t2["source"] = m.name
+                    t2["weight"] = round(w, 4)
+                    t2.setdefault("symbol", primary_sym)
+                    t2.setdefault("asset_type", classify_asset_type(primary_sym))
+                    ens_trades.append(t2)
+            ens_trades.sort(key=lambda t: t.get("entry_date", "") or "")
+            ens_metrics = compute_metrics(ens["returns"], ens["equity"],
+                                          trades=ens_trades,
+                                          bars_per_year=BARS_PER_YEAR)
             results.append(AlgorithmResult(
                 name=f"ENSEMBLE-{len(members)}-strategies", family="ensemble",
                 archetype="ensemble", params={"method": method,
@@ -2309,13 +2389,14 @@ def build_algorithms(
                             "wealth tilted by measured quality (Sharpe, drawdown, win rate, "
                             "trade robustness) and penalized for cross-member correlation — "
                             "maximizing each member's strengths while down-weighting its "
-                            "weaknesses."),
-                equity=ens["equity"], returns=ens["returns"], metrics=ens["metrics"],
-                trades=[], train_metrics=None, test_metrics=None,
-                universe=[primary_sym], ensemble_weights=ens["final_weights"],
+                            "weaknesses. Trade count/win rate are the aggregated constituent "
+                            "trades (each labeled with its source strategy and blend weight)."),
+                equity=ens["equity"], returns=ens["returns"], metrics=ens_metrics,
+                trades=ens_trades, train_metrics=None, test_metrics=None,
+                universe=[primary_sym], ensemble_weights=final_w,
                 members=[m.name for m in members],
                 window_returns=window_returns(ens["equity"]),
-                window_metrics=window_metrics(ens["equity"], ens["returns"], []),
+                window_metrics=window_metrics(ens["equity"], ens["returns"], ens_trades),
                 build_notes=ens_notes))
     return results
 

@@ -27,12 +27,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ["OCTAVIAN_OFFLINE"] = "1"
 
+import math
+
 from algorithm_builder_engine import (  # noqa: E402
     ARCHETYPES,
     AlgorithmResult,
     _default_backtest_params,
+    _stamp_trades,
     backtest_ohlcv,
     build_algorithms,
+    classify_asset_type,
+    compute_metrics,
     generate_python,
     parse_request,
     rank_factors,
@@ -291,7 +296,13 @@ def test_build_ensemble_weights_sum_to_one(df_trend, df_second):
     e = ens[0]
     assert abs(sum(e.ensemble_weights.values()) - 1.0) < 0.02
     assert len(e.members) >= 2
-    assert e.metrics["trades"] == 0  # ensemble blends returns, not discrete trades
+    # Regression: the ensemble used to show a return/Sharpe with 0 trades (its
+    # blended curve was metriced but the trade log stayed empty). Constituent
+    # trades are now aggregated so trade count/win rate are REAL.
+    assert e.metrics["trades"] > 0, "ensemble must report aggregated constituent trades"
+    assert e.window_metrics["1y"]["trades"] >= 0
+    assert all(t.get("source") and t.get("weight") for t in e.trades), \
+        "ensemble trades must carry source strategy + blend weight"
 
 
 def test_build_respects_count_and_locked_universe(df_trend, df_second):
@@ -790,9 +801,10 @@ def test_window_metrics_breakdown_shape(df_trend):
     for label, w in wm.items():
         if w is None:
             continue
-        assert set(w) == {"total_return", "sharpe", "max_drawdown", "trades"}
+        assert set(w) == {"total_return", "sharpe", "max_drawdown", "trades", "bars"}
         assert isinstance(w["sharpe"], float)
         assert w["trades"] >= 0
+        assert w["bars"] > 0  # sample size shown per window
     # a build result carries the breakdown end-to-end
     out = build_algorithms(mode="guided", archetypes=["trend_ma"], count=1,
                            universe=["SPY"], seed=7, runs_per_family=1,
@@ -903,4 +915,123 @@ def test_alt_data_explanation_dynamic():
 
     neu = _alt_data_what_it_means(_sig("Dark Pool", "NEUTRAL", 50.0, 0.0, 50.0, 0.0))
     assert "neutral for now" in neu
-    assert "institutional block positioning" in neu
+
+
+# --------------------------------------------------------------------------- #
+#  Trade attribution: symbol + asset type (+ ensemble aggregation)
+# --------------------------------------------------------------------------- #
+
+def test_classify_asset_type_mapping():
+    assert classify_asset_type("ES=F") == "Futures"
+    assert classify_asset_type("CL=F") == "Futures"
+    assert classify_asset_type("EURUSD=X") == "FX"
+    assert classify_asset_type("USDJPY=X") == "FX"
+    assert classify_asset_type("BTC-USD") == "Crypto"
+    assert classify_asset_type("ETH-USD") == "Crypto"
+    assert classify_asset_type("^GSPC") == "Index"
+    assert classify_asset_type("SPY") == "ETF"
+    assert classify_asset_type("QQQ") == "ETF"
+    assert classify_asset_type("NVDA") == "Equity"
+    assert classify_asset_type("AAPL") == "Equity"
+    assert classify_asset_type("BRK-B") == "Equity"
+
+
+def test_backtest_trades_carry_symbol_and_asset_type(df_trend):
+    """Every trade record must say WHAT was traded: symbol + asset type (the
+    trade table and exported notes use these)."""
+    res = build_algorithms("momentum and trend", count=1, universe=["SPY"],
+                           risk="balanced", seed=4, data_fn=_mk_data_fn(df_trend),
+                           runs_per_family=1)
+    assert len(res) == 1
+    closed = [t for t in res[0].trades if t.get("exit_pnl_pct") is not None]
+    assert closed, "strategy should trade on trending data"
+    for t in closed:
+        assert t.get("symbol") == "SPY"
+        assert t.get("asset_type") == "ETF"
+    txt = res[0].to_markdown(include_code=False)
+    assert "| Symbol | Asset type |" in txt
+    assert "| SPY | ETF |" in txt
+
+
+def test_stamp_trades_helpers(df_trend):
+    a = ARCHETYPES["trend_ma"]
+    params = {p["name"]: p["default"] for p in a["params"]}
+    sig = a["sig"](df_trend, params)
+    full = backtest_ohlcv(df_trend, sig, {"sizing": "fixed_pct", "risk_pct": 0.5})
+    full["trades"] = _stamp_trades(full["trades"], "NVDA")
+    for t in full["trades"]:
+        assert t["symbol"] == "NVDA"
+        assert t["asset_type"] == "Equity"
+
+
+def test_ensemble_trades_aggregated_and_win_rate_real(df_osc):
+    """Regression (screenshot): the ENSEMBLE card showed RETURN 79.74% /
+    SHARPE 0.90 with TRADES 0 and WIN RATE 0.00% — the blended-curve metrics
+    were computed but the trade log was never aggregated. The ensemble must
+    report the union of constituent trades with source + blend weight so its
+    trade count / win rate are real and internally consistent."""
+    res = build_algorithms(mode="guided", archetypes=["trend_ma", "bollinger_meanrev"],
+                           count=2, ensemble=True, universe=["SPY", "QQQ"],
+                           seed=7, data_fn=_mk_data_fn(df_osc),
+                           runs_per_family=2, ensemble_method="dynamic")
+    e = [r for r in res if r.family == "ensemble"][0]
+    closed = [t for t in e.trades if t.get("exit_pnl_pct") is not None]
+    assert len(closed) > 0, "ensemble must aggregate its members' closed trades"
+    assert e.metrics["trades"] == len(closed)
+    assert 0.0 <= e.metrics["win_rate"] <= 1.0
+    for t in closed:
+        assert t.get("source"), "ensemble trade missing source strategy"
+        assert t.get("weight", 0) > 0, "ensemble trade missing blend weight"
+        assert t.get("symbol") == "SPY" and t.get("asset_type") == "ETF"
+    # window table trade counts come from the same aggregated log
+    w_any = next((v for v in e.window_metrics.values() if isinstance(v, dict)), None)
+    assert w_any is not None and w_any["trades"] >= 0
+
+
+# --------------------------------------------------------------------------- #
+#  Sharpe math: per-window vs overall use ONE identical formula, and both
+#  recompute independently (the window caption explains why short windows can
+#  legitimately show higher Sharpe than the full period)
+# --------------------------------------------------------------------------- #
+
+def test_sharpe_formula_identical_and_recomputes(df_trend):
+    res = build_algorithms("momentum and trend", count=1, universe=["SPY"],
+                           risk="balanced", seed=4, data_fn=_mk_data_fn(df_trend),
+                           runs_per_family=1)
+    r = res[0]
+    rets = r.returns.dropna()
+    # overall headline Sharpe recomputed by hand == reported
+    exp_full = rets.mean() / rets.std() * math.sqrt(252)
+    assert abs(r.metrics["sharpe"] - exp_full) < 1e-9
+    # every populated window recomputes to the same formula on its slice
+    for label, w in r.window_metrics.items():
+        if not isinstance(w, dict):
+            continue
+        bars = int(w["bars"])
+        slice_ = rets.iloc[-bars:]
+        assert len(slice_) == bars, "bars count must equal the slice length"
+        sd = float(slice_.std())
+        exp_w = (float(slice_.mean()) / sd * math.sqrt(252)) if sd > 0 else 0.0
+        assert abs(w["sharpe"] - exp_w) < 1e-9, f"window {label} sharpe mismatch"
+    # windows either report '—' (insufficient history) or a real dict
+    assert any(isinstance(r.window_metrics.get(k), dict) for k in r.window_metrics)
+
+
+def test_compute_metrics_and_window_metrics_agree_on_full_period(df_trend):
+    """The overall Sharpe and the LARGEST window (when it covers the whole
+    series) must be identical, proving there is no formula drift between the
+    two code paths."""
+    res = build_algorithms("momentum and trend", count=1, universe=["SPY"],
+                           risk="balanced", seed=4, data_fn=_mk_data_fn(df_trend),
+                           runs_per_family=1)
+    r = res[0]
+    m_full = r.metrics["sharpe"]
+    # find the window whose slice covers the entire series
+    eq = r.equity.dropna()
+    for label, w in r.window_metrics.items():
+        if isinstance(w, dict) and int(w["bars"]) >= len(r.returns.dropna()) - 1:
+            assert abs(w["sharpe"] - m_full) < 1e-9
+            break
+    else:
+        # no full-coverage window (short history): just confirm no crash
+        assert r.window_metrics

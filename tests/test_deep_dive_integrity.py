@@ -252,7 +252,7 @@ def test_dcf_deferred_without_fundamentals():
 
 def test_dcf_mechanics_three_scenarios_and_sensitivity():
     txt, fvs = _dd_real_dcf("NVDA", FUND, 225.16, 0.061, 0.095, 0.028, True, True)
-    assert set(fvs) == {"Bear", "Base", "Bull"}
+    assert {"Bear", "Base", "Bull"}.issubset(set(fvs))
     # conservative DCF anchor below market, Bear < Base < Bull
     assert fvs["Bear"] < fvs["Base"] < fvs["Bull"]
     assert "WACC \u00d7 terminal-growth sensitivity" in txt
@@ -407,12 +407,15 @@ def test_bayesian_posteriors_renormalize_to_100():
     sec = _section(out, "### 15. Bayesian Update Engine")
     rows = 0
     for ln in sec.splitlines():
-        m = re.match(r"^\| [A-Z].*\| \d+%/\d+%/\d+% \| [\d.]+/[\d.]+/[\d.]+ \| (\d+)%/(\d+)%/(\d+)% \|$", ln)
+        m = re.match(r"^\| [A-Z].*\| \d+%/\d+%/\d+% \| [\d.]+/[\d.]+/[\d.]+ \| "
+                     r"(\d+)%/(\d+)%/(\d+)% \|", ln)
         if m:
             rows += 1
             total = int(m.group(1)) + int(m.group(2)) + int(m.group(3))
             assert 99 <= total <= 101, f"posterior does not sum to 100: {ln}"
     assert rows >= 10, "fewer than 10 evidence events"
+    assert "Evidence basis" in sec
+    assert "calibration caveat" in sec
 
 
 # --------------------------------------------------------------------------- #
@@ -445,9 +448,13 @@ def test_qc_audit_verdict_present_both_paths():
     for fund in (None, FUND):
         out = _memo(fund=fund)
         sec = _section(out, "### 20. Quality Control Audit")
-        assert "AUDIT PASS" in sec or "ANALYSIS INCOMPLETE" in sec
-        assert "Scenario probabilities sum to 100%" in sec
-        assert "Bayesian updating performed" in sec
+        assert "AUDIT PASS" in sec or "ANALYSIS INCOMPLETE" in sec or "AUDIT PARTIAL PASS" in sec
+        assert "QC1 scenario probabilities sum to 100%" in sec
+        assert "QC12 Bayesian updating performed with disclosed likelihood basis" in sec
+        if fund:
+            # with REPORTED income statement but NO cash-flow statement the
+            # DCF is PARTIAL and the audit must say so (never a blanket PASS)
+            assert "QC8" in sec and "DCF STATUS: PARTIAL" in sec
 
 
 # --------------------------------------------------------------------------- #
@@ -543,6 +550,162 @@ def test_varied_queries_build_complete_memos(query, tickers):
     for sec in ("### 2. Data Completeness Gate", "### 13. Five-Scenario Engine",
                 "### 20. Quality Control Audit"):
         assert sec in out, f"missing {sec}"
+
+
+# --------------------------------------------------------------------------- #
+#  18. REVIEW FIX 1: DCF is gated (BLOCKED / PARTIAL) — never a pseudo-DCF
+#      when the financial statements behind FCF are unavailable
+# --------------------------------------------------------------------------- #
+
+def test_dcf_blocked_without_fundamentals_explicit_status():
+    txt, fvs = _dd_real_dcf("NVDA", {}, 225.16, 0.061, 0.095, 0.028, True, False)
+    assert "DCF STATUS: BLOCKED - INSUFFICIENT VERIFIED FINANCIAL DATA" in txt
+    assert fvs == {}
+
+
+def test_dcf_partial_status_never_presents_fcf_as_reported():
+    txt, fvs = _dd_real_dcf("NVDA", FUND, 225.16, 0.061, 0.095, 0.028, True, True)
+    assert "DCF STATUS: PARTIAL" in txt
+    assert "cash-flow statement DATA UNAVAILABLE" in txt
+    assert "ASSUMED reinvestment" in txt
+    assert txt.count("MODEL ASSUMPTION") >= 2
+    # the site's own DCF tool is the engine behind the numbers
+    assert "InstitutionalDCFEngine" in txt
+    assert fvs.get("status") == "partial" and fvs.get("cash_flow_verified") is False
+    assert fvs.get("engine") == "InstitutionalDCFEngine"
+
+
+def test_qc_audit_fails_cash_flow_check_and_never_blanket_passes():
+    out = _memo(fund=FUND)
+    sec = _section(out, "### 20. Quality Control Audit")
+    assert "AUDIT PARTIAL PASS" in sec
+    assert "QC8" in sec and "FAIL" in sec
+    assert "DCF STATUS: PARTIAL" in sec
+    assert "quantitative reconciliation" in _section(out, "### 20. Quality Control Audit").lower() \
+        or "QUANTITATIVE CHECK(S) FAILED" in sec
+
+
+# --------------------------------------------------------------------------- #
+#  19. REVIEW FIX 2: proper multi-variable reverse DCF (FCF growth != revenue
+#      growth); REVIEW FIX 3-4: expected return + drawdown probabilities are
+#      single-source and internally consistent across sections 13/14/19
+# --------------------------------------------------------------------------- #
+
+def test_reverse_dcf_is_multivariable_and_distinguishes_fcf_vs_revenue_growth():
+    out = _memo(fund=FUND)
+    sec = _section(out, "### 7. Reverse DCF")
+    assert "Implied revenue CAGR | Implied EBIT margin | Implied FCF growth" in sec
+    m = re.search(r"\| ([\d.]+%) \| ([\d.]+%) \| ([\d.]+%) \|", sec)
+    assert m, "reverse-DCF row missing"
+    rev_cagr, ebit, fcf_g = (float(x.strip("%")) for x in m.groups())
+    assert ebit > 0 and rev_cagr >= 0
+    # the whole point of a multi-variable solve: implied FCF growth and implied
+    # revenue growth are DIFFERENT numbers, and the memo says so explicitly
+    assert "DIFFERENT numbers" in sec
+    assert "classic reverse-DCF error" in sec
+    assert "g_implied = WACC - normalized FCF yield" in sec  # coarse frame kept as secondary
+
+
+def test_expected_return_consistent_across_sections():
+    out = _memo(fund=FUND)
+    s13 = _section(out, "### 13. Five-Scenario Engine")
+    s19 = _section(out, "### 19. Final Investment Committee Output")
+    m13 = re.search(r"expected return: ([+-][\d.]+%)", s13)
+    m19 = re.search(r"12-month expected return: \*\*([+-][\d.]+%)\*\*", s19)
+    assert m13 and m19
+    assert m13.group(1) == m19.group(1), "sections 13 and 19 disagree on expected return"
+    # recompute from the printed scenario rows (independence check)
+    rets = []
+    for ln in _section(out, "### 13. Five-Scenario Engine").splitlines():
+        m = re.match(r"^\| (Extreme Bull|Bull|Base|Bear|Extreme Bear) \| (\d+)% \|.*\| ([+-][\d.]+%) \|$", ln)
+        if m:
+            rets.append((int(m.group(2)) / 100.0, float(m.group(3).strip("%")) / 100.0))
+    rec = sum(p * r for p, r in rets)
+    assert abs(rec - float(m13.group(1).strip("%")) / 100.0) < 0.006, rets
+    # the committee never says "positive expected return" regardless of sign
+    assert "Probability-weighted expected return positive" not in s19
+
+
+def test_drawdown_probabilities_match_scenario_distribution():
+    out = _memo(fund=FUND)
+    s13 = _section(out, "### 13. Five-Scenario Engine")
+    s14 = _section(out, "### 14. Monte Carlo / Distribution Engine")
+    s19 = _section(out, "### 19. Final Investment Committee Output")
+    row = {}
+    for ln in s13.splitlines():
+        m = re.match(r"^\| (Extreme Bull|Bull|Base|Bear|Extreme Bear) \| (\d+)% \|.*\| ([+-][\d.]+%) \|$", ln)
+        if m:
+            row[m.group(1)] = (int(m.group(2)) / 100.0, float(m.group(3).strip("%")) / 100.0)
+    exp_dd30 = sum(p for p, r in row.values() if r <= -0.30)
+    exp_dd50 = sum(p for p, r in row.values() if r <= -0.50)
+    m13 = re.search(r">30% drawdown: (\d+)%; >50% drawdown: (\d+)%\.", s13)
+    m19a = re.search(r">30% drawdown: \*\*(\d+)%\*\*", s19)
+    m19b = re.search(r">50% drawdown: \*\*(\d+)%\*\*", s19)
+    m14a = re.search(r">30% loss: \*\*(\d+)%\*\*", s14)
+    m14b = re.search(r">50% loss: \*\*(\d+)%\*\*", s14)
+    assert m13 and m19a and m19b and m14a and m14b
+    got = (int(m13.group(1)), int(m13.group(2)))
+    got19 = (int(m19a.group(1)), int(m19b.group(1)))
+    got14 = (int(m14a.group(1)), int(m14b.group(1)))
+    assert got == got19 == got14, f"drawdown probs disagree: {got} vs {got19} vs {got14}"
+    assert abs(got[0] / 100.0 - exp_dd30) < 0.01 and abs(got[1] / 100.0 - exp_dd50) < 0.01
+
+
+# --------------------------------------------------------------------------- #
+#  20. REVIEW FIX 5: scenario margins move with growth (operating leverage),
+#      REVIEW FIX 6: price is time-stamped, REVIEW FIX 7: macro transmission
+#      ranges are labeled assumptions + WACC shock is a MODEL CALCULATION
+# --------------------------------------------------------------------------- #
+
+def test_scenario_margins_move_with_growth_operating_leverage():
+    out = _memo(fund=FUND)
+    sec = _section(out, "### 13. Five-Scenario Engine")
+    marg = {}
+    for ln in sec.splitlines():
+        m = re.match(r"^\| (Extreme Bull|Bull|Base|Bear|Extreme Bear) \| \d+% \|", ln)
+        if m:
+            parts = [p.strip() for p in ln.split("|")]
+            # columns: name, prob, revenue, growth, margin, eps, fcf, mult, price, ret
+            marg[m.group(1)] = float(parts[5].rstrip("%"))
+    assert marg["Extreme Bear"] < marg["Bear"] < marg["Base"] < marg["Bull"] < marg["Extreme Bull"]
+    # operating leverage: margin delta is a small fraction of the growth delta
+    span = marg["Extreme Bull"] - marg["Extreme Bear"]
+    assert 2.0 < span < 10.0, f"margin span {span:.1f}pp should be material but sane"
+    assert "operating leverage" in sec.lower()
+
+
+def test_price_is_timestamped_with_source():
+    out = _memo(live={"NVDA": {"price": 225.16, "change_5d": 3.52,
+                                "quote_date": "2026-08-18",
+                                "source": "yfinance 5d daily close (delayed/end-of-day)"}},
+                 fund=FUND)
+    head = next(l for l in out.splitlines() if "Current price:" in l)
+    assert "as of 2026-08-18" in head and "yfinance" in head
+    s19 = _section(out, "### 19. Final Investment Committee Output")
+    assert "as of" in s19 and "OBSERVED DATA" in s19
+
+
+def test_macro_transmission_labels_ranges_and_shows_wacc_shock():
+    out = _memo(fund=FUND)
+    sec = _section(out, "### 9. Macro Transmission Engine")
+    assert "SCENARIO ASSUMPTION" in sec
+    assert "not regressions" in sec or "Why these are assumptions" in sec
+    # the only empirically-anchored number: +100bps WACC shock from section 6
+    assert "MODEL CALCULATION, sec. 6" in sec or "MODEL CALCULATION from the section-6 DCF" in sec
+    assert "+100bps WACC" in sec
+
+
+# --------------------------------------------------------------------------- #
+#  21. REVIEW FIX 8: Bayesian basis column + honest calibration caveat
+# --------------------------------------------------------------------------- #
+
+def test_bayesian_has_evidence_basis_and_honesty_note():
+    out = _memo(fund=None)
+    sec = _section(out, "### 15. Bayesian Update Engine")
+    assert "Evidence basis" in sec
+    assert "calibration caveat" in sec
+    assert "decision framework" in sec
+    assert "MODEL ASSUMPTIONS" in sec
 
 
 def test_empty_live_data_still_builds():

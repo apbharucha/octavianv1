@@ -567,9 +567,22 @@ def test_quant_portal_quick_select_buttons_fill_symbols():
         at.run()
         exc = [str(e.value) for e in at.exception]
         assert not exc, f"Stocks quick-select raised: {exc[:2]}"
-        # the click wrote into the symbol box (session state)
+        # the click wrote into the symbol box (session state), and it must be
+        # the MOST RELEVANT names for the class (curated mega-liquids first,
+        # not arbitrary alphabetical tickers)
         box = st_session_text(at, "Enter Symbols")
         assert box and box.strip() != "", "quick-select should fill the symbol box"
+        first = box.split(",")[0].strip().upper()
+        assert first == "AAPL", f"Stocks button should lead with a mega-cap, got {first}"
+        assert {"AAPL", "MSFT", "NVDA"}.issubset({s.strip().upper() for s in box.split(",")})
+        # Crypto button must lead with the most relevant coins
+        for b in at.button:
+            if b.label == "Crypto":
+                b.click()
+                at.run()
+                break
+        box2 = st_session_text(at, "Enter Symbols")
+        assert box2.strip().upper().startswith("BTC-USD"), box2
 
 
 def st_session_text(at, label):

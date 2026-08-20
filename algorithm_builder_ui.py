@@ -129,7 +129,7 @@ def _render_window_breakdown(r: AlgorithmResult) -> None:
         w = r.window_metrics.get(label)
         if not isinstance(w, dict):
             rows.append({"Window": label, "Return": "—", "Sharpe": "—",
-                         "Max DD": "—", "Trades": "—"})
+                         "Max DD": "—", "Trades": "—", "Bars": "—"})
             continue
         rows.append({
             "Window": label,
@@ -137,13 +137,23 @@ def _render_window_breakdown(r: AlgorithmResult) -> None:
             "Sharpe": f"{w.get('sharpe', 0):.2f}",
             "Max DD": f"{w.get('max_drawdown', 0) * 100:.1f}%",
             "Trades": f"{w.get('trades', 0)}",
+            "Bars": f"{w.get('bars', 0)}",
         })
     st.markdown("**Return / risk by time window**")
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption("Every window uses the same formula as the headline metrics: "
+               "mean/std of the window's daily returns \u00d7 \u221a252, max DD on the "
+               "trailing equity. Short windows (1m/3m/6m) hold very few trades, so "
+               "their Sharpe is a small-sample estimate and can sit above the "
+               "full-period Sharpe \u2014 the headline period also includes the "
+               "pre-first-trade cash stretch and any early chop, which drags its "
+               "denominator. Bars = trading days in the window.")
 
 
 def _render_trade_table(r: AlgorithmResult) -> None:
-    """Trade-by-trade table with best / worst / riskiest highlights."""
+    """Trade-by-trade table with best / worst / riskiest highlights. Shows the
+    symbol + asset type of every trade (and source strategy + blend weight for
+    the ensemble's aggregated constituent trades)."""
     closed = [t for t in r.trades if t.get("exit_pnl_pct") is not None]
     if not closed:
         return
@@ -153,9 +163,20 @@ def _render_trade_table(r: AlgorithmResult) -> None:
         "entry_price": "Entry Px", "exit_pnl_pct": "P&L %",
         "hold_bars": "Hold (bars)", "exit_reason": "Exit reason",
     })
-    cols = [c for c in ("Entry", "Exit", "Side", "Entry Px", "P&L %",
-                        "Hold (bars)", "Exit reason") if c in df.columns]
+    df = df.rename(columns={"symbol": "Symbol", "asset_type": "Asset type",
+                            "source": "Source strategy", "weight": "Weight"})
+    has_sym = "Symbol" in df.columns and bool(df["Symbol"].notna().any())
+    has_src = "Source strategy" in df.columns and bool(df["Source strategy"].notna().any())
+    pre = [c for c in ("Symbol", "Asset type") if has_sym and c in df.columns]
+    post = [c for c in ("Source strategy", "Weight") if has_src and c in df.columns]
+    cols = pre + [c for c in ("Entry", "Exit", "Side", "Entry Px", "P&L %",
+                              "Hold (bars)", "Exit reason") if c in df.columns] + post
     df = df[cols]
+    sym_col = df["Symbol"] if "Symbol" in df.columns else None
+
+    def _who(i):
+        return f"{sym_col.iloc[i]} " if sym_col is not None else ""
+
     pnl_num = df["P&L %"].astype(float)
     hold_num = df["Hold (bars)"].astype(float).clip(lower=1.0)
     df["P&L %"] = pnl_num.map(lambda v: f"{v:+.2f}%")
@@ -168,19 +189,24 @@ def _render_trade_table(r: AlgorithmResult) -> None:
             best, worst = df.loc[best_idx], df.loc[worst_idx]
             risky = df.loc[risky_idx]
             st.markdown(
-                f"<span style='color:{GREEN};'>▲ Best: {best['Entry']} → "
+                f"<span style='color:{GREEN};'>▲ Best: {_who(best_idx)}{best['Entry']} → "
                 f"{best['Exit']} ({best['Side']}) {best['P&L %']} "
                 f"via {best['Exit reason']}</span> · "
-                f"<span style='color:{RED};'>▼ Worst: {worst['Entry']} → "
+                f"<span style='color:{RED};'>▼ Worst: {_who(worst_idx)}{worst['Entry']} → "
                 f"{worst['Exit']} ({worst['Side']}) "
                 f"{worst['P&L %']} via {worst['Exit reason']}</span>",
                 unsafe_allow_html=True)
             st.markdown(
-                f"<span style='color:{MUTED};'>⚠ Riskiest: {risky['Entry']} → {risky['Exit']} "
-                f"({risky['Side']}) {risky['P&L %']} over {risky['Hold (bars)']} bars "
-                f"({risk_eff.loc[risky_idx]:+.2f}%/bar)</span>",
+                f"<span style='color:{MUTED};'>⚠ Riskiest: {_who(risky_idx)}{risky['Entry']} → "
+                f"{risky['Exit']} ({risky['Side']}) {risky['P&L %']} over {risky['Hold (bars)']} "
+                f"bars ({risk_eff.loc[risky_idx]:+.2f}%/bar)</span>",
                 unsafe_allow_html=True)
         st.dataframe(df, use_container_width=True, hide_index=True)
+        if has_src:
+            st.caption("Ensemble trades are the aggregated constituent trades (each "
+                       "labeled with its source strategy and the strategy's blend weight); "
+                       "returns come from the blended curve, win rate/count from the "
+                       "constituent union.")
 
 
 def _render_factor_ranking(universe: list) -> None:
