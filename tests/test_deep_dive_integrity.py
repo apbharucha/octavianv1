@@ -453,8 +453,9 @@ def test_qc_audit_verdict_present_both_paths():
         assert "QC12 Bayesian updating performed with disclosed likelihood basis" in sec
         if fund:
             # with REPORTED income statement but NO cash-flow statement the
-            # DCF is PARTIAL and the audit must say so (never a blanket PASS)
-            assert "QC8" in sec and "DCF STATUS: PARTIAL" in sec
+            # DCF is CONDITIONAL/ASSUMPTION-BASED and the audit must say so
+            # (never a blanket PASS)
+            assert "QC8" in sec and "DCF STATUS: CONDITIONAL" in sec
 
 
 # --------------------------------------------------------------------------- #
@@ -565,13 +566,17 @@ def test_dcf_blocked_without_fundamentals_explicit_status():
 
 def test_dcf_partial_status_never_presents_fcf_as_reported():
     txt, fvs = _dd_real_dcf("NVDA", FUND, 225.16, 0.061, 0.095, 0.028, True, True)
-    assert "DCF STATUS: PARTIAL" in txt
+    assert "DCF STATUS: CONDITIONAL" in txt
+    assert "ASSUMPTION-BASED" in txt
     assert "cash-flow statement DATA UNAVAILABLE" in txt
-    assert "ASSUMED reinvestment" in txt
+    assert "ASSUMED reinvestment" in txt or "reinvestment assumptions" in txt
+    # the DCF must state its EXACT reinvestment formulas (the review's DCF
+    # labeling fix: NWC is a % of the CHANGE in revenue, not of total revenue)
+    assert "x \u0394Revenue" in txt or "\u0394Revenue" in txt
     assert txt.count("MODEL ASSUMPTION") >= 2
     # the site's own DCF tool is the engine behind the numbers
     assert "InstitutionalDCFEngine" in txt
-    assert fvs.get("status") == "partial" and fvs.get("cash_flow_verified") is False
+    assert fvs.get("status") == "conditional" and fvs.get("cash_flow_verified") is False
     assert fvs.get("engine") == "InstitutionalDCFEngine"
 
 
@@ -580,7 +585,7 @@ def test_qc_audit_fails_cash_flow_check_and_never_blanket_passes():
     sec = _section(out, "### 20. Quality Control Audit")
     assert "AUDIT PARTIAL PASS" in sec
     assert "QC8" in sec and "FAIL" in sec
-    assert "DCF STATUS: PARTIAL" in sec
+    assert "DCF STATUS: CONDITIONAL" in sec
     assert "quantitative reconciliation" in _section(out, "### 20. Quality Control Audit").lower() \
         or "QUANTITATIVE CHECK(S) FAILED" in sec
 
@@ -638,17 +643,24 @@ def test_drawdown_probabilities_match_scenario_distribution():
             row[m.group(1)] = (int(m.group(2)) / 100.0, float(m.group(3).strip("%")) / 100.0)
     exp_dd30 = sum(p for p, r in row.values() if r <= -0.30)
     exp_dd50 = sum(p for p, r in row.values() if r <= -0.50)
-    m13 = re.search(r">30% drawdown: (\d+)%; >50% drawdown: (\d+)%\.", s13)
-    m19a = re.search(r">30% drawdown: \*\*(\d+)%\*\*", s19)
-    m19b = re.search(r">50% drawdown: \*\*(\d+)%\*\*", s19)
-    m14a = re.search(r">30% loss: \*\*(\d+)%\*\*", s14)
-    m14b = re.search(r">50% loss: \*\*(\d+)%\*\*", s14)
+    # new wording (review fix 10): modeled probabilities are explicitly "within
+    # defined scenarios" - never stated as empirical probabilities
+    m13 = re.search(r"modeled P\(>30% drawdown\): \*\*(\d+)%\*\* within defined scenarios; modeled P\(>50% drawdown\): \*\*(\d+)%\*\*", s13)
+    m19a = re.search(r"Modeled P\(>30% drawdown\): \*\*(\d+)%\*\* within defined scenarios", s19)
+    m19b = re.search(r"Modeled P\(>50% drawdown\): \*\*(\d+)%\*\* within defined scenarios", s19)
+    m14a = re.search(r"Modeled P\(>30% loss\): \*\*(\d+)%\*\* within defined scenarios", s14)
+    m14b = re.search(r"Modeled P\(>50% loss\): \*\*(\d+)%\*\* within defined scenarios", s14)
     assert m13 and m19a and m19b and m14a and m14b
     got = (int(m13.group(1)), int(m13.group(2)))
     got19 = (int(m19a.group(1)), int(m19b.group(1)))
     got14 = (int(m14a.group(1)), int(m14b.group(1)))
     assert got == got19 == got14, f"drawdown probs disagree: {got} vs {got19} vs {got14}"
     assert abs(got[0] / 100.0 - exp_dd30) < 0.01 and abs(got[1] / 100.0 - exp_dd50) < 0.01
+    # every drawdown probability must carry the "within defined scenarios"
+    # qualifier plus an explicit empirical-probability DATA UNAVAILABLE
+    assert "mpirical probability" in s13.lower() or "empirical" in s13.lower()
+    assert "mpirical probability" in s19.lower() or "empirical" in s19.lower()
+    assert "within defined scenarios" in s14
 
 
 # --------------------------------------------------------------------------- #

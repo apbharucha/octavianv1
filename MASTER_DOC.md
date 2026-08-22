@@ -35,6 +35,7 @@
    - [Background Task Manager (`background_tasks.py`)](#background-task-manager-background_taskspy)
 10. [AI & NLP Layer](#ai--nlp-layer)
     - [Financial LLM Engine (`financial_llm_engine.py`)](#financial-llm-engine-financial_llm_enginepy)
+    - [Deep-Dive Chart Engine (`deep_dive_charts.py`)](#deep-dive-chart-engine-deep_dive_chartspy)
     - [AI Chatbot (`ai_chatbot.py`)](#ai-chatbot-ai_chatbotpy)
     - [Intent Detection (`intent_detection_engine.py`)](#intent-detection-intent_detection_enginepy)
     - [Response Formatter (`response_formatter.py`)](#response-formatter-response_formatterpy)
@@ -316,10 +317,10 @@ streamlit run main.py --server.headless true
 ### Running tests
 
 ```bash
-python3 -m pytest tests/ -q          # full suite (695+ tests)
+python3 -m pytest tests/ -q          # full suite (719 tests)
 ```
 
-The suite currently has **695 passing tests** covering engines, UI walkthroughs
+The suite currently has **719 passing tests** covering engines, UI walkthroughs
 (Streamlit `AppTest`), integration flows, and the deep-dive memo integrity.
 
 ---
@@ -720,15 +721,54 @@ research-integrity spec with these helpers:
 | `_dd_bayesian` | §15 | 10 evidence events with LR vectors, posteriors renormalized to 100%; Evidence-basis column + calibration caveat (LRs are analyst-set MODEL ASSUMPTIONS, a decision framework, not statistics) |
 | `_dd_info_advantage` | §16 | 8 variables with measurement/proxy/bullish/bearish/availability |
 | `_dd_falsification` | §17 | 10 ranked arguments, confirm/falsify per argument, single rating-reverser |
-| `_dd_confidence` | §18 | Computed from completeness + fundamentals + scenario dispersion; <70% always |
+| `_dd_confidence` | §18 | Computed from completeness + fundamentals + scenario dispersion; <70% always; fixed disclosed weights (DQ×30% + MR×25% + FC×25% + RC×20%), formula printed so the number is reproducible |
 | `_dd_final_committee` | §19 | Rating, fair value, 12m/24m returns, drawdown probs (single-source with §13/§14), reasons for/against, key variables, what changes rating |
-| `_dd_qc_audit` | §20 | 15 checks incl. numerical reconciliation (weighted return, weighted price, P(dd>30/50) recomputed, DCF independently recomputed to 1e-6); any failure → "AUDIT PARTIAL PASS — N QUANTITATIVE CHECK(S) FAILED"; QC8 deliberately FAILS without cash-flow data |
+| `_dd_qc_audit` | §20 | 21 checks incl. numerical reconciliation (weighted return, weighted price, P(dd>30/50) recomputed, DCF independently recomputed to 1e-6); any failure → "AUDIT PARTIAL PASS — N QUANTITATIVE CHECK(S) FAILED"; QC8 deliberately FAILS without cash-flow data |
+| `_dd_scenario_engine` | §13 core | **Single source of truth** for all scenario math: rounds probabilities (largest-remainder, sum = exactly 100%) and returns (whole percent) to DISPLAY precision BEFORE computing weighted return / drawdown probs, so every displayed number recomputes exactly from the displayed table |
+| `_dd_rating` | §19 | Mechanically derived rating: base notch from expected return (≥+20% Strong Buy … else Strong Sell) then risk-adjusted (P(>30% dd) ≥20% or confidence <50% → −1 notch); framework text printed with the rating |
+
+**Review-fix iteration (Aug 2026):**
+- **Scenario math:** probabilities/returns are rounded to display precision *upstream* (`_dd_scenario_engine` + `_dd_round_scenarios`), so the displayed weighted return, drawdown probabilities, fair value and rating all recompute exactly from the printed table (review: hidden precision may never produce a displayed result; QC3b enforces ≤0.05pp tolerance).
+- **Same-variable discipline:** the expectation-gap (§8) and "largest market-vs-model disagreement" (§19) compare the market-implied REVENUE CAGR (multi-variable reverse solve) against the model's REVENUE growth — never FCF growth vs revenue growth. QC16 enforces this.
+- **DCF labeling:** the DCF now prints its EXACT reinvestment formulas (D&A = 6%×Revenue, CAPEX = 8%×Revenue, **ΔNWC = 5%×ΔRevenue — the CHANGE in revenue, not total revenue**); status is **CONDITIONAL / ASSUMPTION-BASED** (not "PARTIAL") when cash flow is unavailable; every DCF fair value is labeled ILLUSTRATIVE. QC21 verifies the status.
+- **Valuation separation:** §19 splits valuation into (A) reported-data, (B) assumption-based DCF, (C) market-implied, (D) scenario — provenances are never merged.
+- **Directional validation:** reasons-to-own contain only positively directional evidence and reasons-not-to-own only negative (a negative expected return can never appear under "reasons to own"). QC18 verifies.
+- **Confidence:** mechanically computed from disclosed components with fixed weights (30/25/25/20); the formula and weights are printed. QC17 recomputes it independently.
+- **Bayesian:** labeled **SUBJECTIVE BAYESIAN FRAMEWORK / Bayesian-Style Scenario Update** — likelihood ratios are analyst-set, never presented as calibrated probability. QC12.
+- **Fake precision removed:** every drawdown/loss probability is "modeled P(...) within defined scenarios" with empirical probabilities stated DATA UNAVAILABLE (§13/§14/§19).
+- **Macro gating:** `_build_macro_analysis(..., current_data_available=False)` suppresses all current-claims macro commentary ("The Fed remains…", "here's what matters right now") when no timestamped macro dataset is attached; only the transmission framework + DATA UNAVAILABLE note are emitted. QC19.
+- **LLM system prompt:** carries the 13-point QUANTITATIVE INTEGRITY & ANTI-HALLUCINATION FIREWALL (reproducible numbers, same-variable comparisons, ASSUMPTION-BASED labels, no out-of-model probabilities, mechanically derived confidence/rating, SUBJECTIVE Bayesian, macro gating, A/B/C/D valuation separation).
 
 Price stamps: header + §19 carry `quote_date` + source (yahoo 5d daily,
 delayed EOD). Fundamentals come from `_dd_fetch_fundamentals` →
 `fetch_ticker_fundamentals` (REPORTED data, offline-guarded by
 OCTAVIAN_OFFLINE). `_is_financial_metric_token` is the second firewall layer
 so metric tokens never become deep-dive subjects.
+
+**Deep-dive chart engine (`deep_dive_charts.py`, ~360 lines)** — REVIEW FIX 1
+(the 4-chart problem): every deep-dive thesis gets EXACTLY FOUR charts, each
+serving a DISTINCT analytical job built from the memo's own numbers — never
+generic price charts:
+
+1. **expectation_gap** — current price vs DCF bear/base/bull, scenario-weighted
+   value, market-implied requirement.
+2. **scenario_distribution** — five scenarios: probability, implied price,
+   expected-return contribution.
+3. **valuation_sensitivity** — WACC × terminal-growth heatmap on the base DCF,
+   computed by the same engine as memo §6.
+4. **risk_reward** — probability-weighted downside vs upside with thesis risks.
+
+Every chart carries full metadata: `chart_id` (run_id + purpose), `purpose`,
+`dataset`, `data_timestamp`, `provenance`, `calculation`, `run_id`, and a
+`dataset_hash` (sha256 of its inputs). A process-wide `_CHART_HASH_REGISTRY`
+flags `reused_dataset` when an identical (purpose, dataset) was already
+rendered — the spec is always regenerated from the current run's data, never a
+cached figure. Unsupported charts return a DATA UNAVAILABLE state instead of
+fabricating or recycling one.
+
+Wired into `ai_chatbot.process_enhanced_query`: deep-dive queries are detected
+via `_is_deep_dive_query` and get the four analytical charts; all other
+warranted queries keep the price-chart path.
 
 **Other public entry points:**
 
@@ -2401,13 +2441,14 @@ codebase — the actual journey of a user action from UI click to output.
 
 ## Test Suite
 
-Run: `python3 -m pytest tests/ -q` — **695 tests pass** (as of 2026-08-19
-session; re-verified 2026-08-21). Coverage by file:
+Run: `python3 -m pytest tests/ -q` — **719 tests pass** (as of 2026-08-21
+session). Coverage by file:
 
 | Test file | Tests | Focus |
 |---|---|---|
 | `test_algorithm_builder.py` | 58 | Archetypes, ensembles, metrics math, trade stamps, walk-forward, generated-code compile+run, strategy_spec round-trip |
-| `test_deep_dive_integrity.py` | 48 | All 20 memo sections, provenance, DCF gating, reverse DCF, exp-return/drawdown consistency, QC audit, determinism, fuzz matrix |
+| `test_deep_dive_integrity.py` | 53 | All 20 memo sections, provenance, DCF gating + CONDITIONAL labeling, reverse DCF, exp-return/drawdown consistency, QC audit, determinism, fuzz matrix |
+| `test_deep_dive_review_fixes.py` | 24 | Review-fix iteration: 4-chart engine (distinct analytical jobs, metadata, no-reuse hash), display-precision scenario math, same-variable disagreement, DCF formula labels, valuation A/B/C/D separation, directional validation, mechanical rating/confidence, SUBJECTIVE Bayesian, modeled-vs-empirical language, macro gating, QC16-21 firewall |
 | `test_dark_pool_engine.py` | 45 | Provenance model, FINRA fetch, signals, alerts, backtest, methodology |
 | `test_institutional_suite.py` | 32 | 13F, options, dark pool, institutional engines |
 | `test_audit_regressions.py` | 29 | Model QA / audit regressions |
@@ -2485,7 +2526,7 @@ check, pyflakes clean of new issues.
 
 | Date | Change | Sections touched |
 |---|---|---|
-| 2026-08-21 | Master Doc created (full codebase walkthrough). | all |
+| 2026-08-21 | Master Doc created (full codebase walkthrough); deep-dive memo review-fix iteration: new `deep_dive_charts.py` (4 distinct analytical charts with chart_id/purpose/dataset/timestamp/provenance/calculation/run_id/dataset_hash + no-reuse registry, wired into `process_enhanced_query`), display-precision scenario engine (weighted return recomputes exactly from printed table, QC3b), same-variable market-vs-model disagreement (QC16), DCF exact formula labels + CONDITIONAL/ASSUMPTION-BASED status + A/B/C/D valuation separation (QC21), directional validation of reasons to own/not (QC18), mechanical risk-adjusted rating, confidence with fixed disclosed weights (QC17), SUBJECTIVE Bayesian label, modeled-vs-empirical probability language, macro current-claims gating (QC19), 13-point quantitative-integrity firewall in the LLM system prompt. 695 tests → 719. | AI & NLP Layer; Chart Engine; Test Suite |
 | 2026-08-19 | Deep-dive memo fixes (DCF gating + site-tool DCF, multi-variable reverse DCF, consistent expected-return/drawdown probs, operating-leverage scenarios, price timestamps, labeled macro, Bayesian basis, numeric QC audit); algorithm builder symbol/asset-type stamps, real ensemble trade counts, exact per-window Sharpe; portal quick-select buttons fill most-relevant assets. 694 tests → 695. | AI & NLP Layer; Algorithm Builder; Quant Portal; Test Suite |
 | 2026-08-17 | Rebuilt institutional deep-dive memo to the 20-section research-integrity spec + extreme stress tests (43 → 48 tests). | AI & NLP Layer |
 | 2026-08-15 | Quant portal error fixes; Algorithm Builder advanced backtests + dynamic ensemble; algorithm-builder → paper-trading deployment bridge. | Quant Portal; Algorithm Builder; Trading Infrastructure |

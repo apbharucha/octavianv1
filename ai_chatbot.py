@@ -681,13 +681,42 @@ class OctavianEnhancedChatbot:
         if sectors:
             active_intents.extend([s.replace("_", " ").title() for s in sectors])
 
-        # Generate charts from live price data for the analyzed symbols — but
-        # ONLY when the query actually warrants visuals. Knowledge/definitional
-        # queries ("tell me about COST", "who are X's competitors", "does X pay
-        # a dividend") get no charts: a price chart adds nothing there and costs
-        # latency. Fetches are parallelized across symbols to keep latency low.
+        # Generate charts for the analyzed symbols — but ONLY when the query
+        # actually warrants visuals. Knowledge/definitional queries ("tell me
+        # about COST", "who are X's competitors", "does X pay a dividend") get
+        # no charts: a price chart adds nothing there and costs latency.
+        #
+        # REVIEW FIX 1 (the 4-chart problem): deep-dive institutional theses
+        # NEVER get generic price charts. They get exactly FOUR distinct
+        # analytical charts built from the memo's own numbers — expectation
+        # gap, scenario distribution, valuation sensitivity, risk/reward —
+        # each with a unique chart ID, analytical purpose, source dataset,
+        # timestamp, provenance, calculation, run identifier and a dataset
+        # hash so identical datasets can never silently reuse a prior figure.
         charts = []
-        if _query_warrants_charts(query):
+        _is_dd = False
+        try:
+            from financial_llm_engine import _is_deep_dive_query
+            _is_dd = _is_deep_dive_query(query, tickers)
+        except Exception:
+            _is_dd = False
+        if _is_dd:
+            try:
+                from deep_dive_charts import build_deep_dive_charts
+                from financial_llm_engine import (_dd_fetch_fundamentals,
+                                                  _fetch_live_data_for_tickers)
+                _fund = {}
+                try:
+                    _fund = _dd_fetch_fundamentals(tickers[0]) if tickers else {}
+                except Exception:
+                    _fund = {}
+                _live = _fetch_live_data_for_tickers(tickers[:3]) if tickers else {}
+                charts = build_deep_dive_charts(
+                    query, tickers, sectors, _live, _fund or None)
+            except Exception as e:
+                print(f"Deep-dive chart generation error: {e}")
+                charts = []
+        elif _query_warrants_charts(query):
             try:
                 from data_sources import get_stock
 

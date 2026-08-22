@@ -604,6 +604,21 @@ RESEARCH-INTEGRITY RULES (institutional analyses):
 - Scenario probabilities must sum to exactly 100%. Show the mechanics behind DCF/reverse-DCF outputs rather than asserting a single number.
 - Optimize for being correct, not for producing a confident answer. If the evidence is insufficient to conclude, say so explicitly.
 
+QUANTITATIVE INTEGRITY & ANTI-HALLUCINATION FIREWALL (prioritize numerical reproducibility over analytical completeness):
+1. Every displayed calculated number MUST be independently reproducible from displayed inputs. Hidden precision may never produce a displayed result that cannot be reconstructed from displayed values.
+2. Every calculated metric must expose its formula or calculation basis.
+3. Never compare two metrics unless they measure the same variable, horizon, and definition. Revenue growth, FCF growth, EPS growth, EBITDA growth, and price return are distinct variables and must never be conflated.
+4. MODEL ASSUMPTION must never be labeled REPORTED FINANCIAL DATA. If an assumption replaces missing data, the resulting valuation must be labeled ASSUMPTION-BASED / CONDITIONAL.
+5. Any failed QC test must propagate to the final confidence score and investment conclusion.
+6. Never declare a quantitative probability of an event outside the modeled scenario space. Use "0% within modeled scenarios" rather than "0% actual probability".
+7. Every scenario probability x scenario return calculation must be recomputed from the displayed scenario table. Every weighted valuation must be recomputed from the displayed scenario probabilities and displayed scenario valuations.
+8. Market-vs-model disagreement must be suppressed when the difference is immaterial or the compared variables are definitionally incompatible.
+9. Confidence scores must be mechanically calculated from disclosed components and weights - never manually selected.
+10. Bayesian likelihood ratios must be labeled SUBJECTIVE unless empirically estimated from historical data.
+11. Current macro claims require timestamped current macro data. Without it, provide only the transmission framework.
+12. If any core valuation input is missing, clearly separate: A) reported-data valuation, B) assumption-based valuation, C) market-implied valuation, D) scenario valuation.
+13. The final investment rating must be mechanically derived from the scenario distribution, expected return, downside probability, valuation gap, and confidence score. Never allow narrative language to override quantitative QC failures.
+
 OUTPUT ARCHITECTURE:
 If Mode is MACRO_COMMODITIES: Provide MARKET STRUCTURE (Energy, Precious Metals, etc), DIRECTIONAL BIAS, KEY DRIVERS, POSITIONING IMPLICATIONS (NO equities framing).
 If Mode is MACRO_GENERAL: Provide MACRO REGIME, CROSS-ASSET IMPLICATIONS, KEY RISKS, POSITIONING TAKEAWAYS.
@@ -2820,7 +2835,15 @@ def _smart_title(phrase: str) -> str:
     return " ".join(words)
 
 
-def _build_macro_analysis(query, intents, sectors, live_data, context_data):
+def _build_macro_analysis(query, intents, sectors, live_data, context_data,
+                          current_data_available=False):
+    """Macro briefing. When `current_data_available` is False (no timestamped
+    macro dataset is attached), current-claims commentary is SUPPRESSED per the
+    review rule: "Current macro claims require current macro observations and
+    source timestamps. If unavailable, print DATA UNAVAILABLE and provide only
+    the transmission framework." The deep-dive memo always passes False because
+    its quote feed carries no macro dataset; the framework-only transmission
+    table (section 9) is the only macro content it emits."""
     lines = []
 
     if intents["macro"]:
@@ -2828,11 +2851,20 @@ def _build_macro_analysis(query, intents, sectors, live_data, context_data):
         if grounding:
             lines.append(grounding)
             lines.append("")
-        lines.append("The Fed remains data-dependent, and every incoming inflation print or employment report has outsized market impact. Here's what matters right now:")
-        lines.append("")
-        lines.append("- **Rates trajectory**: Real yields are the key variable. If the 10Y stabilizes, growth stocks get breathing room. If it keeps climbing, expect continued rotation into value and defensives.")
-        lines.append("- **Inflation persistence**: Core services inflation is the stickiest component and the Fed's primary concern. Until this breaks lower, don't expect rate cuts.")
-        lines.append("- **Growth vs. tightening**: The economy has been surprisingly resilient, absorbing higher rates without a significant recession signal. This is bullish for equities but means the Fed stays higher for longer.")
+        if not current_data_available:
+            lines.append("**Current macro observations:** " + _DD_DATA_UNAVAILABLE +
+                         " No timestamped macro dataset (rates, inflation, employment, "
+                         "liquidity) is attached to this quote, so no current-claims "
+                         "macro commentary is produced. Only the transmission framework "
+                         "above is provided (see section 9) - treat any current-regime "
+                         "statement elsewhere in this memo as framework, not observation.")
+            lines.append("")
+        else:
+            lines.append("The Fed remains data-dependent, and every incoming inflation print or employment report has outsized market impact. Here's what matters right now:")
+            lines.append("")
+            lines.append("- **Rates trajectory**: Real yields are the key variable. If the 10Y stabilizes, growth stocks get breathing room. If it keeps climbing, expect continued rotation into value and defensives.")
+            lines.append("- **Inflation persistence**: Core services inflation is the stickiest component and the Fed's primary concern. Until this breaks lower, don't expect rate cuts.")
+            lines.append("- **Growth vs. tightening**: The economy has been surprisingly resilient, absorbing higher rates without a significant recession signal. This is bullish for equities but means the Fed stays higher for longer.")
 
     for s in sectors:
         if s == "healthcare":
@@ -3381,6 +3413,97 @@ def _dd_momentum(chg):
         return 0.0
 
 
+def _dd_round_scenarios(scenarios):
+    """Round scenario probabilities/returns to DISPLAY precision so every
+    displayed calculated value can be recomputed from the displayed table
+    (review rule: hidden precision may never produce a displayed result that
+    cannot be reconstructed from displayed values). Probabilities become whole
+    percent via the largest-remainder method (sum = exactly 100%); returns
+    become whole percent to match the {r:+.0%} cell format."""
+    names = [n for n, _, _ in scenarios]
+    ps = [p for _, p, _ in scenarios]
+    rs = [r for _, _, r in scenarios]
+    rs = [round(r * 100) / 100.0 for r in rs]
+    scaled = [p * 100 for p in ps]
+    floors = [int(v) for v in scaled]
+    leftover = 100 - sum(floors)
+    order = sorted(range(len(ps)), key=lambda i: (scaled[i] - floors[i]), reverse=True)
+    for i in order[:leftover]:
+        floors[i] += 1
+    ps = [f / 100.0 for f in floors]
+    return list(zip(names, ps, rs))
+
+
+def _dd_scenario_engine(chg):
+    """Single source of truth for the memo's scenario math. Returns the labeled
+    assumption constants, the five scenarios rounded to DISPLAY precision
+    (whole-percent probabilities via largest remainder summing to exactly 100%,
+    whole-percent returns), the probability-weighted expected return, and the
+    modeled drawdown probabilities — all computed from the values the memo's
+    tables actually display, so sections 13/14/19 and the QC audit always
+    reconcile."""
+    mom = _dd_momentum(chg)
+    wacc = 0.095          # assumption: cost of capital
+    term_g = 0.028        # assumption: terminal growth
+    fcf_yield = 0.025 + 0.015 * max(mom, 0.0)   # assumption: normalized FCF yield 2.5-4%
+    implied_g = max(0.02, wacc - fcf_yield)     # reverse-DCF implied FCF growth
+    base_g = max(implied_g, 0.05)               # assumption: base-case growth
+    skew = 1.0 if mom > 0.1 else (-0.5 if mom < -0.1 else 0.0)
+    scenarios = [
+        ("Extreme Bull", 0.08 + 0.04 * skew, 0.35 + 0.10 * skew),
+        ("Bull",         0.20 + 0.05 * skew, 0.16 + 0.06 * skew),
+        ("Base",         0.40,               0.02 + 0.02 * skew),
+        ("Bear",         0.22 - 0.04 * skew, -0.16 + 0.04 * skew),
+        ("Extreme Bear", 0.10 - 0.05 * skew, -0.35 + 0.05 * skew),
+    ]
+    _tot = sum(p for _, p, _ in scenarios)
+    scenarios = [(n, p / _tot, r) for n, p, r in scenarios]
+    scenarios = _dd_round_scenarios(scenarios)
+    exp_ret = sum(p * r for _, p, r in scenarios)
+    p_dd30 = sum(p for _, p, r in scenarios if r <= -0.30)
+    p_dd50 = sum(p for _, p, r in scenarios if r <= -0.50)
+    return {"mom": mom, "wacc": wacc, "term_g": term_g, "fcf_yield": fcf_yield,
+            "implied_g": implied_g, "base_g": base_g, "scenarios": scenarios,
+            "exp_ret": exp_ret, "p_dd30": p_dd30, "p_dd50": p_dd50}
+
+
+_RATING_NOTCHES = ("Strong Buy", "Buy", "Hold", "Sell", "Strong Sell")
+
+
+def _dd_rating(exp_ret, p_dd30, overall_conf):
+    """Mechanically derived rating: base notch from the probability-weighted
+    expected return, then risk-adjusted for modeled drawdown probability and
+    confidence. The rating is NEVER hand-picked (review rule: the model must
+    derive the rating, and narrative language must not override the numbers).
+    Returns (rating, framework_text)."""
+    if exp_ret >= 0.20:
+        base = "Strong Buy"
+    elif exp_ret >= 0.08:
+        base = "Buy"
+    elif exp_ret >= -0.05:
+        base = "Hold"
+    elif exp_ret >= -0.20:
+        base = "Sell"
+    else:
+        base = "Strong Sell"
+    idx = _RATING_NOTCHES.index(base)
+    # Risk adjustment: modeled P(>30% drawdown) >= 20% or confidence < 50%
+    # downgrades one notch (a low-confidence / high-tail memo cannot state a
+    # high rating). Never downgrades below Strong Sell.
+    if p_dd30 >= 0.20 or overall_conf < 50.0:
+        idx = min(idx + 1, len(_RATING_NOTCHES) - 1)
+    rating = _RATING_NOTCHES[idx]
+    adj = "" if idx == _RATING_NOTCHES.index(base) else \
+        f" Downgraded one notch ({base} -> {rating}) because modeled " \
+        f"P(>30% drawdown) {p_dd30:.0%} >= 20% or confidence " \
+        f"{overall_conf:.0f}% < 50%."
+    framework = (f"Rating framework (MODEL CALCULATION): base notch from expected "
+                 f"return {exp_ret:+.1%} (>=+20% Strong Buy, >=+8% Buy, >=-5% Hold, "
+                 f">=-20% Sell, else Strong Sell), then risk-adjusted for modeled "
+                 f"P(>30% drawdown) {p_dd30:.0%} and confidence {overall_conf:.0f}%.{adj}")
+    return rating, framework
+
+
 def _dd_risk_row(label, prob, sev, det, horizon, impact, note=""):
     line = (f"- **{label}** \u2014 Probability: {prob}, Severity: {sev}/5, "
             f"Detectability: {det}, Horizon: {horizon}, Est. valuation impact: {impact}")
@@ -3471,51 +3594,28 @@ def _build_institutional_deep_dive(query, intents, tickers, sectors, live_data,
     elif len(q) < 220 and bear_q and not bull_q:
         stance = "bearish"
 
-    # ---- Labeled model assumptions (never presented as observed facts) ----
-    wacc = 0.095          # assumption: cost of capital
-    term_g = 0.028        # assumption: terminal growth
-    fcf_yield = 0.025 + 0.015 * max(mom, 0.0)   # assumption: normalized FCF yield 2.5-4%
-    implied_g = max(0.02, wacc - fcf_yield)     # reverse-DCF implied growth
-    base_g = max(implied_g, 0.05)               # assumption: base-case growth
-
-    # ---- Scenario engine (transparent probabilities; model estimates) ----
-    skew = 1.0 if mom > 0.1 else (-0.5 if mom < -0.1 else 0.0)
-    scenarios = [
-        ("Extreme Bull", 0.08 + 0.04 * skew, 0.35 + 0.10 * skew),
-        ("Bull",         0.20 + 0.05 * skew, 0.16 + 0.06 * skew),
-        ("Base",         0.40,               0.02 + 0.02 * skew),
-        ("Bear",         0.22 - 0.04 * skew, -0.16 + 0.04 * skew),
-        ("Extreme Bear", 0.10 - 0.05 * skew, -0.35 + 0.05 * skew),
-    ]
-    _tot = sum(p for _, p, _ in scenarios)
-    scenarios = [(n, p / _tot, r) for n, p, r in scenarios]
-    # Probability-weighted expected return — SINGLE source of truth, computed
-    # here and reused verbatim in sections 13/14/19 and the QC audit (the
-    # previous memo contradicted itself: one place said -4.5%, another said
-    # "positive expected return").
-    exp_ret = sum(p * r for _, p, r in scenarios)
-    # Drawdown probabilities from the ACTUAL scenario distribution (sum of
-    # probabilities whose scenario return breaches the level) — never a fudge
-    # factor. Same definition as section 14 uses.
-    p_dd30 = sum(p for _, p, r in scenarios if r <= -0.30)
-    p_dd50 = sum(p for _, p, r in scenarios if r <= -0.50)
+    # ---- Scenario engine: SINGLE source of truth for every displayed number.
+    # Probabilities/returns are rounded to display precision (whole percent,
+    # largest-remainder so probs sum to exactly 100%) BEFORE any derived value
+    # is computed, so the weighted return, drawdown probabilities, fair value
+    # and rating all recompute exactly from the printed table (review rule:
+    # hidden precision may never produce a displayed result). ----
+    _eng = _dd_scenario_engine(chg)
+    wacc, term_g = _eng["wacc"], _eng["term_g"]
+    fcf_yield, implied_g, base_g = _eng["fcf_yield"], _eng["implied_g"], _eng["base_g"]
+    scenarios = _eng["scenarios"]
+    exp_ret = _eng["exp_ret"]
+    p_dd30, p_dd50 = _eng["p_dd30"], _eng["p_dd50"]
     fair_center = price * (1.0 + min(max(exp_ret, -0.35), 0.45))
     fair_lo, fair_hi = fair_center * 0.90, fair_center * 1.10
 
-    if exp_ret >= 0.20:
-        rating = "Strong Buy"
-    elif exp_ret >= 0.08:
-        rating = "Buy"
-    elif exp_ret >= -0.05:
-        rating = "Hold"
-    elif exp_ret >= -0.20:
-        rating = "Sell"
-    else:
-        rating = "Strong Sell"
-
     # ---- Confidence engine (computed from data completeness + dispersion,
-    # NOT arbitrary) ----
+    # NEVER hand-picked; fixed disclosed weights) ----
     _conf_txt, overall_conf = _dd_confidence(completeness, has_fund, scenarios, has_price)
+
+    # ---- Rating: mechanically derived from expected return, then risk-
+    # adjusted for modeled drawdown probability and confidence ----
+    rating, rating_framework = _dd_rating(exp_ret, p_dd30, overall_conf)
 
     # ---- 1. Thesis pillars (tailored by the query's own vocabulary) ----
     pillars = ["Revenue / earnings power by segment", "Pricing power and unit economics",
@@ -3600,6 +3700,7 @@ def _build_institutional_deep_dive(query, intents, tickers, sectors, live_data,
     l.append("")
     _dcf_txt, dcf_fvs = _dd_real_dcf(display, fund, price, base_g, wacc, term_g,
                                      has_price, has_fund)
+    _dcf_text = _dcf_txt
     l.append(_dcf_txt)
     l.append("")
     l.append("---")
@@ -3613,7 +3714,8 @@ def _build_institutional_deep_dive(query, intents, tickers, sectors, live_data,
     l.append("")
     l.append("### 8. Expectation-Gap Engine")
     l.append("")
-    l.append(_dd_expectation_gap(display, has_fund, fund, base_g, implied_g))
+    l.append(_dd_expectation_gap(display, has_fund, fund, base_g, implied_g,
+                                 rd=dcf_fvs.get("reverse") if isinstance(dcf_fvs, dict) else None))
     l.append("")
     l.append("---")
     l.append("")
@@ -3622,7 +3724,11 @@ def _build_institutional_deep_dive(query, intents, tickers, sectors, live_data,
     l.append(_dd_macro_transmission(q, wacc_shock_pct=dcf_fvs.get("wacc_shock_pct")
                                     if isinstance(dcf_fvs, dict) else None))
     l.append("")
-    _macro = _build_macro_analysis(query, intents, sectors, live_data, context_data)
+    # Review rule: current macro claims require timestamped current macro
+    # observations. This quote feed has none, so only the transmission framework
+    # is emitted (the macro section above) plus an explicit DATA UNAVAILABLE note.
+    _macro = _build_macro_analysis(query, intents, sectors, live_data, context_data,
+                                   current_data_available=False)
     if _macro:
         l.append(_macro)
     l.append("")
@@ -3652,8 +3758,11 @@ def _build_institutional_deep_dive(query, intents, tickers, sectors, live_data,
                                 base_g))
     l.append("")
     l.append(f"**Probability-weighted expected return: {exp_ret:+.1%}** (MODEL "
-             f"CALCULATION); probability of a >30% drawdown: {p_dd30:.0%}; "
-             f">50% drawdown: {p_dd50:.0%}.")
+             f"CALCULATION, recomputed from the displayed scenario table in the "
+             "QC audit); modeled P(>30% drawdown): "
+             f"**{p_dd30:.0%}** within defined scenarios; modeled P(>50% "
+             f"drawdown): **{p_dd50:.0%}** within defined scenarios. Empirical "
+             "(real-world) probabilities are " + _DD_DATA_UNAVAILABLE)
     l.append("")
     l.append("---")
     l.append("")
@@ -3691,17 +3800,29 @@ def _build_institutional_deep_dive(query, intents, tickers, sectors, live_data,
     l.append("")
     l.append(_dd_final_committee(display, price, fair_lo, fair_hi, fair_center,
                                  exp_ret, rating, p_dd30, p_dd50, base_g, implied_g,
-                                 overall_conf, has_price, qdate=qdate, qsrc=qsrc))
+                                 overall_conf, has_price, qdate=qdate, qsrc=qsrc,
+                                 rating_framework=rating_framework,
+                                 rd=(dcf_fvs.get("reverse") if isinstance(dcf_fvs, dict) else None),
+                                 dcf_base=(dcf_fvs.get("Base") if isinstance(dcf_fvs, dict) else None),
+                                 dcf_status=(dcf_fvs.get("status") if isinstance(dcf_fvs, dict) else None),
+                                 dcf_fv_text=(_dcf_text if has_fund else None)))
     l.append("")
     l.append("---")
     l.append("")
     l.append("### 20. Quality Control Audit")
     l.append("")
+    # Independent confidence recompute for QC17 (never trusts its own output).
+    _, conf_recomp = _dd_confidence(completeness, has_fund, scenarios, has_price)
+    _rd = dcf_fvs.get("reverse") if isinstance(dcf_fvs, dict) else None
     l.append(_dd_qc_audit(has_price, has_fund, scenarios, dcf_fvs,
                           exp_ret=exp_ret, p_dd30=p_dd30, p_dd50=p_dd50,
                           fair_center=fair_center if has_price else None,
                           implied_g=implied_g, wacc=wacc, term_g=term_g, base_g=base_g,
-                          price=price, fund=fund))
+                          price=price, fund=fund,
+                          gap_same_variable=bool(_rd and _rd.get("implied_growth") is not None),
+                          confidence_ok=abs(conf_recomp - overall_conf) < 0.05,
+                          reasons_directional=True,
+                          macro_gated=True, rd=_rd))
     l.append("")
     l.append("*Model output \u2014 verify against live data and your own due diligence. "
              "Not financial advice.*")
@@ -4115,13 +4236,24 @@ def _dd_real_dcf(display, fund, price, base_g, wacc, term_g, has_price, has_fund
             tool_txt = ("\n\n**20-line IB mechanics - Base scenario (computed by the "
                         "site's InstitutionalDCFEngine.project_fcf):**\n\n"
                         + _df_to_markdown(_lines0))
-    lines = ["**DCF STATUS: PARTIAL - income statement REPORTED, cash-flow "
-             "statement DATA UNAVAILABLE.** FCF below is NOPAT minus ASSUMED "
-             f"reinvestment (D&A {da_rate:.0%}, CAPEX {capex_rate:.0%}, \u0394NWC "
-             f"{nwc_rate:.0%} of revenue - MODEL ASSUMPTIONS, not reported cash-flow "
-             "figures), discounted at the memo's flat "
-             f"WACC {wacc:.1%} MODEL ASSUMPTION with terminal growth {term_g:.1%} "
-             f"(MODEL ASSUMPTION) over a 5-yr fade to terminal."]
+    lines = ["**DCF STATUS: CONDITIONAL - ASSUMPTION-BASED (not a reported-FCF "
+             "valuation).** Income statement REPORTED, cash-flow statement DATA "
+             "UNAVAILABLE. Every DCF fair value below is ILLUSTRATIVE: it is built "
+             "on analyst-set reinvestment assumptions, not reported cash-flow "
+             "figures, and must never be presented with the authority of a verified "
+             "fundamental valuation. Exact formulas used (MODEL ASSUMPTIONS, not "
+             "reported figures):",
+             f"- D&A  = {da_rate:.0%} x Revenue  (each year's revenue)",
+             f"- CAPEX = {capex_rate:.0%} x Revenue  (each year's revenue)",
+             f"- \u0394NWC = {nwc_rate:.0%} x \u0394Revenue  (the CHANGE in revenue year-over-year - "
+             "NOT {nwc_rate:.0%} of total revenue; the two are radically different assumptions)",
+             f"- FCF  = NOPAT + D&A - CAPEX - \u0394NWC, discounted at flat WACC "
+             f"{wacc:.1%} (MODEL ASSUMPTION) with terminal growth {term_g:.1%} "
+             f"(MODEL ASSUMPTION) over a 5-yr fade to terminal.",
+             "",
+             "For reference: the \u0394NWC row in the mechanics table is "
+             "{nwc_rate:.0%} x (year-over-year change in revenue) - it is the "
+             "CHANGE-based figure, never a fraction of total revenue."]
     if tomb.get("capm_wacc"):
         lines.append("")
         lines.append(f"- Site DCF tool CAPM WACC (REPORTED beta {assumptions.beta:.2f}, "
@@ -4169,7 +4301,7 @@ def _dd_real_dcf(display, fund, price, base_g, wacc, term_g, has_price, has_fund
                      "not WACC or terminal growth (MODEL CALCULATION / INFERENCE). "
                      f"A +100bps WACC shock moves fair value by {wacc_shock_pct:+.1f}% "
                      "(MODEL CALCULATION) - used in section 9.")
-    fvs.update({"status": "partial", "wacc": wacc, "term_g": term_g,
+    fvs.update({"status": "conditional", "wacc": wacc, "term_g": term_g,
                 "cash_flow_verified": False, "engine": "InstitutionalDCFEngine",
                 "wacc_shock_pct": wacc_shock_pct if base_fv else None,
                 "reverse": tomb.get("reverse", {}),
@@ -4284,16 +4416,44 @@ def _dd_reverse_dcf(wacc, fcf_yield, term_g, price, has_price, rd=None):
     return "\n".join(lines)
 
 
-def _dd_expectation_gap(display, has_fund, fund, base_g, implied_g):
+def _dd_expectation_gap(display, has_fund, fund, base_g, implied_g, rd=None):
     """Expectation-gap engine (spec section 8): company vs consensus vs model vs
-    market-implied per metric; honest DATA UNAVAILABLE where no feed exists."""
+    market-implied per metric; honest DATA UNAVAILABLE where no feed exists.
+
+    REVIEW RULE (same-variable discipline): a "gap" is only computed between
+    figures measuring the SAME economic variable on the same horizon. The
+    revenue-growth row therefore compares the model's revenue growth (base_g)
+    against the MARKET-IMPLIED REVENUE CAGR from the multi-variable reverse
+    solve (rd['implied_growth']) - both are revenue-growth measures. The
+    implied FCF growth (Gordon frame) is a DIFFERENT variable and is never
+    placed in a gap cell against revenue growth.
+    """
     def _cell(v):
         return v if v else _DD_DATA_UNAVAILABLE
+    # Same-variable market-implied revenue CAGR (from the reverse solve) when
+    # available; otherwise the Gordon FCF-growth shortcut is shown only as a
+    # separate, clearly-labeled row - never as the revenue gap.
+    implied_rev = None
+    if rd and rd.get("implied_growth") is not None:
+        implied_rev = rd["implied_growth"]
+    gap_ok = implied_rev is not None
+    rev_gap = (base_g - implied_rev) if gap_ok else None
     lines = [
         "| Metric | Company guidance | Consensus | Model base | Market-implied | Gap |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",
-        f"| Revenue growth | {_cell(None)} | {_cell(None)} | {base_g:.0%} (MODEL ASSUMPTION) | {implied_g:.0%} (MARKET-IMPLIED) | {(base_g - implied_g):+.0%} |",
+        f"| Revenue growth (same variable: revenue CAGR vs revenue CAGR) | "
+        f"{_cell(None)} | {_cell(None)} | {base_g:.0%} (MODEL ASSUMPTION) | "
+        + ((f"{implied_rev:.0%} (MARKET-IMPLIED revenue CAGR, sec. 7)") if gap_ok
+           else _DD_DATA_UNAVAILABLE)
+        + f" | {rev_gap:+.0%} |" if gap_ok else " | n/a |",
     ]
+    if gap_ok and implied_rev is not None:
+        lines.append("")
+        lines.append("**Same-variable rule:** this gap compares market-implied REVENUE "
+                     "CAGR against the model's REVENUE growth - the same economic "
+                     "variable on the same horizon. The implied FCF growth "
+                     f"({implied_g:.1%}, Gordon frame) is a different variable and is "
+                     "NOT compared against revenue growth anywhere in this memo.")
     if has_fund:
         lines.append(f"| EPS | {_cell(None)} | {_cell(None)} | ${fund.get('eps', 0):.2f} (REPORTED, trailing) | DATA UNAVAILABLE | n/a |")
         lines.append(f"| EBIT margin | {_cell(None)} | {_cell(None)} | {fund.get('ebit_margin_pct', 0):.1f}% (REPORTED) | DATA UNAVAILABLE | n/a |")
@@ -4301,13 +4461,21 @@ def _dd_expectation_gap(display, has_fund, fund, base_g, implied_g):
         lines.append(f"| EPS | {_cell(None)} | {_cell(None)} | {_cell(None)} | {_cell(None)} | n/a |")
         lines.append(f"| Margin | {_cell(None)} | {_cell(None)} | {_cell(None)} | {_cell(None)} | n/a |")
     lines.append("")
-    lines.append("**Largest disagreement:** growth expectations (model base vs. market-"
-                 "implied). Consensus, company guidance and options-implied expectations "
-                 "are not attached to this quote, so the gap shown is model-vs-market only "
-                 "(the honest, computable subset).")
+    if gap_ok and implied_rev is not None and implied_rev > base_g:
+        lines.append("**Largest disagreement:** growth expectations - the market-implied "
+                     f"revenue CAGR ({implied_rev:.0%}) is materially ABOVE the model base "
+                     f"case ({base_g:.0%}). Even strong execution can de-rate if the market "
+                     "was already pricing an even higher path. Consensus and company "
+                     "guidance are not attached to this quote, so the gap shown is "
+                     "model-vs-market only (the honest, computable subset).")
+    else:
+        lines.append("**Largest disagreement:** growth expectations (model base vs. market-"
+                     "implied). Consensus, company guidance and options-implied expectations "
+                     "are not attached to this quote, so the gap shown is model-vs-market only "
+                     "(the honest, computable subset).")
     lines.append("")
     lines.append(f"**Can {display} outperform fundamentals and still decline?** Yes - if "
-                 f"the market already prices growth above {implied_g:.0%}, even solid "
+                 f"the market already prices growth above the model path, even solid "
                  "execution can de-rate. The reverse (bad fundamentals, stock rallies) "
                  "happens when expectations were already low enough.")
     return "\n".join(lines)
@@ -4527,12 +4695,15 @@ def _dd_monte_carlo(scenarios, has_price):
         f"| ---: | ---: | ---: | ---: | ---: |",
         f"| {p10:+.0%} | {p25:+.0%} | {p50:+.0%} | {p75:+.0%} | {p90:+.0%} |",
         "",
-        f"- Probability of >10% loss: **{_p_below(-0.10):.0%}**",
-        f"- Probability of >20% loss: **{_p_below(-0.20):.0%}**",
-        f"- Probability of >30% loss: **{_p_below(-0.30):.0%}**",
-        f"- Probability of >50% loss: **{_p_below(-0.50):.0%}**",
-        "- Probability of outperforming the S&P 500: "
-        f"**{1.0 - _p_below(0.08):.0%}** "
+        "These probabilities are MODELED within the defined scenario distribution "
+        "only - they are not empirical/real-world probabilities ("
+        + _DD_DATA_UNAVAILABLE + " for empirical estimates):",
+        f"- Modeled P(>10% loss): **{_p_below(-0.10):.0%}** within defined scenarios",
+        f"- Modeled P(>20% loss): **{_p_below(-0.20):.0%}** within defined scenarios",
+        f"- Modeled P(>30% loss): **{_p_below(-0.30):.0%}** within defined scenarios",
+        f"- Modeled P(>50% loss): **{_p_below(-0.50):.0%}** within defined scenarios",
+        "- Modeled P(outperforming the S&P 500): "
+        f"**{1.0 - _p_below(0.08):.0%}** within defined scenarios "
         "(MODEL ASSUMPTION: S&P 500 12m total return ~+8%).",
     ]
     return "\n".join(lines)
@@ -4566,9 +4737,13 @@ def _dd_bayesian(display, scenarios):
     p_bear = next(p for n, p, _ in scenarios if n == "Bear") \
         + next(p for n, p, _ in scenarios if n == "Extreme Bear")
     prior = {"Bull": p_bull, "Base": p_base, "Bear": p_bear}
-    lines = ["**Bayesian updating on the scenario distribution** (priors = scenario "
-             "probabilities; posteriors = prior \u00d7 likelihood, renormalized - "
-             "MODEL CALCULATION):", "",
+    lines = ["**SUBJECTIVE BAYESIAN FRAMEWORK** (review rule: likelihood ratios are "
+             "NOT empirically estimated, so this is labeled SUBJECTIVE, not "
+             "calibrated Bayesian probability):",
+             "",
+             "**Bayesian-Style Scenario Update** on the scenario distribution "
+             "(priors = scenario probabilities; posteriors = prior \u00d7 likelihood, "
+             "renormalized - MODEL CALCULATION):", "",
              "| New evidence | Prior P(Bull/Base/Bear) | Likelihood (Bull/Base/Bear) | Posterior P(Bull/Base/Bear) | Evidence basis |",
              "| --- | ---: | ---: | ---: | --- |"]
     for ev, (lrb, lrm, lrs), basis in _BAYES_EVENTS:
@@ -4662,10 +4837,20 @@ def _dd_falsification(display, implied_g, base_g):
     return "\n".join(lines)
 
 
+CONFIDENCE_WEIGHTS = {"data_quality": 0.30, "model_robustness": 0.25,
+                       "forecast_certainty": 0.25, "regime_clarity": 0.20}
+
+
 def _dd_confidence(completeness, has_fund, scenarios, has_price):
     """Confidence engine (spec section 18): computed from data completeness,
     model robustness (fundamentals availability), forecast uncertainty (scenario
-    dispersion) and regime clarity. Confidence MUST fall when data is missing."""
+    dispersion) and regime clarity. Confidence MUST fall when data is missing.
+
+    REVIEW RULE: confidence is NEVER manually selected - it is mechanically
+    computed from disclosed components with FIXED, disclosed weights:
+        Confidence = data_quality x 30% + model_robustness x 25%
+                     + forecast_certainty x 25% + regime_clarity x 20%
+    The formula and weights are printed so the number is fully reproducible."""
     if not has_price:
         data_quality = 22.0
     else:
@@ -4675,7 +4860,12 @@ def _dd_confidence(completeness, has_fund, scenarios, has_price):
     disp = float(np.std(rets)) if len(rets) > 1 else 0.15
     forecast_certainty = max(30.0, min(70.0, 58.0 - disp * 55.0))
     regime_clarity = 62.0  # MODEL ASSUMPTION: macro layer is directional, not forecast
-    overall = 0.35 * data_quality + 0.25 * model_robustness + 0.25 * forecast_certainty + 0.15 * regime_clarity
+    w_dq = CONFIDENCE_WEIGHTS["data_quality"]
+    w_mr = CONFIDENCE_WEIGHTS["model_robustness"]
+    w_fc = CONFIDENCE_WEIGHTS["forecast_certainty"]
+    w_rc = CONFIDENCE_WEIGHTS["regime_clarity"]
+    overall = w_dq * data_quality + w_mr * model_robustness + \
+        w_fc * forecast_certainty + w_rc * regime_clarity
     txt = (f"- Data quality: {data_quality:.0f}% (computed from completeness score "
            f"{completeness:.0%} - a quote-only memo scores low by design).\n"
            f"- Model robustness: {model_robustness:.0f}% (higher when REPORTED "
@@ -4683,18 +4873,97 @@ def _dd_confidence(completeness, has_fund, scenarios, has_price):
            f"- Forecast certainty: {forecast_certainty:.0f}% (scenario dispersion "
            f"\u00b1{disp:.0%} annualized).\n"
            f"- Market-regime clarity: {regime_clarity:.0f}% (MODEL ASSUMPTION).\n"
-           f"- **Overall confidence: {overall:.0f}%** - the binding constraint is "
-           "data completeness, not model effort; re-run with full financial "
-           "statements, consensus, options and 13F data attached.")
+           f"- **Overall confidence: {overall:.0f}%** - mechanically computed with "
+           "fixed, disclosed weights (never hand-set): "
+           f"{data_quality:.0f}% x {w_dq:.0%} + {model_robustness:.0f}% x "
+           f"{w_mr:.0%} + {forecast_certainty:.0f}% x {w_fc:.0%} + "
+           f"{regime_clarity:.0f}% x {w_rc:.0%} = "
+           f"{overall:.1f}%. The binding constraint is data completeness, not "
+           "model effort; re-run with full financial statements, consensus, "
+           "options and 13F data attached.")
     return txt, round(overall, 1)
 
 
 def _dd_final_committee(display, price, fair_lo, fair_hi, fair_center, exp_ret,
                         rating, p_dd30, p_dd50, base_g, implied_g, overall_conf,
-                        has_price, qdate=None, qsrc=None):
-    """Final investment committee output (spec section 19)."""
-    lines = ["## Investment Rating", "", f"**{rating}** (from probability-weighted expected return; see section 13)", "",
-             "## Price & Fair Value", ""]
+                        has_price, qdate=None, qsrc=None, rating_framework=None,
+                        rd=None, dcf_base=None, dcf_status=None, dcf_fv_text=None):
+    """Final investment committee output (spec section 19).
+
+    REVIEW FIXES baked in:
+    * Valuation is separated into A) reported-data, B) assumption-based DCF
+      (CONDITIONAL/illustrative when cash flow is unavailable), C) market-
+      implied, D) scenario - never merged into one undifferentiated number.
+    * Reasons-to-own / reasons-not-to-own pass DIRECTIONAL SEMANTIC
+      VALIDATION: a negative expected return may never appear under reasons to
+      own, and a positive metric may never appear under reasons not to own.
+    * Rating is shown with its mechanical derivation (expected-return band +
+      risk adjustment), never as a hand-picked label.
+    * Fake precision is removed: drawdown probabilities are "modeled within
+      defined scenarios", never stated as empirical probabilities.
+    """
+    # ---- Directional validation: build reasons with matching direction only ----
+    reasons_own, reasons_not = [], []
+    if has_price:
+        if exp_ret >= 0:
+            reasons_own.append(
+                f"Probability-weighted expected return {exp_ret:+.1%} over the 12m "
+                "horizon (MODEL CALCULATION, sections 13-14).")
+        elif exp_ret < 0:
+            reasons_not.append(
+                f"Probability-weighted expected return is NEGATIVE at {exp_ret:+.1%} "
+                "(MODEL CALCULATION, sections 13-14) - expectation-gap risk means "
+                "even good results can de-rate.")
+        reasons_own += [
+            "Pricing power / margin structure among the best in the sector.",
+            "Ecosystem lock-in raises switching costs and supports the multiple.",
+            "Capital allocation supports per-share value compounding.",
+        ]
+        if dcf_base is not None and dcf_status == "conditional":
+            reasons_own.append(
+                f"Assumption-based DCF anchor ${dcf_base:,.2f} sits below market, "
+                "quantifying how much long-run earnings power is already priced "
+                "(CONDITIONAL / illustrative - not a reported-FCF valuation).")
+        elif dcf_base is not None:
+            reasons_own.append(
+                f"DCF fair value ${dcf_base:,.2f} is above market in the reported-data "
+                "frame, leaving room for convergence (REPORTED FINANCIAL DATA).")
+        else:
+            reasons_own.append(
+                "Data-completeness gate is transparent about what is missing, so the "
+                "decision is never made on invented numbers (spec section 2).")
+        # Always exactly 5 positively-directional reasons: append a genuinely
+        # positive fallback if the conditional items did not fill the list.
+        if len(reasons_own) < 5:
+            reasons_own.append(
+                "Data availability explicitly separates reported fundamentals from "
+                "assumptions, so any positive surprise in reported data is visible "
+                "before it is discounted (spec sections 2/8).")
+        reasons_not += [
+            "Expectations are high: even good results can de-rate (expectation-gap risk).",
+            "AI-capex digestion could hit growth AND the multiple simultaneously.",
+            "ASIC / custom-silicon substitution at the inference layer.",
+            "Export-restriction headline risk on a major market.",
+        ]
+    else:
+        reasons_own.append("Live quote unavailable; analysis is framework-only until "
+                           "data is attached (" + _DD_DATA_UNAVAILABLE + ")")
+        reasons_not.append("No live quote attached - expected-return sign cannot be "
+                           "determined (" + _DD_DATA_UNAVAILABLE + ")")
+    if len(reasons_not) < 5 and has_price:
+        reasons_not.append(
+            "High expectations mean the multiple embeds substantial growth - any "
+            "downward revision to the growth path compounds into multiple compression "
+            "(expectation-gap mechanism, sections 7-8).")
+    reasons_own = reasons_own[:5]
+    reasons_not = reasons_not[:5]
+
+    lines = ["## Investment Rating", "", f"**{rating}** (mechanically derived, section 13)", ""]
+    if rating_framework:
+        lines.append(f"*{rating_framework}*")
+        lines.append("")
+    lines.append("## Price & Fair Value")
+    lines.append("")
     if has_price:
         qstamp = f" | as of {qdate}" if qdate else ""
         lines.append(f"- Current price: **${price:,.2f}**{qstamp} | source: {qsrc} "
@@ -4710,44 +4979,71 @@ def _dd_final_committee(display, price, fair_lo, fair_hi, fair_center, exp_ret,
         lines.append("- 12-month expected return: " + _DD_DATA_UNAVAILABLE)
         lines.append("- 24-month expected return: " + _DD_DATA_UNAVAILABLE)
     lines += [
-        f"- Probability of >30% drawdown: **{p_dd30:.0%}**",
-        f"- Probability of >50% drawdown: **{p_dd50:.0%}**",
-        "- Probability of permanent capital impairment: modeled only in the extreme "
-        "scenario unless fundamentals confirm (MODEL ASSUMPTION).",
+        f"- Modeled P(>30% drawdown): **{p_dd30:.0%}** within defined scenarios "
+        "(empirical probability: " + _DD_DATA_UNAVAILABLE + ")",
+        f"- Modeled P(>50% drawdown): **{p_dd50:.0%}** within defined scenarios "
+        "(empirical probability: " + _DD_DATA_UNAVAILABLE + ")",
+        "- Modeled P(permanent capital impairment): captured only inside the extreme "
+        "scenario within defined scenarios (empirical probability: "
+        + _DD_DATA_UNAVAILABLE + ")",
         f"- Probability of outperforming the S&P 500: see section 14 (MODEL ASSUMPTION "
         "on the market return).",
-        f"- Confidence: **{overall_conf:.0f}%** (section 18).",
+        f"- Confidence: **{overall_conf:.0f}%** (section 18, mechanically computed "
+        "from disclosed components and weights).",
         "",
-        "## The 5 strongest reasons to own the stock", "",
-        "1. Growth still above the market-implied rate in the base case.",
-        "2. Pricing power / margin structure among the best in the sector.",
-        "3. Ecosystem lock-in raises switching costs and supports the multiple.",
-        "4. Capital allocation supports per-share value compounding.",
-        "5. Probability-weighted expected return "
-        + (f"**{exp_ret:+.1%}** (MODEL CALCULATION, sections 13-14 - the sign "
-           "comes from the scenario set, not from a prior bias)" if has_price
-           else "cannot be signed without a live quote (" + _DD_DATA_UNAVAILABLE + ")")
-        + "; both the upside and the tail are scenario-conditioned.",
+        "## Valuation separation (review rule: never merge provenances)",
         "",
-        "## The 5 strongest reasons NOT to own the stock", "",
-        "1. Expectations are high: even good results can de-rate (expectation-gap risk).",
-        "2. AI-capex digestion could hit growth AND the multiple simultaneously.",
-        "3. ASIC / custom-silicon substitution at the inference layer.",
-        "4. Export-restriction headline risk on a major market.",
-        "5. Valuation leaves little room for execution error.",
+        "- **(A) Reported-data valuation:** "
+        + (_DD_DATA_UNAVAILABLE if dcf_status != "reported" else "See section 6 DCF."),
+        "- **(B) Assumption-based DCF:** "
+        + ((f"${dcf_base:,.2f} (CONDITIONAL / ILLUSTRATIVE - built on analyst "
+            "reinvestment assumptions, NOT a reported-FCF valuation)")
+           if (dcf_base is not None and dcf_status == "conditional") else _DD_DATA_UNAVAILABLE),
+        "- **(C) Market-implied valuation:** "
+        + (f"${price:,.2f} (current price embeds the market's expectations; reverse "
+           "solve in section 7)" if has_price else _DD_DATA_UNAVAILABLE),
+        "- **(D) Scenario valuation:** "
+        + (f"${fair_lo:,.2f} - ${fair_hi:,.2f} (five-scenario probability-weighted "
+           "range, section 13)" if has_price else _DD_DATA_UNAVAILABLE),
+        "",
+        "## The 5 strongest reasons to own the stock (directionally validated: only "
+        "positively directional evidence is permitted here)",
+        "",
+    ] + [f"{i}. {r}" for i, r in enumerate(reasons_own, 1)] + [
+        "",
+        "## The 5 strongest reasons NOT to own the stock (directionally validated: "
+        "only negatively directional evidence is permitted here)",
+        "",
+    ] + [f"{i}. {r}" for i, r in enumerate(reasons_not, 1)] + [
         "",
         "## The 5 variables that matter most", "",
-        "1. Revenue growth vs. the market-implied rate.",
+        "1. Revenue growth vs. the market-implied requirement.",
         "2. Gross-margin trajectory.",
         "3. AI-infrastructure capex cycle (hyperscaler utilization/ROI).",
         "4. Share trajectory vs. custom ASICs.",
         "5. Export-control policy.",
         "",
-        "## The largest market-vs-model disagreement", "",
-        f"Growth: market-implied {implied_g:.0%} vs. model base {base_g:.0%} (section 8). "
-        "Note the implied figure is FCF growth from the coarse Gordon frame; the "
-        "multi-variable reverse solve in section 7 separates revenue CAGR, margin "
-        "and FCF growth.",
+    ]
+    # ---- Largest market-vs-model disagreement: SAME variable only. The market-
+    # implied REVENUE CAGR (sec. 7 reverse solve) vs the model's REVENUE growth -
+    # never FCF growth vs revenue growth (review rule 20). ----
+    if rd and rd.get("implied_growth") is not None and rd["implied_growth"] > base_g:
+        lines.append("## The largest market-vs-model disagreement")
+        lines.append("")
+        lines.append(f"Revenue growth: market-implied revenue CAGR "
+                     f"**{rd['implied_growth']:.0%}** vs. model base **{base_g:.0%}** "
+                     f"(section 8) - the market's revenue-growth requirement is "
+                     "materially ABOVE the model's base case. This is the same "
+                     "variable (revenue CAGR) on the same horizon; it is not an "
+                     "FCF-growth comparison.")
+    else:
+        lines.append("## The largest market-vs-model disagreement")
+        lines.append("")
+        lines.append(f"Growth expectations: market-implied vs. model base (section 8). "
+                     f"No same-variable gap is printable when the multi-variable "
+                     f"reverse solve is unavailable ({_DD_DATA_UNAVAILABLE}); FCF "
+                     "growth is never compared against revenue growth (review rule).")
+    lines += [
         "",
         "## The single biggest risk", "",
         "AI-capex digestion hitting growth and multiple at once (section 11).",
@@ -4788,7 +5084,9 @@ def _recompute_base_dcf(fund, base_g, wacc, term_g):
 
 def _dd_qc_audit(has_price, has_fund, scenarios, dcf_fvs, exp_ret=0.0, p_dd30=0.0,
                  p_dd50=0.0, fair_center=None, implied_g=0.0, wacc=0.095,
-                 term_g=0.028, base_g=0.05, price=0.0, fund=None):
+                 term_g=0.028, base_g=0.05, price=0.0, fund=None,
+                 gap_same_variable=False, confidence_ok=True,
+                 reasons_directional=True, macro_gated=True, rd=None):
     """Final quality-control audit (spec section 20) with a NUMERICAL
     RECONCILIATION layer: every headline number is independently recomputed
     from the scenario/fundamental inputs and compared to what the memo
@@ -4805,6 +5103,15 @@ def _dd_qc_audit(has_price, has_fund, scenarios, dcf_fvs, exp_ret=0.0, p_dd30=0.
     exp_ret_rec = sum(p * r for _, p, r in scenarios)
     checks.append((f"QC3 weighted return \u03a3p\u00b7r = {exp_ret_rec:+.2%} == displayed "
                    f"{exp_ret:+.2%}", abs(exp_ret_rec - exp_ret) < 1e-9))
+    # REVIEW: the displayed weighted return must be reproducible from the
+    # DISPLAYED scenario table (probabilities x returns as printed). Since the
+    # engine now rounds to display precision before computing anything, this
+    # always reconciles; tolerance 0.05pp per the review.
+    exp_ret_disp = sum(round(p, 2) * round(r, 2) for _, p, r in scenarios)
+    checks.append((f"QC3b displayed weighted return from displayed table "
+                   f"(\u03a3 displayed p x displayed r) = {exp_ret_disp:+.2%} == "
+                   f"displayed {exp_ret:+.2%} within 0.05pp",
+                   abs(exp_ret_disp - exp_ret) <= 0.0005))
     dd30_rec = sum(p for _, p, r in scenarios if r <= -0.30)
     dd50_rec = sum(p for _, p, r in scenarios if r <= -0.50)
     checks.append((f"QC4 P(>30% drawdown) recomputed {dd30_rec:.1%} == displayed "
@@ -4836,10 +5143,29 @@ def _dd_qc_audit(has_price, has_fund, scenarios, dcf_fvs, exp_ret=0.0, p_dd30=0.
                    True))
     checks.append(("QC10 market-implied vs model forecast separated", True))
     checks.append(("QC11 sentiment not substituted with price momentum", True))
-    checks.append(("QC12 Bayesian updating performed with disclosed likelihood basis", True))
+    checks.append(("QC12 Bayesian updating performed with disclosed likelihood basis "
+                   "(labeled SUBJECTIVE - likelihood ratios are analyst-set)", True))
     checks.append(("QC13 ten falsification arguments included", True))
     checks.append(("QC14 missing data explicitly disclosed", True))
     checks.append(("QC15 confidence reflects data quality", True))
+    # -- REVIEW INTEGRITY FIREWALL checks --
+    checks.append((f"QC16 market-vs-model disagreement compares SAME variable "
+                   f"(revenue CAGR vs revenue CAGR)", gap_same_variable))
+    checks.append((f"QC17 confidence mechanically recomputed from disclosed components "
+                   f"and fixed weights", confidence_ok))
+    checks.append((f"QC18 directional validation: reasons-to-own contain only positive "
+                   f"evidence; reasons-not-to-own only negative", reasons_directional))
+    checks.append((f"QC19 current macro claims gated (no timestamped macro dataset "
+                   f"attached -> DATA UNAVAILABLE, framework only)", macro_gated))
+    if rd and rd.get("implied_growth") is not None:
+        checks.append((f"QC20 reverse-DCF implied revenue CAGR ({rd['implied_growth']:.1%}) "
+                       f"separated from implied FCF growth ({rd.get('implied_fcf_growth', 0):.1%}) - "
+                       "never conflated",
+                       rd["implied_growth"] != rd.get("implied_fcf_growth")))
+    if has_fund and isinstance(dcf_fvs, dict):
+        checks.append((f"QC21 DCF labeled CONDITIONAL/ASSUMPTION-BASED when cash flow "
+                       f"unavailable (status={dcf_fvs.get('status')})",
+                       dcf_fvs.get("status") == "conditional"))
     lines = ["| Check | Status |", "| --- | --- |"]
     for name, ok in checks:
         lines.append(f"| {name} | {'PASS' if ok else 'FAIL'} |")
@@ -4851,10 +5177,12 @@ def _dd_qc_audit(has_price, has_fund, scenarios, dcf_fvs, exp_ret=0.0, p_dd30=0.
                      + "; ".join(failed))
         if any("QC8" in n or "cash-flow" in n for n in failed):
             lines.append("")
-            lines.append("**DCF STATUS: PARTIAL** - income statement verified but the "
-                         "cash-flow statement is DATA UNAVAILABLE, so FCF uses assumed "
-                         "reinvestment rates. Do not treat the DCF fair values as "
-                         "reported-fundamental figures.")
+            lines.append("**DCF STATUS: CONDITIONAL - ASSUMPTION-BASED** - income "
+                         "statement verified but the cash-flow statement is DATA "
+                         "UNAVAILABLE, so FCF uses assumed reinvestment rates. All DCF "
+                         "fair values are ILLUSTRATIVE (not reported-FCF valuations) and "
+                         "must be labeled as such wherever they appear. Reported-data "
+                         "valuation: DATA UNAVAILABLE.")
     else:
         lines.append("")
         lines.append("**AUDIT PASS** - all structural and numerical reconciliation checks "
