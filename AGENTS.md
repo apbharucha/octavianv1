@@ -16,6 +16,25 @@ Before doing anything else:
 4. **If in MAIN SESSION** (direct chat with your human): Also read `MEMORY.md`
 Don't ask permission. Just do it.
 
+## Master Doc
+
+`MASTER_DOC.md` at the project root is the **complete authoritative reference**
+for the entire codebase — every module, feature, and process.
+
+**Update it in the same session as every code change:**
+
+1. After adding/modifying/removing any code, update the affected section(s)
+   of `MASTER_DOC.md` before committing.
+2. New module? Add a section (or subsection) covering purpose, key
+   classes/functions, data flow, and how it plugs into `main.py` navigation.
+3. Update the **Test Suite** section when the test count changes.
+4. Always append a row to the **Changelog** table (date, change, sections
+   touched).
+5. On large changes, update the "Last updated" line at the top.
+
+Never leave the Master Doc stale — it is the continuity that lets future
+sessions (and the user) understand the whole system without re-reading code.
+
 ## Memory
 
 You wake up fresh each session. These files are your continuity:
