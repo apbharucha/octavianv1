@@ -3814,6 +3814,14 @@ def _build_institutional_deep_dive(query, intents, tickers, sectors, live_data,
     # Independent confidence recompute for QC17 (never trusts its own output).
     _, conf_recomp = _dd_confidence(completeness, has_fund, scenarios, has_price)
     _rd = dcf_fvs.get("reverse") if isinstance(dcf_fvs, dict) else None
+    # REVIEW FIX: QC18 is no longer hardcoded - the reasons lists are built
+    # with the SAME helper the committee section uses and semantically scanned
+    # (negative implication under reasons-to-own, or positive implication under
+    # reasons-not-to-own, is a QC FAILURE, not a stylistic note).
+    _ddc_base = dcf_fvs.get("Base") if isinstance(dcf_fvs, dict) else None
+    _ddc_status = dcf_fvs.get("status") if isinstance(dcf_fvs, dict) else None
+    _own, _not = _dd_build_reasons(has_price, exp_ret, _ddc_base, _ddc_status, price)
+    _reasons_viol = _dd_semantic_violations(_own, _not)
     l.append(_dd_qc_audit(has_price, has_fund, scenarios, dcf_fvs,
                           exp_ret=exp_ret, p_dd30=p_dd30, p_dd50=p_dd50,
                           fair_center=fair_center if has_price else None,
@@ -3821,7 +3829,8 @@ def _build_institutional_deep_dive(query, intents, tickers, sectors, live_data,
                           price=price, fund=fund,
                           gap_same_variable=bool(_rd and _rd.get("implied_growth") is not None),
                           confidence_ok=abs(conf_recomp - overall_conf) < 0.05,
-                          reasons_directional=True,
+                          reasons_directional=(not _reasons_viol),
+                          reasons_violations=_reasons_viol,
                           macro_gated=True, rd=_rd))
     l.append("")
     l.append("*Model output \u2014 verify against live data and your own due diligence. "
@@ -4884,32 +4893,36 @@ def _dd_confidence(completeness, has_fund, scenarios, has_price):
     return txt, round(overall, 1)
 
 
-def _dd_final_committee(display, price, fair_lo, fair_hi, fair_center, exp_ret,
-                        rating, p_dd30, p_dd50, base_g, implied_g, overall_conf,
-                        has_price, qdate=None, qsrc=None, rating_framework=None,
-                        rd=None, dcf_base=None, dcf_status=None, dcf_fv_text=None):
-    """Final investment committee output (spec section 19).
+_NEG_IMPLICATION_TOKENS = (
+    "negative", "below market", "below-market", "drawdown", "de-rate",
+    "downside", "overvalued", "underperform", "impairment", "loss",
+)
+_POS_IMPLICATION_TOKENS = (
+    "positive", "above market", "above-market", "upside", "outperform",
+    "room for convergence", "supports the multiple", "value compounding",
+)
 
-    REVIEW FIXES baked in:
-    * Valuation is separated into A) reported-data, B) assumption-based DCF
-      (CONDITIONAL/illustrative when cash flow is unavailable), C) market-
-      implied, D) scenario - never merged into one undifferentiated number.
-    * Reasons-to-own / reasons-not-to-own pass DIRECTIONAL SEMANTIC
-      VALIDATION: a negative expected return may never appear under reasons to
-      own, and a positive metric may never appear under reasons not to own.
-    * Rating is shown with its mechanical derivation (expected-return band +
-      risk adjustment), never as a hand-picked label.
-    * Fake precision is removed: drawdown probabilities are "modeled within
-      defined scenarios", never stated as empirical probabilities.
+
+def _dd_build_reasons(has_price, exp_ret, dcf_base, dcf_status, price):
+    """Build the reasons-to-own / reasons-not-to-own lists with STRICT
+    directional semantics (review rule 18 / QC18):
+
+      * a positive expected return may only appear under reasons-to-own;
+        a NEGATIVE expected return may only appear under reasons-not-to-own;
+      * a BELOW-market DCF anchor is a NEGATIVE valuation signal (the
+        fundamentals frame does not support the price) and therefore belongs
+        under reasons-not-to-own, NEVER under reasons-to-own;
+      * an at/above-market DCF anchor may appear under reasons-to-own.
+
+    Returns (reasons_own, reasons_not), each trimmed to exactly 5 items.
     """
-    # ---- Directional validation: build reasons with matching direction only ----
     reasons_own, reasons_not = [], []
     if has_price:
         if exp_ret >= 0:
             reasons_own.append(
                 f"Probability-weighted expected return {exp_ret:+.1%} over the 12m "
                 "horizon (MODEL CALCULATION, sections 13-14).")
-        elif exp_ret < 0:
+        else:
             reasons_not.append(
                 f"Probability-weighted expected return is NEGATIVE at {exp_ret:+.1%} "
                 "(MODEL CALCULATION, sections 13-14) - expectation-gap risk means "
@@ -4919,15 +4932,32 @@ def _dd_final_committee(display, price, fair_lo, fair_hi, fair_center, exp_ret,
             "Ecosystem lock-in raises switching costs and supports the multiple.",
             "Capital allocation supports per-share value compounding.",
         ]
-        if dcf_base is not None and dcf_status == "conditional":
-            reasons_own.append(
-                f"Assumption-based DCF anchor ${dcf_base:,.2f} sits below market, "
-                "quantifying how much long-run earnings power is already priced "
-                "(CONDITIONAL / illustrative - not a reported-FCF valuation).")
-        elif dcf_base is not None:
-            reasons_own.append(
-                f"DCF fair value ${dcf_base:,.2f} is above market in the reported-data "
-                "frame, leaving room for convergence (REPORTED FINANCIAL DATA).")
+        # DCF anchor DIRECTION is decisive: below-market fair value is a
+        # negative signal and may never be presented as a reason to own.
+        if dcf_base is not None:
+            if dcf_base >= price:
+                if dcf_status == "conditional":
+                    reasons_own.append(
+                        f"Assumption-based DCF anchor ${dcf_base:,.2f} is at/above "
+                        "market, so the conditional frame does not contradict the "
+                        "price (CONDITIONAL / illustrative - not a reported-FCF "
+                        "valuation).")
+                else:
+                    reasons_own.append(
+                        f"DCF fair value ${dcf_base:,.2f} is at/above market in the "
+                        "reported-data frame, leaving room for convergence "
+                        "(REPORTED FINANCIAL DATA).")
+            else:
+                if dcf_status == "conditional":
+                    reasons_not.append(
+                        f"Assumption-based DCF anchor ${dcf_base:,.2f} sits BELOW "
+                        "market - the conditional fundamentals frame does not "
+                        "support the current price (CONDITIONAL / illustrative - "
+                        "not a reported-FCF valuation).")
+                else:
+                    reasons_not.append(
+                        f"DCF fair value ${dcf_base:,.2f} sits below market in the "
+                        "reported-data frame (REPORTED FINANCIAL DATA).")
         else:
             reasons_own.append(
                 "Data-completeness gate is transparent about what is missing, so the "
@@ -4955,8 +4985,52 @@ def _dd_final_committee(display, price, fair_lo, fair_hi, fair_center, exp_ret,
             "High expectations mean the multiple embeds substantial growth - any "
             "downward revision to the growth path compounds into multiple compression "
             "(expectation-gap mechanism, sections 7-8).")
-    reasons_own = reasons_own[:5]
-    reasons_not = reasons_not[:5]
+    return reasons_own[:5], reasons_not[:5]
+
+
+def _dd_semantic_violations(reasons_own, reasons_not):
+    """HARD semantic QC (review rule 18): a negative investment implication may
+    never appear under Reasons to Own; a positive implication may never appear
+    under Reasons NOT to Own. Returns a list of violation strings (empty list ==
+    clean). This is a QC FAILURE condition, not stylistic guidance - the audit
+    fails when any violation is found."""
+    violations = []
+    for i, r in enumerate(reasons_own, 1):
+        low = r.lower()
+        if any(t in low for t in _NEG_IMPLICATION_TOKENS) or \
+                re.search(r"-\d+(\.\d+)?%", r):
+            violations.append(f"reasons-to-own #{i} contains a negative implication: {r}")
+    for i, r in enumerate(reasons_not, 1):
+        low = r.lower()
+        if any(t in low for t in _POS_IMPLICATION_TOKENS) or \
+                re.search(r"\+\d+(\.\d+)?%", r):
+            violations.append(f"reasons-not-to-own #{i} contains a positive implication: {r}")
+    return violations
+
+
+def _dd_final_committee(display, price, fair_lo, fair_hi, fair_center, exp_ret,
+                        rating, p_dd30, p_dd50, base_g, implied_g, overall_conf,
+                        has_price, qdate=None, qsrc=None, rating_framework=None,
+                        rd=None, dcf_base=None, dcf_status=None, dcf_fv_text=None):
+    """Final investment committee output (spec section 19).
+
+    REVIEW FIXES baked in:
+    * Valuation is separated into A) reported-data, B) assumption-based DCF
+      (CONDITIONAL/illustrative when cash flow is unavailable), C) market-
+      implied, D) scenario - never merged into one undifferentiated number.
+    * Reasons-to-own / reasons-not-to-own pass DIRECTIONAL SEMANTIC
+      VALIDATION (via _dd_build_reasons / _dd_semantic_violations): a negative
+      expected return OR a below-market DCF anchor may never appear under
+      reasons to own, and a positive metric may never appear under reasons not
+      to own. Violations fail QC18.
+    * Rating is shown with its mechanical derivation (expected-return band +
+      risk adjustment), never as a hand-picked label.
+    * Fake precision is removed: drawdown probabilities are "modeled within
+      defined scenarios", never stated as empirical probabilities.
+    """
+    # ---- Directional validation: build reasons with matching direction only ----
+    reasons_own, reasons_not = _dd_build_reasons(has_price, exp_ret, dcf_base,
+                                                 dcf_status, price)
 
     lines = ["## Investment Rating", "", f"**{rating}** (mechanically derived, section 13)", ""]
     if rating_framework:
@@ -5086,7 +5160,8 @@ def _dd_qc_audit(has_price, has_fund, scenarios, dcf_fvs, exp_ret=0.0, p_dd30=0.
                  p_dd50=0.0, fair_center=None, implied_g=0.0, wacc=0.095,
                  term_g=0.028, base_g=0.05, price=0.0, fund=None,
                  gap_same_variable=False, confidence_ok=True,
-                 reasons_directional=True, macro_gated=True, rd=None):
+                 reasons_directional=True, macro_gated=True, rd=None,
+                 reasons_violations=None):
     """Final quality-control audit (spec section 20) with a NUMERICAL
     RECONCILIATION layer: every headline number is independently recomputed
     from the scenario/fundamental inputs and compared to what the memo
@@ -5153,8 +5228,11 @@ def _dd_qc_audit(has_price, has_fund, scenarios, dcf_fvs, exp_ret=0.0, p_dd30=0.
                    f"(revenue CAGR vs revenue CAGR)", gap_same_variable))
     checks.append((f"QC17 confidence mechanically recomputed from disclosed components "
                    f"and fixed weights", confidence_ok))
+    _viol = reasons_violations or []
     checks.append((f"QC18 directional validation: reasons-to-own contain only positive "
-                   f"evidence; reasons-not-to-own only negative", reasons_directional))
+                   f"evidence; reasons-not-to-own only negative"
+                   + (f" ({len(_viol)} violation(s) found)" if _viol else ""),
+                   reasons_directional and not _viol))
     checks.append((f"QC19 current macro claims gated (no timestamped macro dataset "
                    f"attached -> DATA UNAVAILABLE, framework only)", macro_gated))
     if rd and rd.get("implied_growth") is not None:
@@ -5170,6 +5248,10 @@ def _dd_qc_audit(has_price, has_fund, scenarios, dcf_fvs, exp_ret=0.0, p_dd30=0.
     for name, ok in checks:
         lines.append(f"| {name} | {'PASS' if ok else 'FAIL'} |")
     failed = [n for n, ok in checks if not ok]
+    if _viol:
+        lines.append("")
+        lines.append("**SEMANTIC QC FAILURES (reasons direction):** "
+                     + "; ".join(_viol))
     if failed:
         lines.append("")
         lines.append("**AUDIT PARTIAL PASS - " + str(len(failed)) +

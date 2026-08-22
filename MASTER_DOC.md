@@ -317,10 +317,10 @@ streamlit run main.py --server.headless true
 ### Running tests
 
 ```bash
-python3 -m pytest tests/ -q          # full suite (719 tests)
+python3 -m pytest tests/ -q          # full suite (730 tests)
 ```
 
-The suite currently has **719 passing tests** covering engines, UI walkthroughs
+The suite currently has **730 passing tests** covering engines, UI walkthroughs
 (Streamlit `AppTest`), integration flows, and the deep-dive memo integrity.
 
 ---
@@ -732,7 +732,7 @@ research-integrity spec with these helpers:
 - **Same-variable discipline:** the expectation-gap (§8) and "largest market-vs-model disagreement" (§19) compare the market-implied REVENUE CAGR (multi-variable reverse solve) against the model's REVENUE growth — never FCF growth vs revenue growth. QC16 enforces this.
 - **DCF labeling:** the DCF now prints its EXACT reinvestment formulas (D&A = 6%×Revenue, CAPEX = 8%×Revenue, **ΔNWC = 5%×ΔRevenue — the CHANGE in revenue, not total revenue**); status is **CONDITIONAL / ASSUMPTION-BASED** (not "PARTIAL") when cash flow is unavailable; every DCF fair value is labeled ILLUSTRATIVE. QC21 verifies the status.
 - **Valuation separation:** §19 splits valuation into (A) reported-data, (B) assumption-based DCF, (C) market-implied, (D) scenario — provenances are never merged.
-- **Directional validation:** reasons-to-own contain only positively directional evidence and reasons-not-to-own only negative (a negative expected return can never appear under "reasons to own"). QC18 verifies.
+- **Directional validation (round-2 hardened):** reasons-to-own/reasons-not-to-own are built by `_dd_build_reasons` and scanned by `_dd_semantic_violations` — a negative expected return OR a below-market DCF anchor can never appear under "reasons to own" (a below-market anchor is a negative implication and goes under reasons-not-to-own), and a positive implication can never appear under "reasons not to own". QC18 runs the REAL scan (no longer hardcoded) and a violation prints a SEMANTIC QC FAILURES block and flips the audit to FAIL.
 - **Confidence:** mechanically computed from disclosed components with fixed weights (30/25/25/20); the formula and weights are printed. QC17 recomputes it independently.
 - **Bayesian:** labeled **SUBJECTIVE BAYESIAN FRAMEWORK / Bayesian-Style Scenario Update** — likelihood ratios are analyst-set, never presented as calibrated probability. QC12.
 - **Fake precision removed:** every drawdown/loss probability is "modeled P(...) within defined scenarios" with empirical probabilities stated DATA UNAVAILABLE (§13/§14/§19).
@@ -745,26 +745,40 @@ delayed EOD). Fundamentals come from `_dd_fetch_fundamentals` →
 OCTAVIAN_OFFLINE). `_is_financial_metric_token` is the second firewall layer
 so metric tokens never become deep-dive subjects.
 
-**Deep-dive chart engine (`deep_dive_charts.py`, ~360 lines)** — REVIEW FIX 1
+**Deep-dive chart engine (`deep_dive_charts.py`, ~430 lines)** — REVIEW FIX 1
 (the 4-chart problem): every deep-dive thesis gets EXACTLY FOUR charts, each
 serving a DISTINCT analytical job built from the memo's own numbers — never
 generic price charts:
 
 1. **expectation_gap** — current price vs DCF bear/base/bull, scenario-weighted
-   value, market-implied requirement.
+   value, market-implied requirement. When the DCF is CONDITIONAL
+   (assumption-based, cash-flow statement unavailable), the chart prints a
+   prominent banner "CONDITIONAL DCF — NOT VERIFIED FCF VALUATION", labels the
+   bars "Cond. DCF Bear/Base/Bull" (never a bare "DCF Bear"), and the
+   provenance says so — review round 2, issue 1.
 2. **scenario_distribution** — five scenarios: probability, implied price,
    expected-return contribution.
 3. **valuation_sensitivity** — WACC × terminal-growth heatmap on the base DCF,
-   computed by the same engine as memo §6.
-4. **risk_reward** — probability-weighted downside vs upside with thesis risks.
+   computed by the same engine as memo §6. Carries the same CONDITIONAL DCF
+   banner when applicable.
+4. **risk_reward** — metrics TABLE tied to the memo text (review round 2,
+   issue 2): probability-weighted return, probability-weighted price, current
+   price, upside/downside scenario ranges, weighted upside/downside
+   contributions, and modeled P(>30%/>50% drawdown) each labeled "within
+   defined scenarios (empirical: DATA UNAVAILABLE)". Replaces the old
+   abstract weighted-downside/upside bars that did not obviously reconcile
+   with the headline return.
 
 Every chart carries full metadata: `chart_id` (run_id + purpose), `purpose`,
-`dataset`, `data_timestamp`, `provenance`, `calculation`, `run_id`, and a
-`dataset_hash` (sha256 of its inputs). A process-wide `_CHART_HASH_REGISTRY`
-flags `reused_dataset` when an identical (purpose, dataset) was already
-rendered — the spec is always regenerated from the current run's data, never a
-cached figure. Unsupported charts return a DATA UNAVAILABLE state instead of
-fabricating or recycling one.
+`dataset`, `data_timestamp`, `provenance`, `calculation`, `run_id`, a
+`dataset_hash` (sha256 of its inputs), and a `qc_status` computed by
+`_chart_qc` — the visualization layer inherits the memo's reconciliation rules
+(review round 2: "extend the integrity firewall to the visualization layer"),
+so a chart can never display numbers the memo's audit would reject. A
+process-wide `_CHART_HASH_REGISTRY` flags `reused_dataset` when an identical
+(purpose, dataset) was already rendered — the spec is always regenerated from
+the current run's data, never a cached figure. Unsupported charts return a
+DATA UNAVAILABLE state instead of fabricating or recycling one.
 
 Wired into `ai_chatbot.process_enhanced_query`: deep-dive queries are detected
 via `_is_deep_dive_query` and get the four analytical charts; all other
@@ -2441,7 +2455,7 @@ codebase — the actual journey of a user action from UI click to output.
 
 ## Test Suite
 
-Run: `python3 -m pytest tests/ -q` — **719 tests pass** (as of 2026-08-21
+Run: `python3 -m pytest tests/ -q` — **730 tests pass** (as of 2026-08-21
 session). Coverage by file:
 
 | Test file | Tests | Focus |
@@ -2527,6 +2541,7 @@ check, pyflakes clean of new issues.
 | Date | Change | Sections touched |
 |---|---|---|
 | 2026-08-21 | Master Doc created (full codebase walkthrough); deep-dive memo review-fix iteration: new `deep_dive_charts.py` (4 distinct analytical charts with chart_id/purpose/dataset/timestamp/provenance/calculation/run_id/dataset_hash + no-reuse registry, wired into `process_enhanced_query`), display-precision scenario engine (weighted return recomputes exactly from printed table, QC3b), same-variable market-vs-model disagreement (QC16), DCF exact formula labels + CONDITIONAL/ASSUMPTION-BASED status + A/B/C/D valuation separation (QC21), directional validation of reasons to own/not (QC18), mechanical risk-adjusted rating, confidence with fixed disclosed weights (QC17), SUBJECTIVE Bayesian label, modeled-vs-empirical probability language, macro current-claims gating (QC19), 13-point quantitative-integrity firewall in the LLM system prompt. 695 tests → 719. | AI & NLP Layer; Chart Engine; Test Suite |
+| 2026-08-21 | Deep-dive retest review (round 2, ~8.3/10) fixes: (1) charts now carry an explicit "CONDITIONAL DCF — NOT VERIFIED FCF VALUATION" banner + "Cond. DCF" bar labels on expectation-gap and valuation-sensitivity charts; (2) risk/reward chart rebuilt as a metrics table that directly matches the memo text (weighted return, weighted price, current price, upside/downside ranges, modeled drawdown probs with empirical DATA UNAVAILABLE); (3) below-market DCF anchor moved from reasons-to-own to reasons-not-to-own (it was a negative implication listed as a reason to own); (4) QC18 no longer hardcoded — `_dd_build_reasons` + `_dd_semantic_violations` actually scan the reason lists and a violation flips QC18 to FAIL with a SEMANTIC QC FAILURES block; (5) every chart gains a `qc_status` computed by `_chart_qc` so the visualization inherits the memo's reconciliation/QC status; (6) eval prompts (`prompt_factory`, `llm_stress_test`) now request "MODELED probability … within defined scenarios" instead of bare drawdown probabilities. 719 tests → 730. | AI & NLP Layer; Chart Engine; Test Suite |
 | 2026-08-19 | Deep-dive memo fixes (DCF gating + site-tool DCF, multi-variable reverse DCF, consistent expected-return/drawdown probs, operating-leverage scenarios, price timestamps, labeled macro, Bayesian basis, numeric QC audit); algorithm builder symbol/asset-type stamps, real ensemble trade counts, exact per-window Sharpe; portal quick-select buttons fill most-relevant assets. 694 tests → 695. | AI & NLP Layer; Algorithm Builder; Quant Portal; Test Suite |
 | 2026-08-17 | Rebuilt institutional deep-dive memo to the 20-section research-integrity spec + extreme stress tests (43 → 48 tests). | AI & NLP Layer |
 | 2026-08-15 | Quant portal error fixes; Algorithm Builder advanced backtests + dynamic ensemble; algorithm-builder → paper-trading deployment bridge. | Quant Portal; Algorithm Builder; Trading Infrastructure |

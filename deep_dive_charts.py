@@ -67,6 +67,43 @@ def _dataset_hash(*parts) -> str:
 _CHART_HASH_REGISTRY = {}
 
 
+_CONDITIONAL_BANNER = "CONDITIONAL DCF - NOT VERIFIED FCF VALUATION"
+
+
+def _chart_qc(eng, dcf_status, has_price, has_fund):
+    """Chart-level QC status: the visualization inherits the SAME reconciliation
+    rules as the memo (review: charts must carry the report's QC status).
+    Returns a short status string; every chart dict carries it and the figure
+    prints it, so a chart can never display numbers the memo's audit rejects."""
+    fails = []
+    probs = [p for _, p, _ in eng["scenarios"]]
+    if abs(sum(probs) - 1.0) > 1e-9:
+        fails.append("scenario probabilities do not sum to 100%")
+    rec = sum(p * r for _, p, r in eng["scenarios"])
+    if abs(rec - eng["exp_ret"]) > 1e-9:
+        fails.append("weighted return does not recompute from displayed scenarios")
+    if dcf_status == "conditional" and not has_fund:
+        fails.append("conditional DCF displayed without reported fundamentals")
+    if not has_price and not fails:
+        fails.append("no live price attached")
+    if fails:
+        return "QC FAIL - " + "; ".join(fails)
+    return "QC PASS - chart values recompute from the memo's displayed scenario table"
+
+
+def _conditional_banner_annotation(has_fund, dcf_status):
+    """Prominent banner annotation for conditional (assumption-based) DCF
+    values - the review's point 1: the UI must label these charts explicitly
+    rather than simply 'DCF Bear / DCF Base / DCF Bull'."""
+    if has_fund and dcf_status == "conditional":
+        return [dict(text=_CONDITIONAL_BANNER, x=0.5, y=1.10, xref="paper",
+                     yref="paper", showarrow=False,
+                     font=dict(size=13, color="#E67E22"),
+                     bordercolor="#E67E22", borderwidth=1,
+                     bgcolor="rgba(40,40,40,0.85)")]
+    return []
+
+
 def _check_reuse(chart_type: str, dataset_hash: str, run_id: str) -> bool:
     """Returns True when this (purpose, dataset) was already rendered in this
     process; updates the registry either way."""
@@ -139,6 +176,8 @@ def build_deep_dive_charts(query, tickers, sectors=None, live_data=None,
                                     eng["term_g"], has_price, has_fund)
     dcf_status = dcf_fvs.get("status") if isinstance(dcf_fvs, dict) else None
     fair_center = price * (1.0 + min(max(exp_ret, -0.35), 0.45)) if has_price else None
+    qc_status = _chart_qc(eng, dcf_status, has_price, has_fund)
+    cond_banner = _conditional_banner_annotation(has_fund, dcf_status)
 
     charts = []
 
@@ -152,7 +191,12 @@ def build_deep_dive_charts(query, tickers, sectors=None, live_data=None,
     if has_fund and isinstance(dcf_fvs, dict):
         for name in ("Bear", "Base", "Bull"):
             if dcf_fvs.get(name) is not None:
-                labels.append(f"DCF {name}" + (" (cond.)" if dcf_status == "conditional" else ""))
+                # Explicit conditional label - review point 1: never a bare
+                # "DCF Bear/Base/Bull" when the values are assumption-based.
+                if dcf_status == "conditional":
+                    labels.append(f"Cond. DCF {name}")
+                else:
+                    labels.append(f"DCF {name}")
                 vals.append(dcf_fvs[name])
                 colors.append("#8B4513" if name == "Bear" else "#CD853F" if name == "Base" else "#B8860B")
     if not vals:
@@ -165,7 +209,7 @@ def build_deep_dive_charts(query, tickers, sectors=None, live_data=None,
             "calculation": "price, price*(1+weighted return), DCF per-share per scenario",
             "dataset_hash": _dataset_hash(sym, price, chg, fund, scenarios),
             "status": "DATA UNAVAILABLE", "title": f"{display} - Expectation Gap",
-            "symbol": sym, "figure": _unavailable_figure(
+            "symbol": sym, "qc_status": qc_status, "figure": _unavailable_figure(
                 f"{display} - Expectation Gap",
                 "Expectation gap: price vs DCF vs scenario-weighted value"),
         })
@@ -176,29 +220,34 @@ def build_deep_dive_charts(query, tickers, sectors=None, live_data=None,
         if has_price:
             fig.add_hline(y=price, line_dash="dash", line_color="#FFD700",
                           annotation_text=f"Market ${price:,.2f}")
-        dcf_note = (" (illustrative - assumption-based DCF)" if dcf_status == "conditional" else "")
+        dcf_note = (" | DCF values are CONDITIONAL (assumption-based reinvestment; "
+                    "not verified reported FCF)" if dcf_status == "conditional" else "")
+        # NOTE: update_layout(annotations=[...]) MERGES by index in plotly, so
+        # the full list (hline's Market annotation + banner + footer) must be
+        # assembled explicitly or the banner is silently merged away.
+        _footer = dict(text=("Expectation gap: how much of the price is explained by "
+                             "fundamentals vs expectations" + dcf_note + " | " + qc_status),
+                       x=0.5, y=-0.18, xref="paper", yref="paper",
+                       showarrow=False, font=dict(size=11, color="#999999"))
+        fig.layout.annotations = (list(fig.layout.annotations) + cond_banner + [_footer])
         fig.update_layout(
             title=f"{display} - Expectation Gap",
             template="plotly_dark", height=380,
             yaxis_title="Value ($/share)",
             margin=dict(l=40, r=40, t=60, b=40),
-            annotations=[
-                dict(text=("Expectation gap: how much of the price is explained by "
-                           "fundamentals vs expectations" + dcf_note),
-                     x=0.5, y=-0.18, xref="paper", yref="paper",
-                     showarrow=False, font=dict(size=11, color="#999999")),
-            ],
         )
         charts.append({
             "type": "expectation_gap", "chart_id": f"{run_id}-01-expectation_gap",
             "purpose": "Current price vs DCF bear/base/bull, scenario-weighted value and market-implied requirement",
             "dataset": "quote price + memo scenario engine + DCF engine",
             "data_timestamp": data_ts, "run_id": run_id,
-            "provenance": "OBSERVED DATA + MODEL CALCULATION",
+            "provenance": ("OBSERVED DATA + MODEL CALCULATION + CONDITIONAL DCF "
+                            "(assumption-based, NOT verified FCF)" if dcf_status == "conditional"
+                            else "OBSERVED DATA + MODEL CALCULATION"),
             "calculation": "price, price*(1+weighted return), DCF per-share per scenario",
             "dataset_hash": _dataset_hash(sym, price, chg, fund, scenarios),
             "status": "OK", "title": f"{display} - Expectation Gap",
-            "symbol": sym, "figure": fig,
+            "symbol": sym, "qc_status": qc_status, "figure": fig,
         })
 
     # ---------------------------------------------------------------- #
@@ -244,7 +293,7 @@ def build_deep_dive_charts(query, tickers, sectors=None, live_data=None,
         "dataset_hash": _dataset_hash(sym, price, scenarios, exp_ret),
         "status": "OK" if has_price else "DATA UNAVAILABLE",
         "title": f"{display} - Scenario Distribution",
-        "symbol": sym, "figure": fig2,
+        "symbol": sym, "qc_status": qc_status, "figure": fig2,
     })
 
     # ---------------------------------------------------------------- #
@@ -271,16 +320,20 @@ def build_deep_dive_charts(query, tickers, sectors=None, live_data=None,
             title=f"{display} - Valuation Sensitivity (Base DCF)",
             template="plotly_dark", height=360,
             margin=dict(l=40, r=40, t=60, b=40),
-            annotations=[
+            annotations=cond_banner + [
                 dict(text=("WACC x terminal-growth grid on the base DCF, computed by the "
                            "same valuation engine as memo section 6" +
-                           (" (illustrative - assumption-based)" if dcf_status == "conditional" else "")),
+                           (" | CONDITIONAL DCF (assumption-based reinvestment)"
+                            if dcf_status == "conditional" else "") + " | " + qc_status),
                      x=0.5, y=-0.18, xref="paper", yref="paper",
                      showarrow=False, font=dict(size=11, color="#999999")),
             ],
         )
         status3 = "OK"
-        prov3 = "MODEL CALCULATION (DCF engine) + REPORTED FINANCIAL DATA"
+        prov3 = ("MODEL CALCULATION (DCF engine) + REPORTED FINANCIAL DATA + "
+                 "CONDITIONAL DCF (assumption-based, NOT verified FCF)"
+                 if dcf_status == "conditional"
+                 else "MODEL CALCULATION (DCF engine) + REPORTED FINANCIAL DATA")
         calc3 = "DCF per-share = PV(FCF@WACC) + TV/(1+WACC)^5 - net debt + cash / shares"
     else:
         fig3 = _unavailable_figure(f"{display} - Valuation Sensitivity",
@@ -298,11 +351,13 @@ def build_deep_dive_charts(query, tickers, sectors=None, live_data=None,
         "dataset_hash": _dataset_hash(sym, fund, base_g,
                                        [0.085, 0.095, 0.105], [0.02, 0.028, 0.035]),
         "status": status3, "title": f"{display} - Valuation Sensitivity",
-        "symbol": sym, "figure": fig3,
+        "symbol": sym, "qc_status": qc_status, "figure": fig3,
     })
 
     # ---------------------------------------------------------------- #
-    #  CHART 4 - RISK / REWARD: weighted downside vs upside + risks     #
+    #  CHART 4 - RISK / REWARD: metrics table tied to the memo text      #
+    #  (review point 2: the chart must directly correspond to the report, #
+    #   so it shows the same headline metrics instead of abstract bars)   #
     # ---------------------------------------------------------------- #
     fig4 = go.Figure()
     if has_price:
@@ -310,23 +365,43 @@ def build_deep_dive_charts(query, tickers, sectors=None, live_data=None,
         up = [(n, p, r) for n, p, r in scenarios if r >= 0]
         down_w = sum(p * r for _, p, r in down)
         up_w = sum(p * r for _, p, r in up)
-        fig4.add_trace(go.Bar(
-            x=["Weighted downside", "Weighted upside"],
-            y=[down_w, up_w],
-            marker_color=["#B8860B", "#FFD700"],
-            text=[f"{down_w:+.1%}", f"{up_w:+.1%}"],
-            textposition="outside",
-            name="Probability-weighted return contribution"))
+        up_range = (f"{min(r for _, _, r in up):+.0%} to "
+                    f"{max(r for _, _, r in up):+.0%}") if up else "n/a"
+        down_range = (f"{min(r for _, _, r in down):+.0%} to "
+                      f"{max(r for _, _, r in down):+.0%}") if down else "n/a"
+        p_dd30 = eng.get("p_dd30", 0.0)
+        p_dd50 = eng.get("p_dd50", 0.0)
+        rows = [
+            ("Probability-weighted return", f"{exp_ret:+.1%}"),
+            ("Probability-weighted price", f"${fair_center:,.2f}"),
+            ("Current price", f"${price:,.2f}"),
+            ("Upside scenarios", up_range),
+            ("Downside scenarios", down_range),
+            ("Weighted upside contribution", f"{up_w:+.1%}"),
+            ("Weighted downside contribution", f"{down_w:+.1%}"),
+            ("Modeled P(>30% drawdown)",
+             f"{p_dd30:.0%} within defined scenarios (empirical: {_DD_DATA_UNAVAILABLE})"),
+            ("Modeled P(>50% drawdown)",
+             f"{p_dd50:.0%} within defined scenarios (empirical: {_DD_DATA_UNAVAILABLE})"),
+        ]
+        fig4 = go.Figure(data=[go.Table(
+            header=dict(values=["Metric", "Value"], fill_color="#2c2c2c",
+                        align="left", font=dict(color="#FFD700", size=13)),
+            cells=dict(values=[list(c) for c in zip(*rows)],
+                       fill_color="#222222", align="left", height=28,
+                       font=dict(color="#DDDDDD", size=12)),
+        )])
         fig4.update_layout(
             title=f"{display} - Risk / Reward",
-            template="plotly_dark", height=380,
-            yaxis=dict(title="Expected-return contribution", tickformat=".0%"),
+            template="plotly_dark", height=440,
             margin=dict(l=40, r=40, t=60, b=40),
             annotations=[
-                dict(text=("Probability-weighted downside vs upside from the five scenarios. "
+                dict(text=("Risk/reward from the five scenarios - the table matches the "
+                           "memo's section 13/14 numbers exactly. Weighted return = "
+                           "sum(p x r); weighted price = price x (1 + weighted return). "
                            "Major risks: AI-capex digestion, ASIC substitution, margin "
-                           "compression, export restrictions (see memo section 11)"),
-                     x=0.5, y=-0.18, xref="paper", yref="paper",
+                           "compression, export restrictions (memo section 11). " + qc_status),
+                     x=0.5, y=-0.12, xref="paper", yref="paper",
                      showarrow=False, font=dict(size=11, color="#999999")),
             ],
         )
@@ -337,14 +412,14 @@ def build_deep_dive_charts(query, tickers, sectors=None, live_data=None,
         status4 = "DATA UNAVAILABLE"
     charts.append({
         "type": "risk_reward", "chart_id": f"{run_id}-04-risk_reward",
-        "purpose": "Probability-weighted downside vs upside with the major thesis risks and catalysts",
+        "purpose": "Probability-weighted risk/reward metrics table tied to memo sections 13-14 (weighted return, weighted price, upside/downside ranges, modeled drawdown probabilities)",
         "dataset": "memo five-scenario engine + risk matrix",
         "data_timestamp": data_ts, "run_id": run_id,
-        "provenance": "MODEL CALCULATION (scenario engine)",
-        "calculation": "sum(p*r) over negative-return scenarios vs positive-return scenarios",
+        "provenance": "MODEL CALCULATION (scenario engine) + OBSERVED DATA (price)",
+        "calculation": "weighted return = sum(p*r); weighted price = price*(1+weighted return); weighted upside/downside = sum(p*r) over positive/negative scenarios; P(>30%/>50%) = sum(p) over scenarios with r<=-30%/-50%",
         "dataset_hash": _dataset_hash(sym, price, scenarios),
         "status": status4, "title": f"{display} - Risk / Reward",
-        "symbol": sym, "figure": fig4,
+        "symbol": sym, "qc_status": qc_status, "figure": fig4,
     })
 
     # No-reuse firewall: flag any chart whose (purpose, dataset-hash) was

@@ -400,3 +400,147 @@ def test_qc20_reverse_dcf_variables_never_conflated():
     out = _memo()
     sec = _section(out, "### 20. Quality Control Audit")
     assert re.search(r"QC20.*PASS", sec)
+
+
+# --------------------------------------------------------------------------- #
+#  9. RETEST REVIEW (round 2) - semantic + visualization integrity firewall
+# --------------------------------------------------------------------------- #
+
+def test_below_market_dcf_anchor_is_reason_not_to_own():
+    # The FUND fixture's conservative DCF anchor sits BELOW market. A below-
+    # market fair value is a NEGATIVE implication - it may never appear under
+    # reasons-to-own (the round-1 build listed it there as a "reason to own").
+    from financial_llm_engine import _dd_build_reasons
+    own, not_ = _dd_build_reasons(True, -0.043, 89.34, "conditional", 214.72)
+    assert any("below market" in r.lower() for r in not_), \
+        "below-market DCF anchor must be a reason NOT to own"
+    assert all("below market" not in r.lower() for r in own), \
+        "below-market DCF anchor may never be a reason to own"
+
+
+def test_semantic_scan_detects_misplaced_direction():
+    from financial_llm_engine import _dd_semantic_violations
+    # clean lists -> no violations
+    assert _dd_semantic_violations(["good moat"], ["expensive"]) == []
+    # negative implication under reasons-to-own -> violation
+    v = _dd_semantic_violations(
+        ["Assumption-based DCF anchor $89.34 sits below market"], ["bad"])
+    assert any("reasons-to-own" in x for x in v)
+    # positive implication under reasons-not-to-own -> violation
+    v2 = _dd_semantic_violations(["ok"], ["Expected return +8.8% above market"])
+    assert any("reasons-not-to-own" in x for x in v2)
+
+
+def test_qc18_uses_real_validation_not_hardcoded():
+    # The audit must actually scan the reasons lists (round-1 build passed
+    # reasons_directional=True unconditionally). A planted violation must
+    # flip QC18 to FAIL.
+    from financial_llm_engine import _dd_qc_audit
+    eng = _dd_scenario_engine(3.52)
+    audit = _dd_qc_audit(True, True, eng["scenarios"], {}, exp_ret=eng["exp_ret"],
+                         price=225.16, fund=FUND,
+                         reasons_directional=False,
+                         reasons_violations=["reasons-to-own #1 contains a negative implication: x"])
+    assert "QC18 directional validation" in audit
+    assert re.search(r"QC18.*FAIL", audit)
+    assert "SEMANTIC QC FAILURES" in audit
+
+
+def test_memo_qc18_passes_with_real_scan():
+    # The real memo (bull fixture) must pass QC18 under the actual scan.
+    out = _memo()
+    sec = _section(out, "### 20. Quality Control Audit")
+    assert re.search(r"QC18.*PASS", sec)
+    assert "SEMANTIC QC FAILURES" not in sec
+
+
+def test_expectation_gap_chart_has_conditional_banner():
+    import deep_dive_charts as ddc
+    ddc._CHART_HASH_REGISTRY.clear()
+    charts = build_deep_dive_charts(NVDA_QUERY, ["NVDA"], ["technology"], LIVE, FUND,
+                                    run_id="RUN40")
+    eg = next(c for c in charts if c["type"] == "expectation_gap")
+    fig_txt = str(eg["figure"])
+    # the FUND DCF is CONDITIONAL (cash flow unavailable): the chart must say
+    # so explicitly, never a bare "DCF Bear / DCF Base / DCF Bull"
+    assert "CONDITIONAL DCF" in fig_txt
+    assert "NOT VERIFIED FCF VALUATION" in fig_txt
+    assert "Cond. DCF" in fig_txt
+    # and the chart inherits the memo's QC status
+    assert eg["qc_status"].startswith("QC")
+    ddc._CHART_HASH_REGISTRY.clear()
+
+
+def test_valuation_sensitivity_chart_has_conditional_banner():
+    import deep_dive_charts as ddc
+    ddc._CHART_HASH_REGISTRY.clear()
+    charts = build_deep_dive_charts(NVDA_QUERY, ["NVDA"], ["technology"], LIVE, FUND,
+                                    run_id="RUN41")
+    vs = next(c for c in charts if c["type"] == "valuation_sensitivity")
+    fig_txt = str(vs["figure"])
+    assert "CONDITIONAL DCF" in fig_txt
+    assert "NOT VERIFIED FCF VALUATION" in fig_txt
+    ddc._CHART_HASH_REGISTRY.clear()
+
+
+def test_risk_reward_chart_is_metrics_table_matching_text():
+    import deep_dive_charts as ddc
+    ddc._CHART_HASH_REGISTRY.clear()
+    charts = build_deep_dive_charts(NVDA_QUERY, ["NVDA"], ["technology"], LIVE, FUND,
+                                    run_id="RUN42")
+    rr = next(c for c in charts if c["type"] == "risk_reward")
+    cells = rr["figure"].data[0].cells
+    metric_col = list(cells.values)[0]
+    val_col = list(cells.values)[1]
+    metrics = dict(zip(metric_col, val_col))
+    # the table directly corresponds to the memo text (review point 2)
+    for key in ("Probability-weighted return", "Probability-weighted price",
+                "Current price", "Upside scenarios", "Downside scenarios"):
+        assert key in metrics, f"missing metric row {key}"
+    # strict modeled-probability language (review point 3)
+    assert "within defined scenarios" in metrics["Modeled P(>30% drawdown)"]
+    assert "within defined scenarios" in metrics["Modeled P(>50% drawdown)"]
+    assert "empirical:" in metrics["Modeled P(>30% drawdown)"]
+    # values reconcile with the memo's scenario engine
+    eng = _dd_scenario_engine(LIVE["NVDA"]["change_5d"])
+    assert f"{eng['exp_ret']:+.1%}" == metrics["Probability-weighted return"]
+    fv = LIVE["NVDA"]["price"] * (1 + eng["exp_ret"])
+    assert abs(float(metrics["Probability-weighted price"].replace("$", "").replace(",", "")) - fv) < 0.01
+    # every chart carries the QC status (visualization inherits memo QC)
+    assert rr["qc_status"].startswith("QC")
+    ddc._CHART_HASH_REGISTRY.clear()
+
+
+def test_all_charts_carry_qc_status():
+    import deep_dive_charts as ddc
+    ddc._CHART_HASH_REGISTRY.clear()
+    charts = build_deep_dive_charts(NVDA_QUERY, ["NVDA"], ["technology"], LIVE, FUND,
+                                    run_id="RUN43")
+    for c in charts:
+        assert c["qc_status"].startswith("QC"), f"missing qc_status on {c['type']}"
+    ddc._CHART_HASH_REGISTRY.clear()
+
+
+def test_chart_qc_fails_when_values_do_not_reconcile():
+    from deep_dive_charts import _chart_qc
+    # A deliberately inconsistent scenario set must produce QC FAIL
+    bad = {"scenarios": [("A", 0.5, 0.1), ("B", 0.4, -0.2)], "exp_ret": 0.99}
+    st = _chart_qc(bad, None, True, True)
+    assert st.startswith("QC FAIL")
+
+
+def test_eval_prompts_request_modeled_probability_language():
+    import chatbot_eval.prompt_factory as pf
+    blob = "\n".join(pf._DEEP_DIVE_TEMPLATES)
+    # the old "probability of a >30% drawdown" phrasing is gone from the prompts
+    assert "MODELED probability" in blob or "modeled probability" in blob.lower()
+    assert "within defined scenarios" in blob
+    # and the bare old phrase is no longer requested
+    assert "the probability of a >30% drawdown" not in blob
+
+
+def test_llm_stress_prompt_uses_modeled_language():
+    import llm_stress_test as lst
+    src = open(lst.__file__).read()
+    assert "MODELED probability of a >30% drawdown" in src
+    assert "within defined scenarios" in src

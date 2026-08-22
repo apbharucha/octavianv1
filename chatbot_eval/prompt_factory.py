@@ -786,8 +786,10 @@ _DEEP_DIVE_TEMPLATES = [
     "matrix covering probability, severity, time horizon and detectability. Identify "
     "catalysts over 0-3, 3-6, 6-12 and 12-24 months with probabilities and valuation impact. "
     "Construct {sc} scenarios with probabilities that sum to 100% and provide "
-    "probability-weighted fair value, 12-month expected return, probability of permanent "
-    "capital impairment, probability of a >30% drawdown and a final rating. Falsify your "
+    "probability-weighted fair value, 12-month expected return, the MODELED probability "
+    "of permanent capital impairment and of a >30% drawdown (each explicitly labeled "
+    "'within defined scenarios'; empirical probability is DATA UNAVAILABLE if not "
+    "measured) and a final rating. Falsify your "
     "own thesis: identify the strongest arguments against your conclusion and what would "
     "cause you to change your rating. Finally tell me: what would I have to believe for "
     "this investment to be dramatically mispriced?",
@@ -817,8 +819,9 @@ _DEEP_DIVE_TEMPLATES = [
     "multiples to the peer group; stress the thesis under {macro} and a geopolitical "
     "scenario such as new trade restrictions; build a risk matrix, a catalyst calendar, and "
     "at least {sc} scenarios with probabilities; give a probability-weighted fair value, a "
-    "12-month expected return, the probability of a >30% drawdown, and a final rating. "
-    "Distinguish hard data from assumptions and inference throughout.",
+    "12-month expected return, the MODELED probability of a >30% drawdown (labeled "
+    "'within defined scenarios'; empirical probability DATA UNAVAILABLE unless measured), "
+    "and a final rating. Distinguish hard data from assumptions and inference throughout.",
 
     # ── T4: Macro-regime / risk-first framing ──
     "You are the CIO of a long-only fund. {t} is a candidate position over a 12-24 month "

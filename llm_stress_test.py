@@ -200,7 +200,9 @@ def run_decomposition(n_prompts: int) -> dict:
         "analysis. Construct at least five scenarios and assign probabilities that sum "
         "to 100%. Identify the 10 strongest arguments against your conclusion. Establish "
         "a Bayesian updating framework. Give me probability-weighted fair value, "
-        "12-month expected return, and the probability of a >30% drawdown.",
+        "12-month expected return, and the MODELED probability of a >30% drawdown "
+        "(labeled 'within defined scenarios'; empirical probability DATA UNAVAILABLE "
+        "unless measured).",
         "Analyze Apple (AAPL): reconstruct the revenue model by product and geography, "
         "estimate services growth and gross margin trajectory, build a three-stage DCF, "
         "compare against EV/EBITDA comps, run a reverse DCF on the current price, "
