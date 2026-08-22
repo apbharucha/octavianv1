@@ -35,6 +35,7 @@
    - [Background Task Manager (`background_tasks.py`)](#background-task-manager-background_taskspy)
 10. [AI & NLP Layer](#ai--nlp-layer)
     - [Financial LLM Engine (`financial_llm_engine.py`)](#financial-llm-engine-financial_llm_enginepy)
+    - [Tool Router (`tool_router.py`)](#tool-router-tool_routerpy)
     - [Deep-Dive Chart Engine (`deep_dive_charts.py`)](#deep-dive-chart-engine-deep_dive_chartspy)
     - [AI Chatbot (`ai_chatbot.py`)](#ai-chatbot-ai_chatbotpy)
     - [Intent Detection (`intent_detection_engine.py`)](#intent-detection-intent_detection_enginepy)
@@ -317,7 +318,7 @@ streamlit run main.py --server.headless true
 ### Running tests
 
 ```bash
-python3 -m pytest tests/ -q          # full suite (730 tests)
+python3 -m pytest tests/ -q          # full suite (758 tests)
 ```
 
 The suite currently has **730 passing tests** covering engines, UI walkthroughs
@@ -794,6 +795,69 @@ warranted queries keep the price-chart path.
   briefing via `_build_data_grounded_briefing`.
 - `_df_to_markdown` — pandas→markdown table renderer (avoids the optional
   `tabulate` dependency).
+
+### Tool Router (`tool_router.py`)
+
+The **tool router** is the layer that outsources explicit tool asks in user
+chat prompts to Octavian's own analytical engines instead of letting the LLM
+improvise an answer from memory. When a user asks the chatbot to "run a DCF",
+"use the Bayesian network", "fit a Markov model", "check dark pool flow",
+"look up 13F positioning", "correlation between X and Y", "options greeks",
+"factor crowding" or "the market regime", the router detects the explicit
+tool vocabulary, invokes the REAL engine that powers that feature, and
+repackages the engine's computed output as the chatbot's answer (with a
+provenance footer stating what was computed, by which engine, and on what
+data basis).
+
+**Design rules**
+
+- Fires ONLY on explicit tool vocabulary — generic asks ("what do you think
+  about NVDA", "hedge my XOM position", "what options strategy for LOW",
+  plain filler "hmm") keep their existing specialist builders untouched.
+- Every runner is fully defensive: any missing data or engine failure
+  returns `None`, so the normal pipeline is never degraded.
+- Multi-tool queries run ALL matched engines and combine their sections into
+  one answer.
+- Reverse-DCF asks are matched only by the Reverse DCF tool (a negative
+  lookbehind keeps "reverse DCF" from also firing the plain DCF tool).
+
+**Tool registry (`_TOOLS`)** — each entry has trigger patterns (regex),
+`needs_symbol`, and a runner:
+
+| Tool | Triggers | Runner → engine |
+| --- | --- | --- |
+| DCF | `dcf`, discounted cash flow, dcf model | `_run_dcf` → `financial_model_generator` `InstitutionalDCFEngine` (`compute_wacc`, `project_fcf`, `compute_terminal_value`) with reported fundamentals |
+| Reverse DCF | reverse dcf, what growth does the price imply | `_run_reverse_dcf` → `market_consensus_engine.reverse_dcf_expectations` (implied growth/margin/FCF) |
+| Bayesian network | bayesian network, bayes net, bayesian analysis | `_run_bayesian_network` → `institutional_analytics_engine.BayesianNetwork` (shock propagation through the 3-layer DAG) |
+| Markov / HMM regime | markov, hidden markov, hmm model/regime, gaussian mixture, regime detection | `_run_markov` → `hmm_engine.get_regime_detector()` fit on the symbol's price history |
+| Dark pool | dark pool, off-exchange | `_run_dark_pool` → `dark_pool_engine.analyze_ticker` + `ai_insight` |
+| Institutional 13F | 13f, sec filings, institutional holdings, smart money | `_run_sec_13f` → `sec_13f_engine.SEC13FEngine.get_global_smart_money_flow` |
+| Correlation | correlation, correlation matrix | `_run_correlation` → `risk_engine.correlation_matrix` (needs 2+ symbols) |
+| Options greeks | greeks, black-scholes, option pricing, delta/gamma | `_run_options_greeks` → `options_engine.OptionsEngine.black_scholes` |
+| Factor crowding | crowding, crowded trades, hedge fund overlap | `_run_factor_crowding` → `factor_crowding_engine` `detect_crowded_trades` + `simulate_hf_overlap` |
+| Market regime | risk-on/off, market regime, volatility regime | `_run_market_regime` → `regime.get_regime_context` (VIX + tape) |
+
+**Public API**
+
+- `detect_tool_requests(query) -> List[str]` — names of every matched tool.
+- `route_tool_query(query, tickers, sectors, live_data) -> Optional[str]` —
+  run all matched tools and join their repackaged sections; `None` when
+  nothing matched or every runner failed.
+
+**Wiring** (all three chat paths):
+
+- `financial_llm_engine.generate_financial_analysis` — right after the
+  deep-dive + mega-decomposition gates, before the specialist builders, so a
+  single explicit tool ask returns the engine's answer (cached like every
+  other response).
+- `financial_llm_engine._build_single_answer` — same gate for each part of a
+  decomposed mega query.
+- `ai_chatbot.OctavianEnhancedChatbot.process_query` — the classic path
+  returns the tool answer directly (no symbol-analysis pipeline).
+
+Intentionally NOT routed here: "probability of reaching $X" (already handled
+by the target-probability engine via the probability intent) and COT
+(needs a live CFTC download that could hang a chat turn).
 
 ### AI Chatbot (`ai_chatbot.py`)
 
@@ -2455,7 +2519,7 @@ codebase — the actual journey of a user action from UI click to output.
 
 ## Test Suite
 
-Run: `python3 -m pytest tests/ -q` — **730 tests pass** (as of 2026-08-21
+Run: `python3 -m pytest tests/ -q` — **758 tests pass** (as of 2026-08-22
 session). Coverage by file:
 
 | Test file | Tests | Focus |
@@ -2478,6 +2542,7 @@ session). Coverage by file:
 | `test_advanced_news_processor.py` | 7 | News processing |
 | `test_ai_chatbot.py` | 7 | Chatbot query paths |
 | `test_llm_and_models_fixes.py` | 69 | LLM/model fix regressions |
+| `test_tool_router.py` | 28 | Tool router: detection, runners, end-to-end chat wiring |
 | `test_comparative_analysis.py` | 4 | Comparative engine |
 | `test_portfolio_analyzer.py` | 4 | Portfolio metrics |
 | `test_background_tasks_streamlit.py` | 3 | Streamlit integration |
@@ -2541,6 +2606,7 @@ check, pyflakes clean of new issues.
 | Date | Change | Sections touched |
 |---|---|---|
 | 2026-08-21 | Master Doc created (full codebase walkthrough); deep-dive memo review-fix iteration: new `deep_dive_charts.py` (4 distinct analytical charts with chart_id/purpose/dataset/timestamp/provenance/calculation/run_id/dataset_hash + no-reuse registry, wired into `process_enhanced_query`), display-precision scenario engine (weighted return recomputes exactly from printed table, QC3b), same-variable market-vs-model disagreement (QC16), DCF exact formula labels + CONDITIONAL/ASSUMPTION-BASED status + A/B/C/D valuation separation (QC21), directional validation of reasons to own/not (QC18), mechanical risk-adjusted rating, confidence with fixed disclosed weights (QC17), SUBJECTIVE Bayesian label, modeled-vs-empirical probability language, macro current-claims gating (QC19), 13-point quantitative-integrity firewall in the LLM system prompt. 695 tests → 719. | AI & NLP Layer; Chart Engine; Test Suite |
+| 2026-08-22 | Tool router (`tool_router.py`, ~450 lines): user prompts that explicitly ask for a built-in analytical tool are outsourced to the REAL engine and repackaged as the chatbot's answer — DCF (InstitutionalDCFEngine), reverse DCF (market-consensus implied expectations), Bayesian network (3-layer propagation), Markov/HMM regime (hmm_engine), dark pool (analyze_ticker + ai_insight), 13F smart-money flow, correlation matrix, options greeks (Black-Scholes), factor crowding, market regime. Fires only on explicit tool vocabulary (no false positives on hedge/probability/options/hmm-filler); multi-tool queries combine sections; every runner degrades to None on missing data. Wired into all three chat paths: `generate_financial_analysis`, `_build_single_answer` (mega parts), and `ai_chatbot.process_query`. 730 tests → 758 (28 new in `test_tool_router.py`). | AI & NLP Layer; Test Suite |
 | 2026-08-21 | Deep-dive retest review (round 2, ~8.3/10) fixes: (1) charts now carry an explicit "CONDITIONAL DCF — NOT VERIFIED FCF VALUATION" banner + "Cond. DCF" bar labels on expectation-gap and valuation-sensitivity charts; (2) risk/reward chart rebuilt as a metrics table that directly matches the memo text (weighted return, weighted price, current price, upside/downside ranges, modeled drawdown probs with empirical DATA UNAVAILABLE); (3) below-market DCF anchor moved from reasons-to-own to reasons-not-to-own (it was a negative implication listed as a reason to own); (4) QC18 no longer hardcoded — `_dd_build_reasons` + `_dd_semantic_violations` actually scan the reason lists and a violation flips QC18 to FAIL with a SEMANTIC QC FAILURES block; (5) every chart gains a `qc_status` computed by `_chart_qc` so the visualization inherits the memo's reconciliation/QC status; (6) eval prompts (`prompt_factory`, `llm_stress_test`) now request "MODELED probability … within defined scenarios" instead of bare drawdown probabilities. 719 tests → 730. | AI & NLP Layer; Chart Engine; Test Suite |
 | 2026-08-19 | Deep-dive memo fixes (DCF gating + site-tool DCF, multi-variable reverse DCF, consistent expected-return/drawdown probs, operating-leverage scenarios, price timestamps, labeled macro, Bayesian basis, numeric QC audit); algorithm builder symbol/asset-type stamps, real ensemble trade counts, exact per-window Sharpe; portal quick-select buttons fill most-relevant assets. 694 tests → 695. | AI & NLP Layer; Algorithm Builder; Quant Portal; Test Suite |
 | 2026-08-17 | Rebuilt institutional deep-dive memo to the 20-section research-integrity spec + extreme stress tests (43 → 48 tests). | AI & NLP Layer |

@@ -1906,6 +1906,15 @@ def _build_single_answer(query, intents, tickers, sectors, context_data=None):
                                            live_data, context_data)
         if r:
             return r
+    # Explicit tool asks inside a mega part are outsourced to the real engine
+    # (DCF, Bayesian network, Markov model, dark pool, 13F, correlation, etc.).
+    try:
+        from tool_router import route_tool_query
+        r = route_tool_query(query, tickers, sectors, live_data)
+    except Exception:
+        r = None
+    if r:
+        return r
     if intents.get("geopolitics") and _is_focused_event_question(query, intents, tickers):
         r = _build_geopolitical_briefing(query, intents, tickers, sectors,
                                          live_data, context_data)
@@ -2501,6 +2510,26 @@ def generate_financial_analysis(query, context_data=None):
             print(f"[PERF] generate_financial_analysis (mega, {len(mega_parts)} parts) "
                   f"took {(_t.time()-_t0)*1000:.0f}ms")
             return mega_report
+
+    # --- Explicit tool asks get outsourced to Octavian's own engines ---
+    # When the user explicitly names one of the platform's built-in analytical
+    # tools (DCF, reverse DCF, Bayesian network, Markov/HMM regime model, dark
+    # pool, 13F positioning, correlation matrix, options greeks, factor
+    # crowding, market regime), the request is handed to the REAL engine that
+    # powers that feature and its computed output is repackaged as the answer
+    # — instead of the LLM generating a plausible-sounding response from
+    # memory. Returns None (falls through) when no tool is requested or the
+    # tool has no usable data.
+    try:
+        from tool_router import route_tool_query
+        tool_report = route_tool_query(query, tickers, sectors, {})
+    except Exception:
+        tool_report = None
+    if tool_report:
+        _cache_save(_qkey, tool_report)
+        print(f"[PERF] generate_financial_analysis (tool) took "
+              f"{(_t.time()-_t0)*1000:.0f}ms")
+        return tool_report
 
     now = datetime.datetime.now()
 

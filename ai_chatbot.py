@@ -2566,7 +2566,26 @@ Based on the multi-layer ensemble analysis, {symbol} shows a **{signal}** signal
 
         # Extract symbols first (needed for intent detection)
         symbols = self._extract_symbols(query)
-        
+
+        # Explicit tool asks (DCF, Bayesian network, Markov model, dark pool,
+        # 13F, correlation, greeks, crowding, regime) are outsourced to
+        # Octavian's own engines and their computed output is repackaged as
+        # the answer — the LLM never improvises a DCF or a regime call.
+        try:
+            from tool_router import route_tool_query
+            _tool_text = route_tool_query(query, symbols, [], {})
+        except Exception:
+            _tool_text = None
+        if _tool_text:
+            return {
+                'text': _tool_text,
+                'charts': [],
+                'intents': ['tool'],
+                'symbols': symbols,
+                'suggestions': [],
+                'response_time_ms': int((time.time() - start_time) * 1000),
+            }
+
         # USE ADVANCED DYNAMIC INTENT DETECTION
         intent_analysis = self.intent_engine.analyze_intent(query, symbols)
         
