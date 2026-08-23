@@ -821,7 +821,7 @@ def _fetch_polygon_realtime(symbol: str):
 
 
 _REALTIME_CACHE: dict = {}
-_REALTIME_CACHE_TTL = 5  # 5 seconds for live price cache
+_REALTIME_CACHE_TTL = 15  # seconds for live price cache (dashboard refreshes every 30s anyway)
 
 
 def get_realtime_price(symbol: str):
@@ -881,7 +881,6 @@ def get_realtime_price(symbol: str):
             prev = getattr(fi, "previous_close", None) or getattr(fi, "regularMarketPreviousClose", None)
             if prev and prev > 0:
                 prev_close = float(prev)
-            print(f"DEBUG: YF fast_info for {yf_sym}: current={current_price}, prev={prev_close}")
         except Exception:
             pass
 
@@ -1031,13 +1030,14 @@ def get_realtime_prices_batch(symbols: list):
             yf_sym = sym.replace("/", "") + "=X"
         yf_map[yf_sym] = sym
 
-    # Method 1: yfinance fast_info batch (most reliable for live prices)
+    # Method 1: yfinance fast_info batch (most reliable for live prices).
+    # Fetched in parallel — sequential per-symbol calls were a top dashboard
+    # load-time cost (4 index tickers = 4 serial network round-trips).
     try:
         import yfinance as yf
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        for yf_sym, orig_sym in list(yf_map.items()):
-            if orig_sym in results:
-                continue
+        def _fast_info(yf_sym):
             try:
                 tk = yf.Ticker(yf_sym)
                 fi = tk.fast_info
@@ -1048,12 +1048,27 @@ def get_realtime_prices_batch(symbols: list):
                     fi, "regularMarketPreviousClose", None
                 )
                 if price and price > 0:
-                    result = (float(price), float(prev) if prev and prev > 0 else None)
+                    return (
+                        yf_sym,
+                        (float(price), float(prev) if prev and prev > 0 else None),
+                    )
+            except Exception:
+                pass
+            return None
+
+        with ThreadPoolExecutor(max_workers=min(8, len(yf_map))) as pool:
+            futures = [pool.submit(_fast_info, yf_sym) for yf_sym in yf_map]
+            for fut in as_completed(futures):
+                try:
+                    out = fut.result()
+                    if out is None:
+                        continue
+                    yf_sym, result = out
+                    orig_sym = yf_map[yf_sym]
                     results[orig_sym] = result
                     _REALTIME_CACHE[f"rt:{orig_sym}"] = (time.time(), result)
-                    print(f"DEBUG: Batch YF fast_info for {orig_sym}: current={price}, prev={prev}")
-            except Exception as e:
-                print(f"DEBUG: Batch YF fast_info failed for {orig_sym}: {e}")
+                except Exception:
+                    continue
     except Exception:
         pass
 

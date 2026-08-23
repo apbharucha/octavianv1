@@ -460,9 +460,9 @@ def test_quant_portal_signal_history_is_capped_and_completes():
             stack.enter_context(m)
         stack.enter_context(patch("quant_ensemble_model.QuantEnsembleModel.predict",
                                   new=_fake_predict))
-        # quant_portal imports get_stock at module import time; the walkthrough's
-        # data_sources.* patches never reach it, so bind its own.
-        stack.enter_context(patch("quant_portal.get_stock",
+        # quant_portal lazy-imports get_stock from data_sources at call time,
+        # so the data_sources patch is what reaches it.
+        stack.enter_context(patch("data_sources.get_stock",
                                   side_effect=_mock_get_stock))
         at.run()
         for r in at.sidebar.radio:
@@ -505,7 +505,7 @@ def test_quant_portal_evolution_progress_callback_arity():
             stack.enter_context(m)
         stack.enter_context(patch("genetic_strategy_engine.GeneticStrategyEngine.evolve",
                                   new=_fake_evolve))
-        stack.enter_context(patch("quant_portal.get_stock", side_effect=_mock_get_stock_long))
+        stack.enter_context(patch("data_sources.get_stock", side_effect=_mock_get_stock_long))
         at.run()
         for r in at.sidebar.radio:
             if r.label == "Navigation":
@@ -531,7 +531,7 @@ def test_quant_portal_backtest_uses_advanced_backtester():
     with ExitStack() as stack:
         for m in _build_mocks():
             stack.enter_context(m)
-        stack.enter_context(patch("quant_portal.get_stock", side_effect=_mock_get_stock_long))
+        stack.enter_context(patch("data_sources.get_stock", side_effect=_mock_get_stock_long))
         at.run()
         for r in at.sidebar.radio:
             if r.label == "Navigation":

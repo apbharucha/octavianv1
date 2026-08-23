@@ -18,76 +18,34 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import hashlib
 import random
+import importlib.util as _ilu
 
-# Risk Engine imports
-try:
-    from risk_engine import correlation_matrix, portfolio_var
-    HAS_RISK = True
-except ImportError:
-    HAS_RISK = False
+# Lazy availability flags — the heavy engines (sklearn/torch/scipy chains)
+# are imported ONLY when the user actually runs that tool, never at module
+# load. Importing quant_ensemble_model / advanced_backtester / etc. at the
+# top of this module added ~9s to the first click on the Quant Portal page.
+def _module_available(name: str) -> bool:
+    try:
+        return _ilu.find_spec(name) is not None
+    except Exception:
+        return False
 
-# Data sources
-try:
-    from data_sources import get_stock
-    HAS_DATA = True
-except ImportError:
-    HAS_DATA = False
+HAS_RISK = _module_available("risk_engine")
+HAS_DATA = _module_available("data_sources")
+HAS_QUANT = _module_available("quant_ensemble_model")
+HAS_BT = _module_available("advanced_backtester")
+HAS_SIM = _module_available("market_simulation_engine")
+HAS_GENETIC = _module_available("genetic_strategy_engine")
+HAS_HMM = _module_available("hmm_engine")
+HAS_FACTOR = _module_available("factor_crowding_engine")
+HAS_MACRO = _module_available("macro_cross_asset_engine")
+HAS_ALT = _module_available("alternative_data_engine")
 
-# Quant ensemble model
-try:
-    from quant_ensemble_model import get_quant_ensemble
-    HAS_QUANT = True
-except ImportError:
-    HAS_QUANT = False
 
-# Advanced backtester
-try:
-    from advanced_backtester import AdvancedBacktester
-    HAS_BT = True
-except ImportError:
-    HAS_BT = False
-
-# Market simulation imports
-try:
-    from market_simulation_engine import MarketSimulationEngine
-    HAS_SIM = True
-except ImportError:
-    HAS_SIM = False
-
-# Genetic strategy imports
-try:
-    from genetic_strategy_engine import GeneticStrategyEngine
-    HAS_GENETIC = True
-except ImportError:
-    HAS_GENETIC = False
-
-# HMM Regime detection
-try:
-    from hmm_engine import detect_regimes
-    HAS_HMM = True
-except ImportError:
-    HAS_HMM = False
-
-# Factor crowding
-try:
-    from factor_crowding_engine import FactorCrowdingEngine
-    HAS_FACTOR = True
-except ImportError:
-    HAS_FACTOR = False
-
-# Macro cross-asset
-try:
-    from macro_cross_asset_engine import MacroCrossAssetEngine
-    HAS_MACRO = True
-except ImportError:
-    HAS_MACRO = False
-
-# Alternative data
-try:
-    from alternative_data_engine import AlternativeDataEngine
-    HAS_ALT = True
-except ImportError:
-    HAS_ALT = False
+def _lazy_import(name: str, attr: str):
+    """Import a single symbol from a module on first use (after availability check)."""
+    mod = __import__(name, fromlist=[attr])
+    return getattr(mod, attr)
 
 # 
 # CSS STYLING
@@ -420,6 +378,9 @@ def _alt_data_what_it_means(sig) -> str:
 def render_quant_portal():
     """Render the comprehensive quantitative research portal."""
 
+    # Lightweight import — data_sources is already loaded by the host app.
+    from data_sources import get_stock
+
     _apply_portal_css()
 
     # Header
@@ -640,6 +601,7 @@ def render_quant_portal():
         
         if len(symbols) >= 2 and HAS_RISK:
             try:
+                from risk_engine import correlation_matrix, portfolio_var
                 corr = correlation_matrix(symbols)
                 
                 if corr is not None and not corr.empty:
@@ -663,6 +625,7 @@ def render_quant_portal():
                         confidence = st.slider("Confidence Level", 0.90, 0.99, 0.95)
                     
                     if len(symbols) >= 2:
+                        from risk_engine import portfolio_var
                         equal_weights = [1.0 / len(symbols)] * len(symbols)
                         var_result, vol_result = portfolio_var(symbols, equal_weights, confidence=confidence)
                         if var_result:
@@ -692,8 +655,10 @@ def render_quant_portal():
             if st.button("Generate Quant Signal", type="primary"):
                 with st.spinner("Running quant ensemble model..."):
                     try:
+                        from data_sources import get_stock
                         df = get_stock(signal_symbol, period="2y")
                         if df is not None:
+                            from quant_ensemble_model import get_quant_ensemble
                             quant = get_quant_ensemble()
                             close = df['Close']
                             if isinstance(close, pd.DataFrame):
@@ -917,6 +882,8 @@ def render_quant_portal():
         if HAS_GENETIC and st.button("Evolve Strategies", type="primary"):
             with st.spinner(f"Evolving {population_size} strategies over {generations} generations..."):
                 try:
+                    from genetic_strategy_engine import GeneticStrategyEngine
+                    from data_sources import get_stock
                     engine = GeneticStrategyEngine(
                         population_size=population_size,
                         mutation_rate=mutation_rate
@@ -1010,6 +977,7 @@ def render_quant_portal():
             if st.button("Run Cross-Asset Analysis", type="primary"):
                 with st.spinner("Fetching cross-asset data..."):
                     try:
+                        from macro_cross_asset_engine import MacroCrossAssetEngine
                         engine = MacroCrossAssetEngine()
                         signals = engine.get_all_signals()
                         st.session_state["cross_signals"] = signals
@@ -1062,6 +1030,8 @@ def render_quant_portal():
         if HAS_BT and st.button("Run Backtest", type="primary"):
             with st.spinner("Running backtest..."):
                 try:
+                    from advanced_backtester import AdvancedBacktester
+                    from data_sources import get_stock
                     backtester = AdvancedBacktester(initial_capital=initial_capital)
                     
                     # Fetch real data for backtest
@@ -1182,6 +1152,7 @@ def render_quant_portal():
             if st.button("Fetch Alternative Data", type="primary"):
                 with st.spinner(f"Fetching all alternative data sources for {alt_ticker}..."):
                     try:
+                        from alternative_data_engine import AlternativeDataEngine
                         engine = AlternativeDataEngine()
                         signals = engine.get_all_signals(alt_ticker)
                         

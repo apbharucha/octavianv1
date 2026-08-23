@@ -841,21 +841,13 @@ def _fetch_watchlist_signal_snapshot(watchlist: List[str], max_symbols: int = 6)
     return results
 
 
-def generate_market_aware_insights(watchlist_signals: Optional[List[Dict]] = None) -> List[Dict]:
-    """Generate 4-6 market-aware personalized insight cards.
-
-    Each card is a dict: {'title', 'body', 'urgency'} with urgency in
-    high/medium/low. Built from: live VIX level, master-engine market
-    bias/regime, the user's trading style and risk profile, and current
-    watchlist signals (RSI, momentum). Replaces the old static fallback tips.
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_market_state() -> tuple:
+    """Live market state used by the insight cards (bias, regime, conviction,
+    vol forecast, VIX). Cached 5 minutes so the dashboard never re-fetches
+    VIX or re-runs the master engine on every rerun — this was the single
+    largest per-rerun load-time cost.
     """
-    insights: List[Dict] = []
-    profile = get_trader_profile()
-    style = profile.get("trading_style", "Swing Trader")
-    risk = profile.get("risk_profile", "Moderate")
-    watchlist = profile.get("watchlist", [])
-
-    # ── 1. Live market state (master strategy engine + VIX) ────────────────
     market_bias = "NEUTRAL"
     market_regime = "Unknown"
     conviction = 0.5
@@ -897,6 +889,26 @@ def generate_market_aware_insights(watchlist_signals: Optional[List[Dict]] = Non
             vix = float(close.dropna().iloc[-1])
     except Exception:
         vix = None
+
+    return market_bias, market_regime, conviction, vol_forecast, vix
+
+
+def generate_market_aware_insights(watchlist_signals: Optional[List[Dict]] = None) -> List[Dict]:
+    """Generate 4-6 market-aware personalized insight cards.
+
+    Each card is a dict: {'title', 'body', 'urgency'} with urgency in
+    high/medium/low. Built from: live VIX level, master-engine market
+    bias/regime, the user's trading style and risk profile, and current
+    watchlist signals (RSI, momentum). Replaces the old static fallback tips.
+    """
+    insights: List[Dict] = []
+    profile = get_trader_profile()
+    style = profile.get("trading_style", "Swing Trader")
+    risk = profile.get("risk_profile", "Moderate")
+    watchlist = profile.get("watchlist", [])
+
+    # ── 1. Live market state (master strategy engine + VIX) — cached 5 min
+    market_bias, market_regime, conviction, vol_forecast, vix = _cached_market_state()
 
     bias_lower = (market_bias or "NEUTRAL").upper()
     regime_lower = (market_regime or "").lower()
