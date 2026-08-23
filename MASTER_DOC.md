@@ -318,10 +318,10 @@ streamlit run main.py --server.headless true
 ### Running tests
 
 ```bash
-python3 -m pytest tests/ -q          # full suite (758 tests)
+python3 -m pytest tests/ -q          # full suite (773 tests)
 ```
 
-The suite currently has **730 passing tests** covering engines, UI walkthroughs
+The suite currently has **773 passing tests** covering engines, UI walkthroughs
 (Streamlit `AppTest`), integration flows, and the deep-dive memo integrity.
 
 ---
@@ -1056,6 +1056,14 @@ Core news aggregation + sentiment engine (1,229 lines).
 - **Queries**: `get_market_sentiment(hours_back)`, `get_sentiment_for_symbol`,
   `get_market_whispers(symbol)` (with `_infer_whisper_type`), and
   `get_news_summary_for_symbol` — the data behind the news dashboard.
+- **Datetime safety**: RSS dates parsed with `parsedate_to_datetime` are
+  timezone-aware while `datetime.now()`/`datetime.min` are naive — comparing
+  them raised "can't compare offset-naive and offset-aware datetimes" in
+  whisper/news sorting.  The module-level `_naive_utc()` normalizes any
+  datetime to naive UTC before every sort key (`get_market_whispers`,
+  `get_news_summary_for_symbol`) and the `_get_recent_articles` recency
+  cutoff, so aware RSS timestamps and naive local timestamps can be mixed
+  freely.
 - **Metrics**: `get_metrics()` (articles processed, avg sentiment, source
   breakdown). `stop()` shuts the background loop.
 - Singleton: `get_news_engine()`.
@@ -1241,10 +1249,29 @@ chatbot (`timeframe_engine` accessor) to frame recommendations by horizon.
 Identifies weaknesses/contradictions in mainstream economic narratives and
 generates signals that profit from consensus mispricing (898 lines):
 
-- `NarrativeStrength`, `CounterTrendSignal` data models.
+- `NarrativeStrength`, `CounterTrendSignal` data models.  Signals now carry
+  live-price confirmation fields: `momentum_state`
+  (REVERSING / DECELERATING / STALLING / TREND_ACCELERATING / NO_DATA),
+  `momentum_score` (−100..+100, +ve = price moving in the fade direction),
+  `price_confirmation` (human-readable read), `live_price`, and
+  `entry_condition` (what to wait for before entering).
 - `CounterTrendAnalyzer` — narrative consensus vs fundamental score,
   divergence computation, `generate_counter_signals(divergence_threshold,
   min_strength)`; `get_all_narratives()` for the tracker table.
+- **Momentum confirmation** — `apply_momentum_filter(signals, price_data)`
+  confirms or vetoes narrative signals with live price action: REVERSING is
+  boosted, DECELERATING mildly boosted, STALLING gets an entry condition,
+  and TREND_ACCELERATING is down-weighted with an explicit "wait for the
+  trend to stall" condition — signals whose trend is accelerating faster
+  than `falling_knife_cutoff` (default 3%/day) are dropped outright
+  (falling-knife filter).  Accepts DataFrames with a `Close` column or plain
+  float lists; missing/insufficient data degrades to NO_DATA without error.
+- **Data-driven scores** — `refresh_from_market_data(market_data)` adjusts
+  the seeded consensus/fundamental scores from live observations (vix,
+  us_10y_yield, usd_index, gold_price, usdjpy, oil_price, smh_price),
+  clamps to 5–95, and rebuilds the narratives; returns the updated themes.
+  The analyzer deep-copies the default narrative registry in `__init__` so
+  refreshes never leak state across instances.
 - `score_narrative_strength(...)`, `identify_macro_contradictions(...)`
   module helpers.
 - Singleton: `get_counter_trend_analyzer()`.
@@ -2528,7 +2555,7 @@ codebase — the actual journey of a user action from UI click to output.
 
 ## Test Suite
 
-Run: `python3 -m pytest tests/ -q` — **758 tests pass** (as of 2026-08-22
+Run: `python3 -m pytest tests/ -q` — **773 tests pass** (as of 2026-08-23
 session). Coverage by file:
 
 | Test file | Tests | Focus |
@@ -2552,6 +2579,7 @@ session). Coverage by file:
 | `test_ai_chatbot.py` | 7 | Chatbot query paths |
 | `test_llm_and_models_fixes.py` | 69 | LLM/model fix regressions |
 | `test_tool_router.py` | 28 | Tool router: detection, runners, end-to-end chat wiring |
+| `test_counter_trend_and_whispers.py` | 15 | Whispers datetime safety (naive/aware RSS timestamps) + counter-trend momentum filter & data-driven score refresh |
 | `test_comparative_analysis.py` | 4 | Comparative engine |
 | `test_portfolio_analyzer.py` | 4 | Portfolio metrics |
 | `test_background_tasks_streamlit.py` | 3 | Streamlit integration |
@@ -2615,6 +2643,7 @@ check, pyflakes clean of new issues.
 | Date | Change | Sections touched |
 |---|---|---|
 | 2026-08-23 | Load-time performance pass (profiled with cProfile through AppTest — cold imports + warm reruns): (1) Dashboard per-rerun cost cut from ~2.8s to ~1.6s by caching the insight cards' market-state fetch (`trader_profile._cached_market_state`, `@st.cache_data(ttl=300)`) — the live VIX download + master-engine outlook previously ran on EVERY rerun; (2) `get_realtime_prices_batch()` parallelized (ThreadPoolExecutor) + debug prints removed + `_REALTIME_CACHE_TTL` 5s→15s; (3) Quant Portal first-click import 8.85s → 0.47s by converting module-level engine imports (sklearn/torch/scipy chains: quant_ensemble_model, advanced_backtester, genetic_strategy_engine, macro_cross_asset_engine, alternative_data_engine, risk_engine) to lazy availability flags (`importlib.util.find_spec`) + imports at point of use; the three walkthrough tests that patched `quant_portal.get_stock` now patch `data_sources.get_stock` (the lazy call-site source). Full suite: 758 passed. | Data Layer; Trader Profile; Quant Portal; Test Suite |
+| 2026-08-23 | Market-whispers datetime fix + counter-trend upgrade: (1) fixed "Error loading market whispers: can't compare offset-naive and offset-aware datetimes" — `parsedate_to_datetime` returns aware datetimes that crashed whisper/news sorting against naive `datetime.min`/`datetime.now()`; added module-level `_naive_utc()` and applied it to all whisper/news sort keys and the `_get_recent_articles` recency cutoff (`news_analysis_engine.py`); (2) counter-trend signals upgraded (`counter_trend_analyzer.py`): new `CounterTrendSignal` live-price fields (momentum_state, momentum_score, price_confirmation, live_price, entry_condition), `apply_momentum_filter()` confirming/vetoing signals with real price momentum (REVERSING boosted, TREND_ACCELERATING down-weighted, falling knives >3%/day dropped), and `refresh_from_market_data()` adjusting seeded consensus/fundamental scores from live VIX/yield/DXY/gold/USDJPY/oil/SMH observations; analyzer now deep-copies the narrative registry so refreshes never leak across instances; (3) Intelligence Center UI (`main.py`) wires it in with a cached (10 min) live-price momentum confirmation checkbox + momentum badges/entry-condition/live-price-read on signal cards. Full suite: 773 passed (758 + 15 new tests). | News Analysis; Counter-Trend Analyzer; Intelligence Center; Test Suite |
 | 2026-08-22 | Tool router (`tool_router.py`, ~450 lines): user prompts that explicitly ask for a built-in analytical tool are outsourced to the REAL engine and repackaged as the chatbot's answer — DCF (InstitutionalDCFEngine), reverse DCF (market-consensus implied expectations), Bayesian network (3-layer propagation), Markov/HMM regime (hmm_engine), dark pool (analyze_ticker + ai_insight), 13F smart-money flow, correlation matrix, options greeks (Black-Scholes), factor crowding, market regime. Fires only on explicit tool vocabulary (no false positives on hedge/probability/options/hmm-filler); multi-tool queries combine sections; every runner degrades to None on missing data. Wired into all three chat paths: `generate_financial_analysis`, `_build_single_answer` (mega parts), and `ai_chatbot.process_query`. 730 tests → 758 (28 new in `test_tool_router.py`). | AI & NLP Layer; Test Suite |
 | 2026-08-21 | Deep-dive retest review (round 2, ~8.3/10) fixes: (1) charts now carry an explicit "CONDITIONAL DCF — NOT VERIFIED FCF VALUATION" banner + "Cond. DCF" bar labels on expectation-gap and valuation-sensitivity charts; (2) risk/reward chart rebuilt as a metrics table that directly matches the memo text (weighted return, weighted price, current price, upside/downside ranges, modeled drawdown probs with empirical DATA UNAVAILABLE); (3) below-market DCF anchor moved from reasons-to-own to reasons-not-to-own (it was a negative implication listed as a reason to own); (4) QC18 no longer hardcoded — `_dd_build_reasons` + `_dd_semantic_violations` actually scan the reason lists and a violation flips QC18 to FAIL with a SEMANTIC QC FAILURES block; (5) every chart gains a `qc_status` computed by `_chart_qc` so the visualization inherits the memo's reconciliation/QC status; (6) eval prompts (`prompt_factory`, `llm_stress_test`) now request "MODELED probability … within defined scenarios" instead of bare drawdown probabilities. 719 tests → 730. | AI & NLP Layer; Chart Engine; Test Suite |
 | 2026-08-19 | Deep-dive memo fixes (DCF gating + site-tool DCF, multi-variable reverse DCF, consistent expected-return/drawdown probs, operating-leverage scenarios, price timestamps, labeled macro, Bayesian basis, numeric QC audit); algorithm builder symbol/asset-type stamps, real ensemble trade counts, exact per-window Sharpe; portal quick-select buttons fill most-relevant assets. 694 tests → 695. | AI & NLP Layer; Algorithm Builder; Quant Portal; Test Suite |

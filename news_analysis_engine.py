@@ -29,6 +29,23 @@ import hashlib
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 
+
+def _naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Normalize any datetime to naive UTC for safe comparison.
+
+    RSS feed dates parsed with ``parsedate_to_datetime`` are timezone-aware,
+    while ``datetime.now()`` and ``datetime.min`` are naive — mixing them in
+    sort keys or cutoff comparisons raises "can't compare offset-naive and
+    offset-aware datetimes".  Converting everything to naive UTC keeps every
+    comparison consistent (None passes through unchanged).
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
 # NLP and sentiment analysis
 NLTK_AVAILABLE = False
 try:
@@ -925,11 +942,12 @@ class NewsAnalysisEngine:
                 # In a real scenario, this would trigger a deeper historical fetch
                 pass
                 
-            cutoff = datetime.now() - timedelta(hours=hours_back)
+            cutoff = _naive_utc(datetime.now(timezone.utc)) - timedelta(hours=hours_back)
             out = []
             for a in articles:
                 try:
-                    if a.published_at and a.published_at >= cutoff:
+                    pub = _naive_utc(a.published_at)
+                    if pub and pub >= cutoff:
                         out.append(a)
                 except Exception:
                     continue
@@ -1067,7 +1085,9 @@ class NewsAnalysisEngine:
         ]
         # Most recent first, cap for performance
         relevant = sorted(
-            relevant, key=lambda a: a.published_at or datetime.min, reverse=True
+            relevant,
+            key=lambda a: _naive_utc(a.published_at) or datetime.min,
+            reverse=True,
         )[:40]
 
         for a in relevant:
@@ -1135,7 +1155,7 @@ class NewsAnalysisEngine:
             seen_titles.add(key)
             unique.append(w)
 
-        unique.sort(key=lambda w: w.timestamp or datetime.min, reverse=True)
+        unique.sort(key=lambda w: _naive_utc(w.timestamp) or datetime.min, reverse=True)
         return unique[:15]
 
     def _infer_whisper_type(self, article: "NewsArticle") -> str:
@@ -1166,7 +1186,11 @@ class NewsAnalysisEngine:
 
             fetched = self.fetch_and_process_news() or []
             relevant = [a for a in fetched if sym in (a.symbols_mentioned or [])]
-            relevant = sorted(relevant, key=lambda a: a.published_at or datetime.min, reverse=True)[:20]
+            relevant = sorted(
+                relevant,
+                key=lambda a: _naive_utc(a.published_at) or datetime.min,
+                reverse=True,
+            )[:20]
             recent_articles = [
                 {
                     'title': a.title,

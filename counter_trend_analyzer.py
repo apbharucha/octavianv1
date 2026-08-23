@@ -19,9 +19,10 @@ Signal Logic:
 
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("CounterTrendAnalyzer")
 
@@ -62,6 +63,12 @@ class CounterTrendSignal:
     catalyst_needed: str  # what would trigger the reversion
     time_horizon: str  # "Days", "Weeks", "Months"
     position_size_pct: float  # suggested % of portfolio
+    # Live-price confirmation fields (populated by apply_momentum_filter)
+    momentum_state: str = "NO_DATA"  # TREND_ACCELERATING / STALLING / DECELERATING / REVERSING / NO_DATA
+    momentum_score: float = 0.0  # −100..+100, +ve = price moving in fade direction
+    price_confirmation: str = ""  # human-readable live-price read
+    live_price: float = 0.0  # last observed close when price data was supplied
+    entry_condition: str = ""  # what to wait for before entering
 
 
 # 
@@ -300,7 +307,9 @@ class CounterTrendAnalyzer:
 
     def __init__(self, custom_narratives: Optional[List[Dict]] = None):
         self._narratives: List[NarrativeStrength] = []
-        raw = (
+        # Deep-copy so in-place score refreshes never mutate the shared
+        # module-level defaults (which would leak state across instances).
+        raw = copy.deepcopy(
             custom_narratives if custom_narratives is not None else _DEFAULT_NARRATIVES
         )
         self._raw_narratives = raw
@@ -420,6 +429,223 @@ class CounterTrendAnalyzer:
             if sig_inst in inst_upper or inst_upper in sig_inst:
                 return sig
         return None
+
+    def apply_momentum_filter(
+        self,
+        signals: List[CounterTrendSignal],
+        price_data: Dict[str, "pd.DataFrame"],
+        falling_knife_cutoff: float = 0.03,
+    ) -> List[CounterTrendSignal]:
+        """Confirm or veto counter-trend signals with live price momentum.
+
+        Fading a narrative is only attractive once the crowd's trend is
+        losing momentum — entering while the trend is still accelerating is
+        catching a falling knife.  For each signal this:
+
+          1. Computes short (5d) and medium (20d) momentum for the instrument.
+          2. Classifies the price action:
+               REVERSING        — price already moving in the fade direction
+                                  (strongest confirmation, strength boosted)
+               DECELERATING     — trend flattening, knife catching
+               STALLING         — no trend, range-bound (neutral)
+               TREND_ACCELERATING — crowd trend still gaining speed; the
+                                  signal is down-weighted and an explicit
+                                  entry_condition is attached.
+               NO_DATA          — no price series supplied; signal untouched.
+          3. Drops signals where the trend is accelerating faster than
+             ``falling_knife_cutoff`` per day (default 3%/day, e.g. a
+             -15%+ five-day crash) AND momentum is extreme — the classic
+             falling-knife case.
+
+        ``price_data`` maps an instrument (e.g. "GLD", "EURUSD=X") to a
+        DataFrame with a ``Close`` column (or a plain list of floats).
+        """
+        if not price_data:
+            for s in signals:
+                s.momentum_state = "NO_DATA"
+                s.price_confirmation = "No live price data supplied - signal is narrative-only."
+            return signals
+
+        confirmed: List[CounterTrendSignal] = []
+        for sig in signals:
+            series = self._extract_close_series(price_data.get(sig.instrument))
+            if series is None or len(series) < 21:
+                sig.momentum_state = "NO_DATA"
+                sig.price_confirmation = "Insufficient price history for momentum confirmation."
+                confirmed.append(sig)
+                continue
+
+            state, score, read, live_price = self._classify_momentum(series, sig.direction)
+            sig.momentum_state = state
+            sig.momentum_score = round(score, 1)
+            sig.live_price = live_price
+            sig.price_confirmation = read
+
+            if state == "TREND_ACCELERATING":
+                # Falling knife: penalise hard, never boost.
+                sig.signal_strength = round(
+                    max(0.0, sig.signal_strength - abs(score) * 0.8), 1
+                )
+                sig.confidence = round(max(0.0, sig.confidence - 15.0), 1)
+                sig.entry_condition = (
+                    f"Wait for momentum to stall - do not enter while the trend is still "
+                    f"accelerating against the fade (momentum {score:+.0f})."
+                )
+                # Drop outright when the knife is falling fast enough.
+                daily = self._daily_slope(series)
+                if daily is not None and abs(daily) >= falling_knife_cutoff:
+                    continue
+            elif state == "REVERSING":
+                sig.signal_strength = round(min(100.0, sig.signal_strength + 8.0), 1)
+                sig.confidence = round(min(95.0, sig.confidence + 8.0), 1)
+                sig.entry_condition = "Price already moving in the fade direction - valid entry zone."
+            elif state == "DECELERATING":
+                sig.signal_strength = round(min(100.0, sig.signal_strength + 4.0), 1)
+                sig.entry_condition = "Momentum flattening - knife catching; scale in on stabilisation."
+            else:  # STALLING
+                sig.entry_condition = "Range-bound - fade only on a confirmed break of the range."
+
+            confirmed.append(sig)
+
+        confirmed.sort(key=lambda s: s.signal_strength, reverse=True)
+        return confirmed
+
+    @staticmethod
+    def _extract_close_series(data: Optional[Any]) -> Optional[List[float]]:
+        """Pull a list of closes from a DataFrame, a Series, or a plain list."""
+        if data is None:
+            return None
+        try:
+            if hasattr(data, "columns") and "Close" in data.columns:
+                vals = [float(x) for x in data["Close"].dropna().tolist()]
+            elif hasattr(data, "tolist"):
+                vals = [float(x) for x in data.dropna().tolist()]
+            else:
+                vals = [float(x) for x in data]
+        except Exception:
+            return None
+        return vals if vals else None
+
+    @staticmethod
+    def _daily_slope(series: List[float]) -> Optional[float]:
+        """Average daily % change over the last 5 sessions."""
+        if len(series) < 6:
+            return None
+        recent = series[-6:]
+        try:
+            return (recent[-1] - recent[0]) / recent[0] / 5.0
+        except Exception:
+            return None
+
+    @classmethod
+    def _classify_momentum(
+        cls, series: List[float], direction: str
+    ) -> Tuple[str, float, str, float]:
+        """Classify price momentum relative to a fade direction.
+
+        Returns (state, score, human_readable, last_price).  Score is on
+        −100..+100 where positive means price is moving WITH the fade
+        (i.e. confirming the counter-trend trade).
+        """
+        last = series[-1]
+        ret_5 = (last / series[-6] - 1.0) * 100.0 if len(series) >= 6 else 0.0
+        ret_20 = (last / series[-21] - 1.0) * 100.0 if len(series) >= 21 else 0.0
+
+        # For a LONG fade we want price rising; for SHORT we want it falling.
+        sign = 1.0 if direction == "LONG" else -1.0
+        mom_5 = ret_5 * sign
+        mom_20 = ret_20 * sign
+
+        # Score: blend short+medium momentum in the fade direction (−100..+100)
+        score = max(-100.0, min(100.0, mom_5 * 2.0 + mom_20 * 1.5))
+
+        if mom_5 > 0 and mom_20 > 0:
+            state = "REVERSING"
+        elif mom_5 > 0 and mom_20 <= 0:
+            state = "DECELERATING"
+        elif mom_5 <= 0 and mom_20 <= 0 and score < -15:
+            state = "TREND_ACCELERATING"
+        else:
+            state = "STALLING"
+
+        read = (
+            f"Last close {last:.4f}; 5d {ret_5:+.2f}%, 20d {ret_20:+.2f}%. "
+            f"Momentum state: {state}."
+        )
+        return state, score, read, last
+
+    def refresh_from_market_data(
+        self, market_data: Dict[str, float], in_place: bool = True
+    ) -> List[str]:
+        """Adjust narrative consensus/fundamental scores from live market data.
+
+        Replaces the static seeded scores with data-conditioned ones wherever
+        a matching observation is provided.  ``market_data`` accepts any of:
+
+          vix                 : current VIX level
+          us_10y_yield        : 10Y US Treasury yield (%)
+          usd_index           : DXY level
+          gold_price          : spot gold price (e.g. 2400)
+          usdjpy              : USD/JPY rate
+          oil_price           : WTI price
+          sp500               : S&P 500 level
+          smh_price           : semiconductor ETF price
+
+        Returns the list of themes whose scores were updated.
+        """
+        updated: List[str] = []
+
+        def _adj(theme: str, consensus_delta: float = 0.0, fundamental_delta: float = 0.0):
+            for item in self._raw_narratives:
+                if item.get("theme") != theme:
+                    continue
+                item["consensus_score"] = max(
+                    5.0, min(95.0, float(item.get("consensus_score", 50)) + consensus_delta)
+                )
+                item["fundamental_score"] = max(
+                    5.0, min(95.0, float(item.get("fundamental_score", 50)) + fundamental_delta)
+                )
+                updated.append(theme)
+                return
+
+        vix = market_data.get("vix")
+        yield_10y = market_data.get("us_10y_yield")
+        dxy = market_data.get("usd_index")
+        gold = market_data.get("gold_price")
+        usdjpy = market_data.get("usdjpy")
+        oil = market_data.get("oil_price")
+        smh = market_data.get("smh_price")
+
+        # USD strength: high/rising DXY supports the consensus, deficits aside.
+        if dxy:
+            _adj("USD Structural Strength", consensus_delta=(dxy - 100.0) * 0.3)
+        if vix:
+            # Risk-off (high VIX) weakens the higher-for-longer / USD-bull case
+            _adj("USD Structural Strength", consensus_delta=-(vix - 15.0) * 0.5)
+            _adj("Fed Hawkishness Permanence", consensus_delta=-(vix - 15.0) * 0.8)
+            _adj("Tech / AI Exceptionalism", consensus_delta=-(vix - 15.0) * 0.9)
+            # Small caps get hit hardest in stress: fundamental case strengthens
+            _adj("Small-Cap Permanent Underperformance", fundamental_delta=(vix - 15.0) * 0.5)
+        if yield_10y:
+            # Falling yields undermine the hawkish-permanence narrative
+            _adj("Fed Hawkishness Permanence", consensus_delta=(yield_10y - 4.2) * -6.0)
+            _adj("Fed Hawkishness Permanence", fundamental_delta=(yield_10y - 4.2) * 3.0)
+        if gold:
+            # Rising gold erodes the "relic" belief and supports fundamentals
+            _adj("Gold is a Relic", consensus_delta=(gold - 2300.0) * -0.02)
+            _adj("Gold is a Relic", fundamental_delta=(gold - 2300.0) * 0.03)
+        if usdjpy:
+            # Higher USD/JPY = more carry complacency = consensus stronger
+            _adj("JPY Carry Trade is Safe", consensus_delta=(usdjpy - 150.0) * 0.8)
+            # BOJ normalisation risk grows as the pair stretches
+            _adj("JPY Carry Trade is Safe", fundamental_delta=(usdjpy - 150.0) * -0.4)
+        if oil:
+            _adj("Energy Transition is Linear", fundamental_delta=(oil - 75.0) * 0.4)
+        if smh:
+            _adj("Tech / AI Exceptionalism", consensus_delta=(smh - 250.0) * 0.05)
+
+        self._build_narratives(self._raw_narratives)
+        return updated
 
     def get_narrative_report(self) -> str:
         """

@@ -41,6 +41,29 @@ from background_tasks import (
     tasks_for_session,
 )
 
+from counter_trend_analyzer import get_counter_trend_analyzer  # noqa: E402
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _fetch_ct_price_data(symbols: tuple) -> dict:
+    """Fetch live closes for counter-trend signal instruments (cached 10 min).
+
+    Returns {instrument: DataFrame with Close}.  Every symbol fetch is wrapped
+    so a single missing ticker never breaks the whole confirmation pass.
+    """
+    from data_sources import get_stock
+
+    out = {}
+    for sym in symbols:
+        try:
+            df = get_stock(sym, period="3mo")
+            if df is not None and not df.empty and "Close" in df.columns:
+                out[sym] = df
+        except Exception:
+            continue
+    return out
+
+
 st.set_page_config(layout="wide", page_title="Octavian Terminal", page_icon="O")
 
 # Apply professional theme
@@ -727,8 +750,6 @@ elif selection == "Intelligence Center":
         )
 
         try:
-            from counter_trend_analyzer import get_counter_trend_analyzer
-
             ct = get_counter_trend_analyzer()
 
             #  Narrative Overview Table 
@@ -780,7 +801,34 @@ elif selection == "Intelligence Center":
                 divergence_threshold=18.0, min_strength=50.0
             )
 
+            # Live-price momentum confirmation (cached 10 min) so signals are
+            # not fired while the crowd's trend is still accelerating.
+            use_momentum = st.checkbox(
+                "Confirm with live price momentum",
+                value=True,
+                help=(
+                    "Fetch live closes for signal instruments and down-weight / "
+                    "filter out falling-knife entries where the trend is still "
+                    "accelerating against the fade."
+                ),
+            )
+            if use_momentum and ct_signals:
+                price_data = _fetch_ct_price_data(
+                    tuple(s.instrument for s in ct_signals[:12])
+                )
+                ct_signals = ct.apply_momentum_filter(ct_signals, price_data)
+
             if ct_signals:
+                momentum_reads = [
+                    s.momentum_state for s in ct_signals if s.momentum_state != "NO_DATA"
+                ]
+                if momentum_reads:
+                    st.caption(
+                        "Momentum: "
+                        + " ".join(
+                            f"{s.momentum_state}" for s in ct_signals if s.momentum_state != "NO_DATA"
+                        )[:200]
+                    )
                 st.success(
                     f"Found **{len(ct_signals)}** counter-trend opportunities across macro narratives."
                 )
@@ -794,10 +842,16 @@ elif selection == "Intelligence Center":
                         if sig.signal_strength >= 60
                         else "#ffa500"
                     )
+                    mom_badge = (
+                        f"  |  Momentum: {sig.momentum_state}"
+                        if sig.momentum_state and sig.momentum_state != "NO_DATA"
+                        else ""
+                    )
 
                     with st.expander(
                         f"{sig.direction} {sig.instrument}  |  {sig.theme}  |  "
-                        f"Strength: {sig.signal_strength:.0f}/100  |  {sig.time_horizon}",
+                        f"Strength: {sig.signal_strength:.0f}/100  |  {sig.time_horizon}"
+                        f"{mom_badge}",
                         expanded=False,
                     ):
                         c1, c2, c3, c4 = st.columns(4)
@@ -824,6 +878,12 @@ elif selection == "Intelligence Center":
                         )
 
                         st.markdown(f"**Entry Rationale:** {sig.entry_rationale}")
+                        if sig.entry_condition:
+                            st.markdown(f"**Entry Condition:** {sig.entry_condition}")
+                        if sig.price_confirmation:
+                            st.markdown(
+                                f"**Live Price Read:** {sig.price_confirmation}"
+                            )
                         st.info(f"**Catalyst Needed:** {sig.catalyst_needed}")
                         st.warning(f"**Key Risks:** {' | '.join(sig.key_risks)}")
 
