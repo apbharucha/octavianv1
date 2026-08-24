@@ -41,8 +41,6 @@ from background_tasks import (
     tasks_for_session,
 )
 
-from counter_trend_analyzer import get_counter_trend_analyzer  # noqa: E402
-
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _fetch_ct_price_data(symbols: tuple) -> dict:
@@ -59,6 +57,40 @@ def _fetch_ct_price_data(symbols: tuple) -> dict:
             df = get_stock(sym, period="3mo")
             if df is not None and not df.empty and "Close" in df.columns:
                 out[sym] = df
+        except Exception:
+            continue
+    return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_ct_macro_state() -> dict:
+    """Fetch the live macro observations the divergence engine conditions on
+    (cached 5 min): VIX, 10Y yield, DXY, gold, oil, USD/JPY, SMH, S&P 500.
+
+    Every symbol goes through ``get_stock`` so a single missing ticker never
+    breaks the intelligence pass; unavailable inputs stay absent (the engine
+    degrades to seeded estimates and labels them ESTIMATED).
+    """
+    from data_sources import get_stock
+
+    mapping = {
+        "vix": "^VIX",
+        "us_10y_yield": "^TNX",
+        "usd_index": "DX-Y.NYB",
+        "gold_price": "GC=F",
+        "oil_price": "CL=F",
+        "usdjpy": "JPY=X",
+        "smh_price": "SMH",
+        "sp500": "^GSPC",
+    }
+    out = {}
+    for key, sym in mapping.items():
+        try:
+            df = get_stock(sym, period="6mo")
+            if df is not None and not df.empty and "Close" in df.columns:
+                close = df["Close"].dropna()
+                if len(close):
+                    out[key] = float(close.iloc[-1])
         except Exception:
             continue
     return out
@@ -743,201 +775,12 @@ elif selection == "Intelligence Center":
 
         show_octavian_chatbot()
     with intel_tabs[2]:
-        st.subheader("Counter-Trend Macro Signal Dashboard")
-        st.caption(
-            "Identifies weaknesses and contradictions in mainstream economic narratives. "
-            "Generates signals that profit from consensus mispricing."
+        from counter_trend_ui import show_counter_trend_dashboard
+
+        show_counter_trend_dashboard(
+            fetch_price_data=_fetch_ct_price_data,
+            fetch_macro_state=_fetch_ct_macro_state,
         )
-
-        try:
-            ct = get_counter_trend_analyzer()
-
-            #  Narrative Overview Table 
-            st.markdown("### Macro Narrative Divergence Tracker")
-            st.caption(
-                "Consensus Score = how strongly the market believes the narrative (0–100). "
-                "Fundamental Score = how well the data actually supports it. "
-                "Divergence = mispricing gap."
-            )
-
-            narratives = ct.get_all_narratives()
-            if narratives:
-                narr_rows = [
-                    {
-                        "Theme": n.theme,
-                        "Consensus Score": round(n.consensus_score, 1),
-                        "Fundamental Score": round(n.fundamental_score, 1),
-                        "Divergence": round(n.divergence, 1),
-                        "Status": (
-                            "OVERCROWDED"
-                            if n.divergence >= 18
-                            else "UNDERHYPED"
-                            if n.divergence <= -18
-                            else "FAIR"
-                        ),
-                    }
-                    for n in narratives
-                ]
-                narr_df = pd.DataFrame(narr_rows)
-                st.dataframe(
-                    narr_df[
-                        [
-                            "Theme",
-                            "Consensus Score",
-                            "Fundamental Score",
-                            "Divergence",
-                            "Status",
-                        ]
-                    ],
-                    width='stretch',
-                    hide_index=True,
-                )
-
-            st.markdown("---")
-
-            #  Active Counter-Trend Signals 
-            st.markdown("### Active Counter-Trend Trade Signals")
-            ct_signals = ct.generate_counter_signals(
-                divergence_threshold=18.0, min_strength=50.0
-            )
-
-            # Live-price momentum confirmation (cached 10 min) so signals are
-            # not fired while the crowd's trend is still accelerating.
-            use_momentum = st.checkbox(
-                "Confirm with live price momentum",
-                value=True,
-                help=(
-                    "Fetch live closes for signal instruments and down-weight / "
-                    "filter out falling-knife entries where the trend is still "
-                    "accelerating against the fade."
-                ),
-            )
-            if use_momentum and ct_signals:
-                price_data = _fetch_ct_price_data(
-                    tuple(s.instrument for s in ct_signals[:12])
-                )
-                ct_signals = ct.apply_momentum_filter(ct_signals, price_data)
-
-            if ct_signals:
-                momentum_reads = [
-                    s.momentum_state for s in ct_signals if s.momentum_state != "NO_DATA"
-                ]
-                if momentum_reads:
-                    st.caption(
-                        "Momentum: "
-                        + " ".join(
-                            f"{s.momentum_state}" for s in ct_signals if s.momentum_state != "NO_DATA"
-                        )[:200]
-                    )
-                st.success(
-                    f"Found **{len(ct_signals)}** counter-trend opportunities across macro narratives."
-                )
-
-                for sig in ct_signals[:10]:  # Show top 10
-                    dir_color = "#00ff88" if sig.direction == "LONG" else "#ff4444"
-                    strength_color = (
-                        "#00ff88"
-                        if sig.signal_strength >= 75
-                        else "#ffff00"
-                        if sig.signal_strength >= 60
-                        else "#ffa500"
-                    )
-                    mom_badge = (
-                        f"  |  Momentum: {sig.momentum_state}"
-                        if sig.momentum_state and sig.momentum_state != "NO_DATA"
-                        else ""
-                    )
-
-                    with st.expander(
-                        f"{sig.direction} {sig.instrument}  |  {sig.theme}  |  "
-                        f"Strength: {sig.signal_strength:.0f}/100  |  {sig.time_horizon}"
-                        f"{mom_badge}",
-                        expanded=False,
-                    ):
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("Direction", sig.direction)
-                        c2.metric("Signal Strength", f"{sig.signal_strength:.0f}/100")
-                        c3.metric("Confidence", f"{sig.confidence:.0f}/100")
-                        c4.metric("Position Size", f"{sig.position_size_pct:.1f}%")
-
-                        st.markdown(
-                            f"<div style='background:#1a1f2e;border-left:4px solid {dir_color};"
-                            f"border-radius:6px;padding:14px;margin:8px 0;'>"
-                            f"<div style='color:#aaa;font-size:0.8rem;margin-bottom:4px;'>MAINSTREAM NARRATIVE</div>"
-                            f"<div style='color:#ccc;'>{sig.macro_narrative}</div>"
-                            f"</div>",
-                            unsafe_allow_html=True,
-                        )
-                        st.markdown(
-                            f"<div style='background:#1a1f2e;border-left:4px solid {strength_color};"
-                            f"border-radius:6px;padding:14px;margin:8px 0;'>"
-                            f"<div style='color:#aaa;font-size:0.8rem;margin-bottom:4px;'>COUNTER-THESIS (WHY CROWD IS WRONG)</div>"
-                            f"<div style='color:white;font-weight:500;'>{sig.counter_thesis}</div>"
-                            f"</div>",
-                            unsafe_allow_html=True,
-                        )
-
-                        st.markdown(f"**Entry Rationale:** {sig.entry_rationale}")
-                        if sig.entry_condition:
-                            st.markdown(f"**Entry Condition:** {sig.entry_condition}")
-                        if sig.price_confirmation:
-                            st.markdown(
-                                f"**Live Price Read:** {sig.price_confirmation}"
-                            )
-                        st.info(f"**Catalyst Needed:** {sig.catalyst_needed}")
-                        st.warning(f"**Key Risks:** {' | '.join(sig.key_risks)}")
-
-            else:
-                st.info(
-                    "No strong counter-trend signals at current divergence threshold. Markets may be fairly priced."
-                )
-
-            st.markdown("---")
-
-            #  Narrative Contradiction Detail 
-            st.markdown("### Narrative Contradictions Deep-Dive")
-            all_narrative_objs = ct.get_all_narratives()
-            selected_theme = st.selectbox(
-                "Select Narrative to Examine",
-                [n.theme for n in all_narrative_objs],
-            )
-            if selected_theme:
-                narr_obj = next(
-                    (n for n in all_narrative_objs if n.theme == selected_theme),
-                    None,
-                )
-                if narr_obj:
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        st.markdown(
-                            f"**Consensus Score:** {narr_obj.consensus_score:.0f}/100"
-                        )
-                        st.markdown(
-                            f"**Fundamental Score:** {narr_obj.fundamental_score:.0f}/100"
-                        )
-                        st.markdown(f"**Divergence:** {narr_obj.divergence:+.1f} pts")
-                        if narr_obj.narrative_summary:
-                            st.markdown("**Narrative Summary:**")
-                            st.write(narr_obj.narrative_summary)
-                    with col_b:
-                        if narr_obj.contradictions:
-                            st.markdown("**Key Contradictions:**")
-                            for c in narr_obj.contradictions:
-                                st.markdown(f"- {c}")
-                        if narr_obj.supporting_data:
-                            st.markdown(
-                                "**Supporting the Narrative (Devil's Advocate):**"
-                            )
-                            for s in narr_obj.supporting_data:
-                                st.markdown(f"- {s}")
-
-            #  Full Narrative Report 
-            with st.expander("Full Narrative Report (Text)", expanded=False):
-                st.code(ct.get_narrative_report(), language=None)
-
-        except Exception as e:
-            st.error(f"Counter-trend analyzer unavailable: {e}")
-            st.info("Ensure counter_trend_analyzer.py is present in the project root.")
 
 elif selection == "Paper Trading":
     from paper_trading_ui import show_paper_trading_dashboard

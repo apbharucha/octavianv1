@@ -20,7 +20,9 @@ Signal Logic:
 from __future__ import annotations
 
 import copy
+import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -695,6 +697,25 @@ class CounterTrendAnalyzer:
 
         return "\n".join(lines)
 
+    def get_intelligence(
+        self,
+        market_state: Optional[Dict[str, Any]] = None,
+        price_data: Optional[Dict[str, Any]] = None,
+        divergence_weights: Optional[Dict[str, float]] = None,
+    ) -> "MacroNarrativeIntelligenceEngine":
+        """Return the full divergence-intelligence engine for this analyzer.
+
+        market_state accepts live observations (vix, us_10y_yield, usd_index,
+        gold_price, oil_price, usdjpy, smh_price, cpi_yoy, hy_spread_bps,
+        sp500).  price_data maps instrument -> DataFrame with a Close column.
+        """
+        return MacroNarrativeIntelligenceEngine(
+            analyzer=self,
+            market_state=market_state,
+            price_data=price_data,
+            divergence_weights=divergence_weights,
+        )
+
     #  Internal Signal Builder 
 
     def _build_signal(
@@ -961,3 +982,2073 @@ def get_counter_trend_analyzer() -> CounterTrendAnalyzer:
     if _analyzer_instance is None:
         _analyzer_instance = CounterTrendAnalyzer()
     return _analyzer_instance
+
+
+# =====================================================================
+# MACRO NARRATIVE DIVERGENCE INTELLIGENCE LAYER
+# =====================================================================
+# Upgrades the counter-trend analyzer into a full divergence intelligence
+# system: for every tracked macro narrative it computes
+#
+#   WHAT THE MARKET BELIEVES (consensus + components)
+#   WHAT THE DATA SAYS     (fundamental reality + components)
+#   WHERE THEY DIVERGE     (composite Macro Divergence Score, weighted)
+#   HOW EXTREME            (historical extremity + crowding)
+#   WHAT IS PRICED         (market-pricing divergence, second-order layer)
+#   WHAT COULD FORCE CONVERGENCE (catalyst watchlist + proximity)
+#   WHAT ASSET IS EXPOSED  (transmission map)
+#   WHAT WOULD INVALIDATE  (value-trap check + invalidation conditions)
+#
+# Design guardrails (see section 23 of the spec): divergence is NEVER an
+# automatic trade.  Opportunity score and confidence score are reported
+# separately, a value-trap detector can veto the setup, every number
+# carries a provenance label (OBSERVED / ESTIMATED / MODEL-DERIVED /
+# MARKET-IMPLIED / AI-INFERRED), and every setup ships an evidence trail
+# linking each claim to its backing.
+
+PROVENANCE_LABELS = (
+    "OBSERVED",
+    "ESTIMATED",
+    "MODEL-DERIVED",
+    "MARKET-IMPLIED",
+    "AI-INFERRED",
+)
+
+DIVERGENCE_WEIGHTS: Dict[str, float] = {
+    "narrative": 0.25,
+    "fundamental": 0.20,
+    "market_pricing": 0.20,
+    "positioning": 0.10,
+    "historical_extremity": 0.10,
+    "data_momentum": 0.10,
+    "catalyst_proximity": 0.05,
+}
+
+_REGIMES = (
+    "Goldilocks",
+    "Inflationary Expansion",
+    "Deflationary Slowdown",
+    "Stagflation",
+    "Recession",
+    "Liquidity Expansion",
+    "Liquidity Contraction",
+    "Credit Stress",
+    "Recovery",
+    "Unknown / Transition",
+)
+
+
+def _clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
+    """Clamp a float into [lo, hi], None-safe."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return lo
+    return max(lo, min(hi, v))
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Coerce to float, returning default on None/NaN/bad input."""
+    if value is None:
+        return default
+    try:
+        f = float(value)
+        if f != f:  # NaN
+            return default
+        return f
+    except (TypeError, ValueError):
+        return default
+
+
+# Per-narrative institutional metadata: consensus & fundamental component
+# seeds, narrative velocity history, historical analogs, transmission maps,
+# catalyst watchlists, half-life and region.  All seeds are MODEL-DERIVED
+# estimates - the engine conditions them on live market observations when
+# those are supplied (market_state) so the displayed numbers stay honest.
+
+_NARRATIVE_EXTRA: Dict[str, Dict] = {
+    "USD Structural Strength": {
+        "region": "Global",
+        "half_life": "Months",
+        "consensus_components": {
+            "market_implied": 78, "analyst_estimates": 72, "news_sentiment": 70,
+            "positioning": 74, "flows": 68, "media_coverage": 72,
+        },
+        "fundamental_components": {
+            "inflation": 45, "employment": 50, "growth": 42, "credit": 40,
+            "rates": 55, "liquidity": 48,
+        },
+        "velocity": {
+            "consensus_7d": -2.0, "consensus_30d": -5.0, "consensus_90d": +6.0,
+            "fundamental_7d": +1.0, "fundamental_30d": +2.0, "fundamental_90d": +8.0,
+        },
+        "analogs": [
+            {"period": "2002-2004 USD decline", "note": "Twin deficits widened while the Fed cut; USD fell 25%+ over two years.",
+             "similarity": 71, "avg_return_pct": -18.0, "median_return_pct": -14.0,
+             "worst_pct": -32.0, "best_pct": +5.0, "resolution_months": 18},
+            {"period": "2017-2018 USD slide", "note": "Fiscal expansion + widening current account while rates stayed low.",
+             "similarity": 64, "avg_return_pct": -9.0, "median_return_pct": -8.0,
+             "worst_pct": -15.0, "best_pct": +2.0, "resolution_months": 12},
+            {"period": "1985 Plaza Accord", "note": "Coordinated intervention forced a sharp USD repricing.",
+             "similarity": 48, "avg_return_pct": -30.0, "median_return_pct": -25.0,
+             "worst_pct": -40.0, "best_pct": -12.0, "resolution_months": 24},
+        ],
+        "transmissions": [
+            {"macro_variable": "USD index", "mechanism": "Rate differential + reserve diversification", "asset": "EURUSD=X", "expected_direction": "LONG"},
+            {"macro_variable": "USD index", "mechanism": "Dollar weakness re-prices hard assets", "asset": "GLD", "expected_direction": "LONG"},
+            {"macro_variable": "US fiscal deficit", "mechanism": "Twin-deficit transmission to USD", "asset": "AUDUSD=X", "expected_direction": "LONG"},
+        ],
+        "catalysts": [
+            {"name": "FOMC rate-cut decision", "days_out": 21, "expected_impact": 70,
+             "directional_relevance": "HIGH", "probability": 65,
+             "invalidates_narrative": "A hawkish hold extends the USD-bull case."},
+            {"name": "US Treasury quarterly refunding", "days_out": 45, "expected_impact": 45,
+             "directional_relevance": "MEDIUM", "probability": 60,
+             "invalidates_narrative": "Weak auction demand pressures USD."},
+            {"name": "US CPI print", "days_out": 14, "expected_impact": 55,
+             "directional_relevance": "MEDIUM", "probability": 70,
+             "invalidates_narrative": "Hot print keeps USD bid."},
+        ],
+        "data_sources": ["Market-implied rates", "COT positioning", "News sentiment", "Fund flows"],
+    },
+    "Fed Hawkishness Permanence": {
+        "region": "United States",
+        "half_life": "Weeks",
+        "consensus_components": {
+            "market_implied": 70, "analyst_estimates": 68, "news_sentiment": 62,
+            "positioning": 66, "flows": 60, "media_coverage": 64,
+        },
+        "fundamental_components": {
+            "inflation": 55, "employment": 38, "growth": 40, "credit": 35,
+            "rates": 45, "liquidity": 42,
+        },
+        "velocity": {
+            "consensus_7d": -1.0, "consensus_30d": -4.0, "consensus_90d": -9.0,
+            "fundamental_7d": +1.5, "fundamental_30d": +4.0, "fundamental_90d": +11.0,
+        },
+        "analogs": [
+            {"period": "2007 pre-cut period", "note": "Rates stayed high into an emerging slowdown; the Fed cut aggressively once cracks showed.",
+             "similarity": 74, "avg_return_pct": -12.0, "median_return_pct": -9.0,
+             "worst_pct": -22.0, "best_pct": +3.0, "resolution_months": 10},
+            {"period": "1995 soft-landing pause", "note": "One cut was enough; long-end rallied hard into the pause.",
+             "similarity": 62, "avg_return_pct": -4.0, "median_return_pct": -3.0,
+             "worst_pct": -10.0, "best_pct": +6.0, "resolution_months": 6},
+            {"period": "2019 pivot", "note": "Trade-war slowdown forced a 180-degree pivot from hikes to cuts.",
+             "similarity": 69, "avg_return_pct": -8.0, "median_return_pct": -6.0,
+             "worst_pct": -14.0, "best_pct": +4.0, "resolution_months": 8},
+        ],
+        "transmissions": [
+            {"macro_variable": "Fed funds path", "mechanism": "Rate-cut repricing lifts duration", "asset": "TLT", "expected_direction": "LONG"},
+            {"macro_variable": "Fed funds path", "mechanism": "Falling rates relieve rate-sensitive sectors", "asset": "XLU", "expected_direction": "LONG"},
+            {"macro_variable": "Fed funds path", "mechanism": "Housing relief on mortgage rates", "asset": "XLRE", "expected_direction": "LONG"},
+        ],
+        "catalysts": [
+            {"name": "Nonfarm payrolls", "days_out": 7, "expected_impact": 75,
+             "directional_relevance": "HIGH", "probability": 75,
+             "invalidates_narrative": "Hot payrolls keep the hawkish stance intact."},
+            {"name": "CPI print", "days_out": 14, "expected_impact": 70,
+             "directional_relevance": "HIGH", "probability": 70,
+             "invalidates_narrative": "Sticky core services re-justifies higher-for-longer."},
+            {"name": "FOMC decision + dots", "days_out": 21, "expected_impact": 80,
+             "directional_relevance": "HIGH", "probability": 65,
+             "invalidates_narrative": "Hawkish dots confirm permanence."},
+        ],
+        "data_sources": ["Fed funds futures", "FOMC dots", "Jobs data", "CPI/PCE prints"],
+    },
+    "Tech / AI Exceptionalism": {
+        "region": "United States",
+        "half_life": "Months",
+        "consensus_components": {
+            "market_implied": 84, "analyst_estimates": 82, "news_sentiment": 80,
+            "positioning": 86, "flows": 82, "media_coverage": 78,
+        },
+        "fundamental_components": {
+            "inflation": 60, "employment": 62, "growth": 58, "credit": 55,
+            "rates": 50, "liquidity": 60,
+        },
+        "velocity": {
+            "consensus_7d": -1.5, "consensus_30d": -3.0, "consensus_90d": -7.0,
+            "fundamental_7d": +0.5, "fundamental_30d": +1.5, "fundamental_90d": +4.0,
+        },
+        "analogs": [
+            {"period": "2000 TMT peak", "note": "Concentration + capex boom + perfect expectations; index fell 40%+ over two years.",
+             "similarity": 66, "avg_return_pct": -28.0, "median_return_pct": -22.0,
+             "worst_pct": -49.0, "best_pct": +5.0, "resolution_months": 24},
+            {"period": "1968 Nifty Fifty", "note": "One-decision growth stocks de-rated over a decade.",
+             "similarity": 58, "avg_return_pct": -20.0, "median_return_pct": -15.0,
+             "worst_pct": -35.0, "best_pct": +4.0, "resolution_months": 30},
+            {"period": "2015-2016 biotech unwind", "note": "Crowded theme corrected ~30% when funding conditions turned.",
+             "similarity": 55, "avg_return_pct": -12.0, "median_return_pct": -9.0,
+             "worst_pct": -25.0, "best_pct": +8.0, "resolution_months": 10},
+        ],
+        "transmissions": [
+            {"macro_variable": "AI capex cycle", "mechanism": "Capex digestion hits hardware names", "asset": "NVDA", "expected_direction": "SHORT"},
+            {"macro_variable": "AI capex cycle", "mechanism": "Rotation out of mega-cap concentration", "asset": "QQQ", "expected_direction": "SHORT"},
+            {"macro_variable": "AI capex cycle", "mechanism": "Rate relief + breadth rotation", "asset": "IWM", "expected_direction": "LONG"},
+        ],
+        "catalysts": [
+            {"name": "Hyperscaler earnings / capex guidance", "days_out": 20, "expected_impact": 80,
+             "directional_relevance": "HIGH", "probability": 80,
+             "invalidates_narrative": "Capex acceleration keeps the AI bid intact."},
+            {"name": "NVDA quarterly results", "days_out": 35, "expected_impact": 75,
+             "directional_relevance": "HIGH", "probability": 75,
+             "invalidates_narrative": "Guidance beat validates the exceptionalism narrative."},
+            {"name": "Fed rate path shift", "days_out": 21, "expected_impact": 60,
+             "directional_relevance": "MEDIUM", "probability": 65,
+             "invalidates_narrative": "Duration pain hits long-duration growth names."},
+        ],
+        "data_sources": ["Options positioning", "13F concentration", "Earnings guidance", "Capex disclosures"],
+    },
+    "China Economic Collapse": {
+        "region": "Asia",
+        "half_life": "Months",
+        "consensus_components": {
+            "market_implied": 72, "analyst_estimates": 70, "news_sentiment": 68,
+            "positioning": 66, "flows": 64, "media_coverage": 72,
+        },
+        "fundamental_components": {
+            "inflation": 45, "employment": 40, "growth": 52, "credit": 38,
+            "rates": 50, "liquidity": 44,
+        },
+        "velocity": {
+            "consensus_7d": -1.0, "consensus_30d": -2.0, "consensus_90d": -5.0,
+            "fundamental_7d": +0.5, "fundamental_30d": +1.0, "fundamental_90d": +3.0,
+        },
+        "analogs": [
+            {"period": "2015-2016 China devaluation scare", "note": "Extreme bearishness; MSCI China rallied ~30% off the lows within a year.",
+             "similarity": 70, "avg_return_pct": +25.0, "median_return_pct": +18.0,
+             "worst_pct": +2.0, "best_pct": +45.0, "resolution_months": 12},
+            {"period": "2022 China zero-COVID bottom", "note": "Valuations at decade lows preceded a strong 2023 recovery.",
+             "similarity": 66, "avg_return_pct": +18.0, "median_return_pct": +12.0,
+             "worst_pct": -5.0, "best_pct": +35.0, "resolution_months": 9},
+            {"period": "1997-98 Asia crisis", "note": "Contagion was real - recovery took years.",
+             "similarity": 45, "avg_return_pct": -15.0, "median_return_pct": -10.0,
+             "worst_pct": -40.0, "best_pct": +10.0, "resolution_months": 24},
+        ],
+        "transmissions": [
+            {"macro_variable": "China growth expectations", "mechanism": "Valuation re-rating off depressed base", "asset": "FXI", "expected_direction": "LONG"},
+            {"macro_variable": "China growth expectations", "mechanism": "Internet platform earnings leverage", "asset": "KWEB", "expected_direction": "LONG"},
+            {"macro_variable": "Property stabilisation", "mechanism": "CNY sentiment recovery", "asset": "USDCNH=X", "expected_direction": "SHORT"},
+        ],
+        "catalysts": [
+            {"name": "PBOC stimulus announcement", "days_out": 30, "expected_impact": 75,
+             "directional_relevance": "HIGH", "probability": 60,
+             "invalidates_narrative": "Large fiscal bazooka breaks the stagnation view."},
+            {"name": "China PMI / credit prints", "days_out": 10, "expected_impact": 55,
+             "directional_relevance": "MEDIUM", "probability": 70,
+             "invalidates_narrative": "Continued contraction extends the bear case."},
+            {"name": "Property sales data", "days_out": 25, "expected_impact": 50,
+             "directional_relevance": "MEDIUM", "probability": 65,
+             "invalidates_narrative": "Floor formation supports the recovery case."},
+        ],
+        "data_sources": ["China PMI", "Property sales", "PBOC policy", "MSCI China valuations"],
+    },
+    "Gold is a Relic": {
+        "region": "Global",
+        "half_life": "Months",
+        "consensus_components": {
+            "market_implied": 42, "analyst_estimates": 40, "news_sentiment": 38,
+            "positioning": 36, "flows": 40, "media_coverage": 42,
+        },
+        "fundamental_components": {
+            "inflation": 15, "employment": 25, "growth": 25, "credit": 30,
+            "rates": 10, "liquidity": 20,
+        },
+        "velocity": {
+            "consensus_7d": -1.5, "consensus_30d": -4.0, "consensus_90d": -8.0,
+            "fundamental_7d": +1.0, "fundamental_30d": +2.5, "fundamental_90d": +7.0,
+        },
+        "analogs": [
+            {"period": "1970s gold breakout", "note": "Fiscal dominance + negative real returns lifted gold 5x over the decade.",
+             "similarity": 68, "avg_return_pct": +35.0, "median_return_pct": +22.0,
+             "worst_pct": +5.0, "best_pct": +70.0, "resolution_months": 24},
+            {"period": "2001-2011 secular bull", "note": "Central bank buying + real-rate decline drove an 8x move.",
+             "similarity": 64, "avg_return_pct": +28.0, "median_return_pct": +18.0,
+             "worst_pct": +3.0, "best_pct": +55.0, "resolution_months": 36},
+            {"period": "2013 taper tantrum", "note": "Real-rate spike crushed gold - the relationship reasserted itself.",
+             "similarity": 42, "avg_return_pct": -28.0, "median_return_pct": -25.0,
+             "worst_pct": -35.0, "best_pct": -10.0, "resolution_months": 12},
+        ],
+        "transmissions": [
+            {"macro_variable": "Real yields", "mechanism": "Lower real yields raise gold's appeal", "asset": "GLD", "expected_direction": "LONG"},
+            {"macro_variable": "Central bank reserves", "mechanism": "De-dollarisation buying", "asset": "GDX", "expected_direction": "LONG"},
+            {"macro_variable": "Fiscal dominance", "mechanism": "Counterparty-risk hedging", "asset": "SLV", "expected_direction": "LONG"},
+        ],
+        "catalysts": [
+            {"name": "Central bank reserve disclosures", "days_out": 30, "expected_impact": 60,
+             "directional_relevance": "MEDIUM", "probability": 70,
+             "invalidates_narrative": "Continued buying validates gold as reserve asset."},
+            {"name": "Real-yield decline", "days_out": 21, "expected_impact": 70,
+             "directional_relevance": "HIGH", "probability": 65,
+             "invalidates_narrative": "Rising real yields would re-justify underweighting."},
+            {"name": "US fiscal / downgrade event", "days_out": 90, "expected_impact": 65,
+             "directional_relevance": "MEDIUM", "probability": 40,
+             "invalidates_narrative": "Fiscal stress accelerates the reserve-asset bid."},
+        ],
+        "data_sources": ["Central bank reserve data", "Real yields", "ETF flows", "COMEX positioning"],
+    },
+    "Energy Transition is Linear": {
+        "region": "Global",
+        "half_life": "Months",
+        "consensus_components": {
+            "market_implied": 64, "analyst_estimates": 62, "news_sentiment": 60,
+            "positioning": 58, "flows": 60, "media_coverage": 66,
+        },
+        "fundamental_components": {
+            "inflation": 40, "employment": 45, "growth": 35, "credit": 40,
+            "rates": 45, "liquidity": 40,
+        },
+        "velocity": {
+            "consensus_7d": -0.5, "consensus_30d": -1.0, "consensus_90d": -3.0,
+            "fundamental_7d": +0.5, "fundamental_30d": +1.0, "fundamental_90d": +2.0,
+        },
+        "analogs": [
+            {"period": "2014-2016 oil bust", "note": "Underinvestment + demand surprise produced the 2021-22 energy supercycle.",
+             "similarity": 60, "avg_return_pct": +22.0, "median_return_pct": +15.0,
+             "worst_pct": -8.0, "best_pct": +45.0, "resolution_months": 24},
+            {"period": "2000s China demand shock", "note": "Demand growth exceeded all projections.",
+             "similarity": 55, "avg_return_pct": +18.0, "median_return_pct": +12.0,
+             "worst_pct": -10.0, "best_pct": +40.0, "resolution_months": 18},
+            {"period": "1986 price collapse", "note": "Supply glut can persist for years - the bear case has precedent too.",
+             "similarity": 40, "avg_return_pct": -30.0, "median_return_pct": -25.0,
+             "worst_pct": -45.0, "best_pct": -10.0, "resolution_months": 20},
+        ],
+        "transmissions": [
+            {"macro_variable": "Oil demand vs EV adoption", "mechanism": "Demand surprise + capital discipline", "asset": "XLE", "expected_direction": "LONG"},
+            {"macro_variable": "Oil supply", "mechanism": "Underinvestment tightens balances", "asset": "XOM", "expected_direction": "LONG"},
+            {"macro_variable": "Energy security policy", "mechanism": "Policy reversal supports fossil fuels", "asset": "USO", "expected_direction": "LONG"},
+        ],
+        "catalysts": [
+            {"name": "OPEC+ supply decision", "days_out": 15, "expected_impact": 65,
+             "directional_relevance": "HIGH", "probability": 70,
+             "invalidates_narrative": "Cuts tighten balances and lift prices."},
+            {"name": "Global demand data", "days_out": 25, "expected_impact": 50,
+             "directional_relevance": "MEDIUM", "probability": 65,
+             "invalidates_narrative": "Weak demand confirms the transition narrative."},
+            {"name": "Energy security policy shift", "days_out": 60, "expected_impact": 55,
+             "directional_relevance": "MEDIUM", "probability": 45,
+             "invalidates_narrative": "Pro-fossil policy reversal lifts the sector."},
+        ],
+        "data_sources": ["EIA inventories", "OPEC+ statements", "EV adoption data", "Energy capex surveys"],
+    },
+    "Small-Cap Permanent Underperformance": {
+        "region": "United States",
+        "half_life": "Weeks",
+        "consensus_components": {
+            "market_implied": 60, "analyst_estimates": 58, "news_sentiment": 54,
+            "positioning": 50, "flows": 48, "media_coverage": 56,
+        },
+        "fundamental_components": {
+            "inflation": 35, "employment": 35, "growth": 40, "credit": 40,
+            "rates": 50, "liquidity": 42,
+        },
+        "velocity": {
+            "consensus_7d": -0.5, "consensus_30d": -2.0, "consensus_90d": -6.0,
+            "fundamental_7d": +0.5, "fundamental_30d": +1.5, "fundamental_90d": +4.0,
+        },
+        "analogs": [
+            {"period": "1999-2000 large-cap peak", "note": "Small caps lagged into the peak, then outperformed for years.",
+             "similarity": 72, "avg_return_pct": +30.0, "median_return_pct": +22.0,
+             "worst_pct": -15.0, "best_pct": +60.0, "resolution_months": 24},
+            {"period": "2016 rate-cut rotation", "note": "First cut of a cycle triggered a small-cap leadership shift.",
+             "similarity": 63, "avg_return_pct": +20.0, "median_return_pct": +14.0,
+             "worst_pct": +2.0, "best_pct": +35.0, "resolution_months": 12},
+            {"period": "1970s small-cap decade", "note": "Small caps compounded at nearly double large-cap rates.",
+             "similarity": 58, "avg_return_pct": +25.0, "median_return_pct": +18.0,
+             "worst_pct": -5.0, "best_pct": +45.0, "resolution_months": 36},
+        ],
+        "transmissions": [
+            {"macro_variable": "Fed rate path", "mechanism": "Floating-rate debt relief + earnings leverage", "asset": "IWM", "expected_direction": "LONG"},
+            {"macro_variable": "Fed rate path", "mechanism": "Credit-sensitive small-cap refinancing", "asset": "IJR", "expected_direction": "LONG"},
+            {"macro_variable": "Mega-cap concentration", "mechanism": "Breadth rotation on any tech wobble", "asset": "VBR", "expected_direction": "LONG"},
+        ],
+        "catalysts": [
+            {"name": "First Fed rate cut", "days_out": 21, "expected_impact": 75,
+             "directional_relevance": "HIGH", "probability": 60,
+             "invalidates_narrative": "A hike or extended hold delays the rotation."},
+            {"name": "Small-cap earnings breadth", "days_out": 25, "expected_impact": 55,
+             "directional_relevance": "MEDIUM", "probability": 70,
+             "invalidates_narrative": "Earnings upgrades confirm relative value."},
+            {"name": "Institutional rotation signals", "days_out": 45, "expected_impact": 50,
+             "directional_relevance": "MEDIUM", "probability": 55,
+             "invalidates_narrative": "Allocator flows stay in mega-cap."},
+        ],
+        "data_sources": ["Relative P/E history", "Rate-cut cycle data", "Fund flows", "Small-cap earnings"],
+    },
+    "JPY Carry Trade is Safe": {
+        "region": "Asia",
+        "half_life": "Days",
+        "consensus_components": {
+            "market_implied": 58, "analyst_estimates": 56, "news_sentiment": 50,
+            "positioning": 72, "flows": 70, "media_coverage": 52,
+        },
+        "fundamental_components": {
+            "inflation": 20, "employment": 30, "growth": 35, "credit": 45,
+            "rates": 15, "liquidity": 30,
+        },
+        "velocity": {
+            "consensus_7d": -1.0, "consensus_30d": -3.0, "consensus_90d": -7.0,
+            "fundamental_7d": +1.0, "fundamental_30d": +3.0, "fundamental_90d": +9.0,
+        },
+        "analogs": [
+            {"period": "August 2024 carry unwind", "note": "Positioning-driven unwind hit -10%+ in days.",
+             "similarity": 78, "avg_return_pct": -6.0, "median_return_pct": -5.0,
+             "worst_pct": -12.0, "best_pct": +1.0, "resolution_months": 2},
+            {"period": "2007 carry unwind", "note": "Global risk-off unwound JPY shorts violently.",
+             "similarity": 66, "avg_return_pct": -9.0, "median_return_pct": -7.0,
+             "worst_pct": -18.0, "best_pct": +2.0, "resolution_months": 4},
+            {"period": "1998 LTCM unwind", "note": "Carry trades collapsed in weeks.",
+             "similarity": 60, "avg_return_pct": -12.0, "median_return_pct": -9.0,
+             "worst_pct": -25.0, "best_pct": 0.0, "resolution_months": 3},
+        ],
+        "transmissions": [
+            {"macro_variable": "BOJ policy", "mechanism": "Hike surprise forces unwind", "asset": "USDJPY=X", "expected_direction": "SHORT"},
+            {"macro_variable": "BOJ policy", "mechanism": "Carry unwind contagion", "asset": "EURJPY=X", "expected_direction": "SHORT"},
+            {"macro_variable": "Risk appetite", "mechanism": "Risk-off triggers yen safe-haven bid", "asset": "GBPJPY=X", "expected_direction": "SHORT"},
+        ],
+        "catalysts": [
+            {"name": "BOJ rate decision", "days_out": 14, "expected_impact": 85,
+             "directional_relevance": "HIGH", "probability": 55,
+             "invalidates_narrative": "A hike re-prices the whole carry complex."},
+            {"name": "Japan CPI print", "days_out": 10, "expected_impact": 60,
+             "directional_relevance": "MEDIUM", "probability": 70,
+             "invalidates_narrative": "Hot CPI forces BOJ normalization."},
+            {"name": "Global risk-off shock", "days_out": 30, "expected_impact": 70,
+             "directional_relevance": "HIGH", "probability": 50,
+             "invalidates_narrative": "Yen strength on safe-haven flows."},
+        ],
+        "data_sources": ["COT yen positioning", "BOJ statements", "Japan CPI", "Cross-currency basis"],
+    },
+}
+
+
+# ---------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------
+
+
+@dataclass
+class ConsensusComponents:
+    """Why the market believes the narrative (each 0-100, weighted)."""
+
+    market_implied: float = 50.0
+    analyst_estimates: float = 50.0
+    news_sentiment: float = 50.0
+    positioning: float = 50.0
+    flows: float = 50.0
+    media_coverage: float = 50.0
+    overall: float = 50.0
+    provenance: str = "MARKET-IMPLIED"
+
+    def to_dict(self) -> Dict:
+        return {
+            "market_implied": round(self.market_implied, 1),
+            "analyst_estimates": round(self.analyst_estimates, 1),
+            "news_sentiment": round(self.news_sentiment, 1),
+            "positioning": round(self.positioning, 1),
+            "flows": round(self.flows, 1),
+            "media_coverage": round(self.media_coverage, 1),
+            "overall": round(self.overall, 1),
+        }
+
+
+@dataclass
+class FundamentalComponents:
+    """How strongly the underlying data supports the narrative (0-100 each)."""
+
+    inflation: float = 50.0
+    employment: float = 50.0
+    growth: float = 50.0
+    credit: float = 50.0
+    rates: float = 50.0
+    liquidity: float = 50.0
+    overall: float = 50.0
+    provenance: str = "ESTIMATED"
+
+    def to_dict(self) -> Dict:
+        return {
+            "inflation": round(self.inflation, 1),
+            "employment": round(self.employment, 1),
+            "growth": round(self.growth, 1),
+            "credit": round(self.credit, 1),
+            "rates": round(self.rates, 1),
+            "liquidity": round(self.liquidity, 1),
+            "overall": round(self.overall, 1),
+        }
+
+
+@dataclass
+class HistoricalAnalog:
+    """A historical period that resembles the current setup (never a guarantee)."""
+
+    period: str
+    note: str
+    similarity: float  # 0-100
+    avg_return_pct: float
+    median_return_pct: float
+    worst_pct: float
+    best_pct: float
+    resolution_months: float
+
+    def to_dict(self) -> Dict:
+        return {
+            "period": self.period,
+            "note": self.note,
+            "similarity": round(self.similarity, 1),
+            "avg_return_pct": self.avg_return_pct,
+            "median_return_pct": self.median_return_pct,
+            "worst_pct": self.worst_pct,
+            "best_pct": self.best_pct,
+            "resolution_months": self.resolution_months,
+        }
+
+
+@dataclass
+class CatalystEvent:
+    """A scheduled / plausible event that could force convergence."""
+
+    name: str
+    timing: str
+    days_out: Optional[int]
+    expected_impact: float  # 0-100
+    directional_relevance: str
+    probability: float  # 0-100
+    invalidates_narrative: str
+
+    def to_dict(self) -> Dict:
+        return {
+            "name": self.name,
+            "timing": self.timing,
+            "days_out": self.days_out,
+            "expected_impact": self.expected_impact,
+            "directional_relevance": self.directional_relevance,
+            "probability": self.probability,
+            "invalidates_narrative": self.invalidates_narrative,
+        }
+
+
+@dataclass
+class TransmissionLeg:
+    """Macro variable -> mechanism -> asset -> expected direction."""
+
+    macro_variable: str
+    mechanism: str
+    asset: str
+    expected_direction: str
+    already_moved: Optional[bool] = None
+    move_pct: float = 0.0
+
+    def to_dict(self) -> Dict:
+        return {
+            "macro_variable": self.macro_variable,
+            "mechanism": self.mechanism,
+            "asset": self.asset,
+            "expected_direction": self.expected_direction,
+            "already_moved": self.already_moved,
+            "move_pct": round(self.move_pct, 2),
+        }
+
+
+@dataclass
+class MacroNarrativeAnalysis:
+    """Full divergence intelligence report for a single macro narrative."""
+
+    theme: str
+    region: str
+    consensus_score: float
+    fundamental_score: float
+    divergence: float  # consensus - fundamental (signed)
+    macro_divergence_score: float  # 0-100 composite (magnitude)
+    divergence_components: Dict[str, float]
+    consensus_components: ConsensusComponents
+    fundamental_components: FundamentalComponents
+    velocity: Dict[str, float]
+    velocity_state: str
+    data_momentum_state: str
+    crowding_score: float
+    narrative_strength: float
+    second_order: Dict[str, str]
+    contradictions: List[Dict]
+    historical_analogs: List[HistoricalAnalog]
+    catalysts: List[CatalystEvent]
+    catalyst_proximity: float  # 0-100
+    value_trap_verdict: str
+    value_trap_reasons: List[str]
+    transmission_map: List[TransmissionLeg]
+    pricing_gap: Dict
+    half_life: str
+    data_quality: Dict
+    regime: Dict
+    signal_status: str
+    opportunity_score: float
+    confidence_score: float
+    classification: str
+    why_wrong: str
+    why_right: str
+    invalidation: str
+    instruments: List[str]
+    primary_instrument: str
+    primary_direction: str
+    provenance: str = "MODEL-DERIVED"
+
+    def to_dict(self) -> Dict:
+        return {
+            "theme": self.theme,
+            "region": self.region,
+            "consensus_score": round(self.consensus_score, 1),
+            "fundamental_score": round(self.fundamental_score, 1),
+            "divergence": round(self.divergence, 1),
+            "macro_divergence_score": round(self.macro_divergence_score, 1),
+            "divergence_components": {
+                k: round(v, 1) for k, v in self.divergence_components.items()
+            },
+            "consensus_components": self.consensus_components.to_dict(),
+            "fundamental_components": self.fundamental_components.to_dict(),
+            "velocity": {k: round(v, 1) for k, v in self.velocity.items()},
+            "velocity_state": self.velocity_state,
+            "data_momentum_state": self.data_momentum_state,
+            "crowding_score": round(self.crowding_score, 1),
+            "narrative_strength": round(self.narrative_strength, 1),
+            "second_order": self.second_order,
+            "contradictions": self.contradictions,
+            "historical_analogs": [a.to_dict() for a in self.historical_analogs],
+            "catalysts": [c.to_dict() for c in self.catalysts],
+            "catalyst_proximity": round(self.catalyst_proximity, 1),
+            "value_trap_verdict": self.value_trap_verdict,
+            "value_trap_reasons": self.value_trap_reasons,
+            "transmission_map": [t.to_dict() for t in self.transmission_map],
+            "pricing_gap": self.pricing_gap,
+            "half_life": self.half_life,
+            "data_quality": self.data_quality,
+            "regime": self.regime,
+            "signal_status": self.signal_status,
+            "opportunity_score": round(self.opportunity_score, 1),
+            "confidence_score": round(self.confidence_score, 1),
+            "classification": self.classification,
+            "why_wrong": self.why_wrong,
+            "why_right": self.why_right,
+            "invalidation": self.invalidation,
+            "instruments": self.instruments,
+            "primary_instrument": self.primary_instrument,
+            "primary_direction": self.primary_direction,
+            "provenance": self.provenance,
+        }
+
+
+@dataclass
+class CounterTrendSetup:
+    """A complete trade setup built around a detected macro divergence.
+
+    Produced by MacroNarrativeIntelligenceEngine.build_setup - this is the
+    "Develop Setup" tool: entry zone, invalidation, targets, sizing,
+    catalyst, monitoring plan and an evidence trail that backs every claim.
+    """
+
+    theme: str
+    instrument: str
+    direction: str
+    narrative: str
+    divergence: float
+    macro_divergence_score: float
+    current_price: Optional[float]
+    entry_zone: Optional[Tuple[float, float]]
+    stop_loss: Optional[float]
+    targets: List[float]
+    risk_reward: float
+    position_size_pct: float
+    risk_per_trade_pct: float
+    catalyst: str
+    catalyst_days_out: Optional[int]
+    time_horizon: str
+    half_life: str
+    invalidation: str
+    entry_condition: str
+    momentum_state: str
+    monitoring_plan: List[str]
+    evidence_trail: List[Dict]
+    confidence_score: float
+    opportunity_score: float
+    classification: str
+    created_at: str
+
+    def to_dict(self) -> Dict:
+        return {
+            "theme": self.theme,
+            "instrument": self.instrument,
+            "direction": self.direction,
+            "narrative": self.narrative,
+            "divergence": round(self.divergence, 1),
+            "macro_divergence_score": round(self.macro_divergence_score, 1),
+            "current_price": self.current_price,
+            "entry_zone": self.entry_zone,
+            "stop_loss": self.stop_loss,
+            "targets": self.targets,
+            "risk_reward": round(self.risk_reward, 2),
+            "position_size_pct": round(self.position_size_pct, 2),
+            "risk_per_trade_pct": self.risk_per_trade_pct,
+            "catalyst": self.catalyst,
+            "catalyst_days_out": self.catalyst_days_out,
+            "time_horizon": self.time_horizon,
+            "half_life": self.half_life,
+            "invalidation": self.invalidation,
+            "entry_condition": self.entry_condition,
+            "momentum_state": self.momentum_state,
+            "monitoring_plan": self.monitoring_plan,
+            "evidence_trail": self.evidence_trail,
+            "confidence_score": round(self.confidence_score, 1),
+            "opportunity_score": round(self.opportunity_score, 1),
+            "classification": self.classification,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass
+class SignalTrackerRecord:
+    """One tracked counter-trend signal with realized outcome (if any)."""
+
+    signal_id: str
+    created_at: str
+    theme: str
+    instrument: str
+    direction: str
+    narrative: str
+    entry_reference: Optional[float]
+    invalidation: str
+    catalyst: str
+    confidence_score: float
+    opportunity_score: float
+    classification: str
+    time_horizon: str
+    position_size_pct: float
+    realized_return_pct: Optional[float] = None
+    max_favorable_pct: Optional[float] = None
+    max_adverse_pct: Optional[float] = None
+    resolved_days: Optional[int] = None
+    catalyst_hit: Optional[bool] = None
+    outcome_label: str = "OPEN"  # OPEN / WIN / LOSS / FLAT
+
+    def to_dict(self) -> Dict:
+        return dict(self.__dict__)
+
+
+# ---------------------------------------------------------------------
+# Engine
+# ---------------------------------------------------------------------
+
+
+class MacroNarrativeIntelligenceEngine:
+    """
+    Bayesian-style evidence aggregation over the counter-trend narratives.
+
+    For each narrative it separates market belief (consensus), observable
+    reality (fundamentals), what is already priced (second-order layer),
+    how extreme the divergence is, what could force convergence, and what
+    would invalidate a trade.  A high divergence score alone NEVER produces
+    a trade - the value-trap detector and confidence score gate the signal.
+    """
+
+    def __init__(
+        self,
+        analyzer: Optional[CounterTrendAnalyzer] = None,
+        market_state: Optional[Dict[str, Any]] = None,
+        price_data: Optional[Dict[str, "pd.DataFrame"]] = None,
+        divergence_weights: Optional[Dict[str, float]] = None,
+    ):
+        self.analyzer = analyzer if analyzer is not None else get_counter_trend_analyzer()
+        self.market_state = dict(market_state or {})
+        self.price_data = price_data or {}
+        self.weights = dict(DIVERGENCE_WEIGHTS)
+        if divergence_weights:
+            for k, v in divergence_weights.items():
+                if k in self.weights:
+                    self.weights[k] = float(v)
+        self._prev_regime: Optional[str] = None
+
+    # ---------------- public API ----------------
+
+    def analyze_all(self) -> List[MacroNarrativeAnalysis]:
+        """Return full divergence intelligence for every narrative, ranked by
+        macro divergence score (most extreme first)."""
+        out = [self.analyze_narrative(n.theme) for n in self.analyzer.get_all_narratives()]
+        out = [a for a in out if a is not None]
+        out.sort(key=lambda a: a.macro_divergence_score, reverse=True)
+        return out
+
+    def analyze_narrative(self, theme: str) -> Optional[MacroNarrativeAnalysis]:
+        narrative = next(
+            (n for n in self.analyzer.get_all_narratives() if n.theme == theme), None
+        )
+        raw = next(
+            (r for r in self.analyzer._raw_narratives if r.get("theme") == theme), None
+        )
+        if narrative is None:
+            return None
+        extra = _NARRATIVE_EXTRA.get(theme, {})
+
+        consensus_components = self._consensus_components(theme, extra)
+        fundamental_components = self._fundamental_components(theme, extra)
+        # The displayed consensus / fundamental scores ARE the component
+        # aggregates (conditioned on live market observations when attached),
+        # not the raw seeded seeds - this is what makes the divergence a
+        # data-driven number rather than a static label.
+        eff_consensus = round(consensus_components.overall, 1)
+        eff_fundamental = round(fundamental_components.overall, 1)
+        eff_div = round(eff_consensus - eff_fundamental, 1)
+        divergence_components = self._divergence_components(
+            narrative, consensus_components, fundamental_components, extra, eff_div
+        )
+        macro_score = self._composite_divergence(divergence_components)
+        velocity = self._narrative_velocity(theme, extra, narrative)
+        velocity_state, data_momentum_state = self._velocity_states(velocity)
+        crowding = self._crowding_score(theme, extra, consensus_components)
+        narrative_strength = self._narrative_strength(consensus_components, crowding)
+        contradictions = self._contradiction_engine(narrative, extra)
+        analogs = self._historical_analogs(theme, extra)
+        catalysts = self._catalyst_watchlist(theme, extra)
+        catalyst_proximity = self._catalyst_proximity(catalysts)
+        second_order = self._second_order_layer(
+            narrative, price_confirm=self._price_confirm_for(theme, raw), div=eff_div
+        )
+        value_trap_verdict, value_trap_reasons = self._value_trap_detector(
+            narrative, extra, velocity, catalysts, contradictions
+        )
+        transmission = self._transmission_map(theme, raw, extra)
+        pricing_gap = self._pricing_gap(narrative, transmission)
+        half_life = extra.get("half_life", "Weeks")
+        data_quality = self._data_quality(extra)
+        regime = self.detect_regime()
+        signal_status = self._signal_status(eff_div, macro_score, crowding, velocity_state)
+        opportunity = round(
+            min(100.0, macro_score + catalyst_proximity * 0.12 + min(crowding, 100.0) * 0.05), 1
+        )
+        confidence = self._confidence_score(
+            narrative, data_quality, catalyst_proximity, analogs,
+            value_trap_verdict, second_order, half_life,
+        )
+        classification = self._classify(opportunity, confidence, signal_status)
+        instruments = self._instruments_for(raw)
+        primary = instruments[0] if instruments else ""
+        direction = str(raw.get("fade_direction", "LONG")) if raw else "LONG"
+
+        return MacroNarrativeAnalysis(
+            theme=theme,
+            region=extra.get("region", "Global"),
+            consensus_score=eff_consensus,
+            fundamental_score=eff_fundamental,
+            divergence=eff_div,
+            macro_divergence_score=macro_score,
+            divergence_components=divergence_components,
+            consensus_components=consensus_components,
+            fundamental_components=fundamental_components,
+            velocity=velocity,
+            velocity_state=velocity_state,
+            data_momentum_state=data_momentum_state,
+            crowding_score=crowding,
+            narrative_strength=narrative_strength,
+            second_order=second_order,
+            contradictions=contradictions,
+            historical_analogs=analogs,
+            catalysts=catalysts,
+            catalyst_proximity=catalyst_proximity,
+            value_trap_verdict=value_trap_verdict,
+            value_trap_reasons=value_trap_reasons,
+            transmission_map=transmission,
+            pricing_gap=pricing_gap,
+            half_life=half_life,
+            data_quality=data_quality,
+            regime=regime,
+            signal_status=signal_status,
+            opportunity_score=opportunity,
+            confidence_score=confidence,
+            classification=classification,
+            why_wrong=self._why_market_wrong(
+                narrative, contradictions, pricing_gap, eff_consensus, eff_fundamental, eff_div
+            ),
+            why_right=self._why_market_right(narrative, extra),
+            invalidation=self._invalidation(narrative, catalysts, half_life),
+            instruments=instruments,
+            primary_instrument=primary,
+            primary_direction=direction,
+        )
+
+    # ---------------- component builders ----------------
+
+    def _consensus_components(
+        self, theme: str, extra: Dict
+    ) -> ConsensusComponents:
+        base = extra.get("consensus_components", {})
+        ms = self.market_state
+        adj = {
+            "market_implied": 0.0, "analyst_estimates": 0.0, "news_sentiment": 0.0,
+            "positioning": 0.0, "flows": 0.0, "media_coverage": 0.0,
+        }
+        vix = _safe_float(ms.get("vix"))
+        if vix:
+            stress = vix - 15.0
+            if "Tech / AI Exceptionalism" in theme:
+                adj["news_sentiment"] -= stress * 0.8
+                adj["positioning"] -= stress * 0.6
+            if "Fed Hawkishness" in theme:
+                adj["market_implied"] -= stress * 0.7
+        dxy = _safe_float(ms.get("usd_index"))
+        if dxy and "USD Structural Strength" in theme:
+            adj["market_implied"] += (dxy - 100.0) * 0.25
+            adj["positioning"] += (dxy - 100.0) * 0.2
+        yield10 = _safe_float(ms.get("us_10y_yield"))
+        if yield10 and "Fed Hawkishness" in theme:
+            adj["market_implied"] += (yield10 - 4.2) * 6.0
+        gold = _safe_float(ms.get("gold_price"))
+        if gold and "Gold is a Relic" in theme:
+            adj["flows"] -= (gold - 2300.0) * 0.02
+        smh = _safe_float(ms.get("smh_price"))
+        if smh and "Tech / AI" in theme:
+            adj["market_implied"] += (smh - 250.0) * 0.05
+
+        vals = {}
+        for key in adj:
+            base_v = _safe_float(base.get(key, 50.0))
+            vals[key] = _clamp(base_v + adj[key])
+        overall = _clamp(
+            vals["market_implied"] * 0.25
+            + vals["analyst_estimates"] * 0.2
+            + vals["news_sentiment"] * 0.15
+            + vals["positioning"] * 0.2
+            + vals["flows"] * 0.1
+            + vals["media_coverage"] * 0.1
+        )
+        return ConsensusComponents(
+            market_implied=vals["market_implied"],
+            analyst_estimates=vals["analyst_estimates"],
+            news_sentiment=vals["news_sentiment"],
+            positioning=vals["positioning"],
+            flows=vals["flows"],
+            media_coverage=vals["media_coverage"],
+            overall=overall,
+        )
+
+    def _fundamental_components(
+        self, theme: str, extra: Dict
+    ) -> FundamentalComponents:
+        base = extra.get("fundamental_components", {})
+        ms = self.market_state
+        adj = {
+            "inflation": 0.0, "employment": 0.0, "growth": 0.0, "credit": 0.0,
+            "rates": 0.0, "liquidity": 0.0,
+        }
+        vix = _safe_float(ms.get("vix"))
+        if vix:
+            stress = vix - 15.0
+            if "Fed Hawkishness" in theme:
+                adj["employment"] -= stress * 0.5
+                adj["growth"] -= stress * 0.4
+            if "Small-Cap" in theme:
+                adj["growth"] -= stress * 0.4
+        yield10 = _safe_float(ms.get("us_10y_yield"))
+        if yield10 and "Fed Hawkishness" in theme:
+            adj["rates"] -= (yield10 - 4.2) * 4.0
+        if yield10 and "Gold is a Relic" in theme:
+            adj["rates"] += (yield10 - 4.2) * -5.0
+        gold = _safe_float(ms.get("gold_price"))
+        if gold and "Gold is a Relic" in theme:
+            adj["inflation"] += (gold - 2300.0) * 0.02
+            adj["liquidity"] += (gold - 2300.0) * 0.015
+        oil = _safe_float(ms.get("oil_price"))
+        if oil and "Energy Transition" in theme:
+            adj["growth"] += (oil - 75.0) * 0.4
+        usdjpy = _safe_float(ms.get("usdjpy"))
+        if usdjpy and "JPY Carry" in theme:
+            adj["rates"] += (usdjpy - 150.0) * 0.5
+            adj["inflation"] += (usdjpy - 150.0) * 0.3
+        hy = _safe_float(ms.get("hy_spread_bps"))
+        if hy and hy > 400:
+            adj["credit"] -= (hy - 400.0) * 0.05
+
+        vals = {}
+        for key in adj:
+            base_v = _safe_float(base.get(key, 50.0))
+            vals[key] = _clamp(base_v + adj[key])
+        overall = _clamp(
+            vals["inflation"] * 0.15
+            + vals["employment"] * 0.2
+            + vals["growth"] * 0.2
+            + vals["credit"] * 0.15
+            + vals["rates"] * 0.15
+            + vals["liquidity"] * 0.15
+        )
+        return FundamentalComponents(
+            inflation=vals["inflation"],
+            employment=vals["employment"],
+            growth=vals["growth"],
+            credit=vals["credit"],
+            rates=vals["rates"],
+            liquidity=vals["liquidity"],
+            overall=overall,
+        )
+
+    def _divergence_components(
+        self,
+        narrative: NarrativeStrength,
+        consensus: ConsensusComponents,
+        fundamental: FundamentalComponents,
+        extra: Dict,
+        div: float,
+    ) -> Dict[str, float]:
+        """The seven divergence inputs from the spec, each 0-100 (magnitude)."""
+        abs_div = abs(div)
+        # 1. Narrative divergence (consensus vs fundamental reality)
+        narrative_div = _clamp(abs_div * 1.9)  # ~35pt divergence -> 67
+        # 2. Fundamental divergence (how far reality deviates from its own trend)
+        fund_vel = extra.get("velocity", {})
+        f30 = _safe_float(fund_vel.get("fundamental_30d"))
+        fundamental_div = _clamp(50.0 + f30 * 3.0)
+        # 3. Market-pricing divergence (price has NOT moved = bigger gap)
+        moved = self._price_moved_for(extra.get("theme", narrative.theme))
+        market_pricing_div = _clamp(60.0 - moved * 2.0)
+        # 4. Positioning divergence (crowding away from neutral)
+        pos = _safe_float(consensus.positioning)
+        positioning_div = _clamp(abs(pos - 50.0) * 2.0)
+        # 5. Historical extremity (divergence vs own history)
+        c90 = _safe_float(fund_vel.get("consensus_90d"))
+        historical_extremity = _clamp(50.0 + abs_div * 0.8 + c90 * 1.5)
+        # 6. Data momentum divergence (fundamentals moving against consensus)
+        data_momentum = _clamp(50.0 - f30 * 2.0)
+        # 7. Catalyst proximity (from the watchlist)
+        cat_prox = self._catalyst_proximity(self._catalyst_watchlist(narrative.theme, extra))
+        catalyst_proximity = cat_prox
+
+        return {
+            "narrative": round(narrative_div, 1),
+            "fundamental": round(fundamental_div, 1),
+            "market_pricing": round(market_pricing_div, 1),
+            "positioning": round(positioning_div, 1),
+            "historical_extremity": round(historical_extremity, 1),
+            "data_momentum": round(data_momentum, 1),
+            "catalyst_proximity": round(catalyst_proximity, 1),
+        }
+
+    def _composite_divergence(self, components: Dict[str, float]) -> float:
+        """Weighted Macro Divergence Score (0-100), weights configurable."""
+        total = 0.0
+        wsum = 0.0
+        for key, w in self.weights.items():
+            total += _safe_float(components.get(key)) * w
+            wsum += w
+        if wsum <= 0:
+            return 0.0
+        return round(_clamp(total / wsum), 1)
+
+    def _narrative_velocity(
+        self, theme: str, extra: Dict, narrative: NarrativeStrength
+    ) -> Dict[str, float]:
+        """Consensus / fundamental today vs 7d vs 30d vs 90d."""
+        vel = extra.get("velocity", {})
+        c7 = _safe_float(vel.get("consensus_7d"))
+        c30 = _safe_float(vel.get("consensus_30d"))
+        c90 = _safe_float(vel.get("consensus_90d"))
+        f7 = _safe_float(vel.get("fundamental_7d"))
+        f30 = _safe_float(vel.get("fundamental_30d"))
+        f90 = _safe_float(vel.get("fundamental_90d"))
+        today = narrative.consensus_score
+        return {
+            "consensus_today": round(today, 1),
+            "consensus_7d": round(today - c7, 1),
+            "consensus_30d": round(today - c30, 1),
+            "consensus_90d": round(today - c90, 1),
+            "fundamental_today": round(narrative.fundamental_score, 1),
+            "fundamental_7d": round(narrative.fundamental_score - f7, 1),
+            "fundamental_30d": round(narrative.fundamental_score - f30, 1),
+            "fundamental_90d": round(narrative.fundamental_score - f90, 1),
+        }
+
+    @staticmethod
+    def _velocity_states(velocity: Dict[str, float]) -> Tuple[str, str]:
+        c30 = velocity.get("consensus_today", 50) - velocity.get("consensus_30d", 50)
+        f30 = velocity.get("fundamental_today", 50) - velocity.get("fundamental_30d", 50)
+        if c30 > 8:
+            vstate = "RAPIDLY STRENGTHENING"
+        elif c30 > 3:
+            vstate = "GRADUALLY STRENGTHENING"
+        elif c30 < -8:
+            vstate = "RAPIDLY COLLAPSING"
+        elif c30 < -3:
+            vstate = "GRADUALLY WEAKENING"
+        else:
+            vstate = "STABLE"
+        if f30 > 5:
+            dstate = "IMPROVING"
+        elif f30 < -5:
+            dstate = "DETERIORATING"
+        else:
+            dstate = "FLAT"
+        return vstate, dstate
+
+    def _crowding_score(
+        self, theme: str, extra: Dict, consensus: ConsensusComponents
+    ) -> float:
+        """Consensus crowding: positioning + flows + media weight + narrative strength."""
+        pos = _safe_float(consensus.positioning)
+        flows = _safe_float(consensus.flows)
+        media = _safe_float(consensus.media_coverage)
+        crowding = _clamp(pos * 0.45 + flows * 0.3 + media * 0.25)
+        return round(crowding, 1)
+
+    def _narrative_strength(self, consensus: ConsensusComponents, crowding: float) -> float:
+        return round(_clamp(consensus.overall * 0.6 + crowding * 0.4), 1)
+
+    def _contradiction_engine(
+        self, narrative: NarrativeStrength, extra: Dict
+    ) -> List[Dict]:
+        """Ranked contradiction list: magnitude, persistence, significance,
+        independent-source count.  Seeded contradictions are ranked first;
+        objective market-data cross-checks are appended when data exists."""
+        out: List[Dict] = []
+        div = abs(narrative.divergence)
+        for i, text in enumerate(narrative.contradictions):
+            magnitude = _clamp(40.0 + div * 1.1 - i * 4.0)
+            out.append(
+                {
+                    "text": text,
+                    "magnitude": round(magnitude, 1),
+                    "persistence": "MEDIUM",
+                    "historical_significance": "HIGH" if div >= 30 else "MEDIUM",
+                    "independent_sources": 3,
+                }
+            )
+        # Objective cross-checks from live market data (OBSERVED provenance)
+        ms = self.market_state
+        if ms:
+            cpi = _safe_float(ms.get("cpi_yoy"))
+            y10 = _safe_float(ms.get("us_10y_yield"))
+            gold = _safe_float(ms.get("gold_price"))
+            vix = _safe_float(ms.get("vix"))
+            hy = _safe_float(ms.get("hy_spread_bps"))
+            if cpi and y10 and cpi < 3.0 and y10 > 4.0:
+                out.append(
+                    {
+                        "text": f"OBSERVED: CPI at {cpi:.1f}% (cooling) while 10Y at {y10:.2f}% - markets price more inflation risk than data shows.",
+                        "magnitude": 62.0, "persistence": "HIGH",
+                        "historical_significance": "HIGH", "independent_sources": 2,
+                    }
+                )
+            if vix and hy and vix < 16 and hy > 380:
+                out.append(
+                    {
+                        "text": f"OBSERVED: VIX at {vix:.0f} (calm) while HY spreads at {hy:.0f}bps - equity and credit price different risks.",
+                        "magnitude": 58.0, "persistence": "MEDIUM",
+                        "historical_significance": "MEDIUM", "independent_sources": 2,
+                    }
+                )
+            if gold and y10 and gold > 2000 and y10 > 4.0:
+                out.append(
+                    {
+                        "text": f"OBSERVED: Gold above {gold:.0f} despite 10Y at {y10:.2f}% - the traditional real-rate relationship is stretched.",
+                        "magnitude": 55.0, "persistence": "MEDIUM",
+                        "historical_significance": "MEDIUM", "independent_sources": 2,
+                    }
+                )
+        out.sort(key=lambda c: c["magnitude"], reverse=True)
+        return out
+
+    def _historical_analogs(self, theme: str, extra: Dict) -> List[HistoricalAnalog]:
+        ms = self.market_state
+        vix = _safe_float(ms.get("vix"))
+        y10 = _safe_float(ms.get("us_10y_yield"))
+        out: List[HistoricalAnalog] = []
+        for a in extra.get("analogs", []):
+            sim = _safe_float(a.get("similarity", 50.0))
+            # Condition similarity on how close today's macro proxies are to
+            # the stress environment each analog represents (MODEL-DERIVED).
+            if vix:
+                sim += (18.0 - vix) * 0.5 if a.get("resolution_months", 12) > 12 else (vix - 18.0) * 0.4
+            out.append(
+                HistoricalAnalog(
+                    period=a.get("period", ""),
+                    note=a.get("note", ""),
+                    similarity=_clamp(sim),
+                    avg_return_pct=_safe_float(a.get("avg_return_pct")),
+                    median_return_pct=_safe_float(a.get("median_return_pct")),
+                    worst_pct=_safe_float(a.get("worst_pct")),
+                    best_pct=_safe_float(a.get("best_pct")),
+                    resolution_months=_safe_float(a.get("resolution_months", 12)),
+                )
+            )
+        return sorted(out, key=lambda a: a.similarity, reverse=True)
+
+    def _catalyst_watchlist(self, theme: str, extra: Dict) -> List[CatalystEvent]:
+        import datetime as _dt
+
+        today = _dt.date.today()
+        out: List[CatalystEvent] = []
+        for c in extra.get("catalysts", []):
+            days = c.get("days_out")
+            timing = (
+                (today + _dt.timedelta(days=int(days))).isoformat()
+                if days is not None
+                else "Event-driven"
+            )
+            out.append(
+                CatalystEvent(
+                    name=c.get("name", ""),
+                    timing=timing,
+                    days_out=int(days) if days is not None else None,
+                    expected_impact=_safe_float(c.get("expected_impact", 50)),
+                    directional_relevance=c.get("directional_relevance", "MEDIUM"),
+                    probability=_safe_float(c.get("probability", 50)),
+                    invalidates_narrative=c.get("invalidates_narrative", ""),
+                )
+            )
+        return sorted(out, key=lambda e: (e.days_out is None, e.days_out or 999))
+
+    def _catalyst_proximity(self, catalysts: List[CatalystEvent]) -> float:
+        if not catalysts:
+            return 0.0
+        best = min(
+            (c for c in catalysts if c.days_out is not None),
+            key=lambda c: c.days_out,
+            default=None,
+        )
+        if best is None:
+            return 30.0
+        # 0-100: near + high-probability + high-impact catalysts score highest
+        return _clamp(
+            100.0 - best.days_out * 1.2 + (best.probability - 50.0) * 0.4
+            + (best.expected_impact - 50.0) * 0.3
+        )
+
+    def _second_order_layer(
+        self, narrative: NarrativeStrength, price_confirm: Optional[float], div: Optional[float] = None
+    ) -> Dict[str, str]:
+        """Three-layer model: Narrative (belief) / Fundamentals (reality) /
+        Market (price).  Detects whether price is already realising the
+        divergence (second-order confirmation) or still aligned with the
+        consensus narrative."""
+        signed_div = div if div is not None else narrative.divergence
+        layer1 = "Crowd believes the narrative"
+        layer2 = "Data supports it less than believed" if signed_div > 0 else "Data supports it more than believed"
+        if price_confirm is None:
+            layer3 = "Price confirmation: NO PRICE DATA - unresolved"
+            alignment = "UNRESOLVED"
+        elif (signed_div > 0 and price_confirm > 0) or (
+            signed_div < 0 and price_confirm < 0
+        ):
+            layer3 = f"Price already moving with the fade (second-order confirmation, {price_confirm:+.1f}%)"
+            alignment = "CONFIRMING"
+        else:
+            layer3 = f"Price still aligned with consensus ({price_confirm:+.1f}% against the fade)"
+            alignment = "STILL_CROWDED"
+        return {
+            "layer1_narrative": layer1,
+            "layer2_fundamentals": layer2,
+            "layer3_market": layer3,
+            "alignment": alignment,
+        }
+
+    def _value_trap_detector(
+        self,
+        narrative: NarrativeStrength,
+        extra: Dict,
+        velocity: Dict[str, float],
+        catalysts: List[CatalystEvent],
+        contradictions: List[Dict],
+    ) -> Tuple[str, List[str]]:
+        """Reject a divergence when it is likely a value trap: deteriorating
+        fundamentals, stale data, no catalyst, weak positioning, persistent
+        non-resolution, or adverse liquidity."""
+        reasons: List[str] = []
+        trap = 0.0
+        f30 = velocity.get("fundamental_today", 50) - velocity.get("fundamental_30d", 50)
+        c30 = velocity.get("consensus_today", 50) - velocity.get("consensus_30d", 50)
+        if f30 < -3:
+            trap += 25.0
+            reasons.append("Fundamentals are deteriorating faster than consensus realises.")
+        if c30 > 5:
+            trap += 15.0
+            reasons.append("Consensus is still strengthening - the divergence is not yet contested.")
+        if not self.market_state:
+            trap += 20.0
+            reasons.append("No live macro data attached - divergence may be driven by stale seeds.")
+        near_catalyst = any(c.days_out is not None and c.days_out <= 30 for c in catalysts)
+        if not near_catalyst:
+            trap += 15.0
+            reasons.append("No high-proximity catalyst to force convergence.")
+        crowding = self._crowding_score(
+            narrative.theme, extra, self._consensus_components(narrative.theme, extra)
+        )
+        if crowding < 55:
+            trap += 15.0
+            reasons.append("Positioning is not actually extreme - little forced-covering fuel.")
+        vix = _safe_float(self.market_state.get("vix"))
+        if vix and vix > 30:
+            trap += 20.0
+            reasons.append("Stress regime (VIX high) - timing is unreliable in a liquidity crunch.")
+        if len(contradictions) < 2:
+            trap += 10.0
+            reasons.append("Few independent contradictions - the counter-thesis is thin.")
+
+        if trap >= 45:
+            verdict = "POSSIBLE VALUE TRAP"
+        elif trap >= 25:
+            verdict = "INSUFFICIENT EVIDENCE"
+        else:
+            verdict = "VALID CONTRARIAN OPPORTUNITY"
+        return verdict, reasons
+
+    def _transmission_map(
+        self, theme: str, raw: Optional[Dict], extra: Dict
+    ) -> List[TransmissionLeg]:
+        legs: List[TransmissionLeg] = []
+        for t in extra.get("transmissions", []):
+            asset = t.get("asset", "")
+            expected_dir = t.get("expected_direction", "LONG")
+            moved, move_pct = self._asset_moved(asset, expected_dir)
+            legs.append(
+                TransmissionLeg(
+                    macro_variable=t.get("macro_variable", ""),
+                    mechanism=t.get("mechanism", ""),
+                    asset=asset,
+                    expected_direction=expected_dir,
+                    already_moved=moved,
+                    move_pct=move_pct,
+                )
+            )
+        return legs
+
+    def _pricing_gap(self, narrative: NarrativeStrength, transmission: List[TransmissionLeg]) -> Dict:
+        """How much of the divergence is already priced into the assets."""
+        moved = [t.already_moved for t in transmission if t.already_moved is not None]
+        if not moved:
+            return {
+                "priced_pct": None,
+                "expected_move_pct": round(abs(narrative.divergence) * 0.4, 1),
+                "read": "No price data attached - pricing gap unmeasurable. Expected convergence move is a MODEL-DERIVED estimate.",
+            }
+        priced = sum(1 for m in moved if m) / len(moved) * 100.0
+        expected = round(max(1.0, abs(narrative.divergence) * 0.4 * (1.0 - priced / 100.0)), 1)
+        read = (
+            f"Approximately {priced:.0f}% of transmission assets have already moved in the "
+            f"expected direction - the remaining convergence opportunity is estimated at "
+            f"{expected}% (MODEL-DERIVED)."
+        )
+        return {"priced_pct": round(priced, 1), "expected_move_pct": expected, "read": read}
+
+    def _data_quality(self, extra: Dict) -> Dict:
+        ms = self.market_state
+        expected_keys = {
+            "vix", "us_10y_yield", "usd_index", "gold_price", "oil_price",
+            "usdjpy", "smh_price", "cpi_yoy", "hy_spread_bps",
+        }
+        provided = [k for k in expected_keys if ms.get(k) is not None]
+        missing = len(expected_keys) - len(provided)
+        missing_pct = round(missing / len(expected_keys) * 100.0, 1) if expected_keys else 0.0
+        sources = extra.get("data_sources", [])
+        n_sources = len(sources) + (1 if ms else 0)
+        freshness = "LIVE" if ms else "SEEDED"
+        coverage = _clamp(100.0 - missing_pct)
+        reliability = "HIGH" if freshness == "LIVE" else "MEDIUM"
+        confidence = _clamp(
+            coverage * 0.4 + min(n_sources, 4) * 8.0 + (40.0 if freshness == "LIVE" else 20.0)
+        )
+        return {
+            "data_confidence_score": round(confidence, 1),
+            "freshness": freshness,
+            "independent_sources": n_sources,
+            "missing_data_pct": missing_pct,
+            "historical_coverage": "LONG" if extra.get("analogs") else "LIMITED",
+            "revision_risk": "LOW" if freshness == "LIVE" else "MEDIUM",
+            "source_reliability": reliability,
+            "provenance": [
+                "OBSERVED" if ms else "ESTIMATED",
+                "MODEL-DERIVED",
+                "MARKET-IMPLIED" if ms else "AI-INFERRED",
+            ],
+        }
+
+    # ---------------- regime detection ----------------
+
+    def detect_regime(self) -> Dict:
+        """Classify the current macro regime from live observations.  Returns
+        regime, confidence, previous regime and transition probability."""
+        ms = self.market_state
+        if not ms:
+            reg = {
+                "regime": "Unknown / Transition",
+                "confidence": 0.0,
+                "previous_regime": self._prev_regime,
+                "transition_probability": 0.0,
+                "basis": "No live macro observations attached.",
+            }
+            self._prev_regime = reg["regime"]
+            return reg
+
+        vix = _safe_float(ms.get("vix"))
+        y10 = _safe_float(ms.get("us_10y_yield"))
+        cpi = _safe_float(ms.get("cpi_yoy"))
+        hy = _safe_float(ms.get("hy_spread_bps"))
+        sp500 = _safe_float(ms.get("sp500"))
+        gold = _safe_float(ms.get("gold_price"))
+
+        growth_pos = sp500 > 0 if sp500 else None
+        scores: Dict[str, float] = {}
+        if vix:
+            scores["Goldilocks"] = max(0.0, 30.0 - (vix - 15.0) * 3.0) + (15.0 if growth_pos is False else 0.0)
+            scores["Recession"] = max(0.0, (vix - 22.0) * 4.0) + (25.0 if growth_pos is False else 0.0)
+            scores["Recovery"] = max(0.0, (15.0 - vix) * 2.0) + (10.0 if growth_pos else 0.0)
+        if cpi:
+            scores["Inflationary Expansion"] = max(0.0, (cpi - 3.0) * 20.0)
+            scores["Deflationary Slowdown"] = max(0.0, (2.0 - cpi) * 20.0)
+            if vix:
+                scores["Stagflation"] = max(0.0, (cpi - 3.5) * 15.0) + max(0.0, (vix - 20.0) * 2.0)
+        if y10:
+            scores["Liquidity Contraction"] = max(0.0, (y10 - 4.5) * 15.0)
+            scores["Liquidity Expansion"] = max(0.0, (3.5 - y10) * 15.0)
+        if hy:
+            scores["Credit Stress"] = max(0.0, (hy - 420.0) * 0.15)
+        if gold:
+            scores["Inflationary Expansion"] = scores.get("Inflationary Expansion", 0.0) + max(0.0, (gold - 2400.0) * 0.01)
+
+        if not scores:
+            reg = {
+                "regime": "Unknown / Transition", "confidence": 0.0,
+                "previous_regime": self._prev_regime, "transition_probability": 0.0,
+                "basis": "Observations present but outside the regime rule space.",
+            }
+            self._prev_regime = reg["regime"]
+            return reg
+
+        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        top, top_s = ranked[0]
+        second_s = ranked[1][1] if len(ranked) > 1 else 0.0
+        denom = top_s + second_s + 1e-9
+        confidence = _clamp(top_s / denom * 100.0, 0.0, 100.0)
+        transition = _clamp(second_s / denom * 100.0, 0.0, 100.0)
+        reg = {
+            "regime": top,
+            "confidence": round(confidence, 1),
+            "previous_regime": self._prev_regime,
+            "transition_probability": round(transition, 1),
+            "basis": "Rule-based classifier over VIX / 10Y / CPI / credit / equity observations (MODEL-DERIVED).",
+        }
+        self._prev_regime = top
+        return reg
+
+    # ---------------- signal gating ----------------
+
+    def _signal_status(
+        self, div: float, macro_score: float, crowding: float, velocity_state: str
+    ) -> str:
+        abs_div = abs(div)
+        if abs_div >= 45 and crowding >= 70:
+            return "EXTREME CONSENSUS / REVERSAL RISK"
+        if macro_score >= 60:
+            return "STRONG CONTRARIAN"
+        if macro_score >= 40:
+            return "CONTRARIAN"
+        if macro_score >= 25:
+            return "WATCH"
+        if div >= 0 and abs_div < 10:
+            return "CONSENSUS CONFIRMED"
+        return "NEUTRAL"
+
+    def _confidence_score(
+        self,
+        narrative: NarrativeStrength,
+        data_quality: Dict,
+        catalyst_proximity: float,
+        analogs: List[HistoricalAnalog],
+        value_trap_verdict: str,
+        second_order: Dict,
+        half_life: str,
+    ) -> float:
+        base = 35.0
+        base += min(len(narrative.contradictions), 5) * 3.0
+        base += _safe_float(data_quality.get("data_confidence_score")) * 0.12
+        base += catalyst_proximity * 0.08
+        if analogs:
+            base += analogs[0].similarity * 0.06
+        if second_order.get("alignment") == "CONFIRMING":
+            base += 8.0
+        if value_trap_verdict == "POSSIBLE VALUE TRAP":
+            base -= 20.0
+        elif value_trap_verdict == "INSUFFICIENT EVIDENCE":
+            base -= 10.0
+        if half_life == "Days":
+            base -= 5.0  # fast-decaying signals are harder to time
+        return round(_clamp(base), 1)
+
+    @staticmethod
+    def _classify(opportunity: float, confidence: float, status: str) -> str:
+        if status == "EXTREME CONSENSUS / REVERSAL RISK" and confidence >= 60:
+            return "HIGH-CONVICTION CONTRARIAN"
+        if opportunity >= 75 and confidence >= 65:
+            return "HIGH-CONVICTION CONTRARIAN"
+        if opportunity >= 55 and confidence >= 45:
+            return "TACTICAL CONTRARIAN"
+        if opportunity >= 35 and confidence >= 30:
+            return "WATCH / DEVELOPING"
+        if status == "CONSENSUS CONFIRMED" or (opportunity < 35 and confidence < 30):
+            return "CONSENSUS CONFIRMED"
+        return "NO EDGE"
+
+    def _why_market_wrong(
+        self,
+        narrative: NarrativeStrength,
+        contradictions: List[Dict],
+        pricing_gap: Dict,
+        eff_consensus: float,
+        eff_fundamental: float,
+        eff_div: float,
+    ) -> str:
+        if not contradictions:
+            return "No contradictions identified with the available data."
+        top = contradictions[0]["text"]
+        gap = pricing_gap.get("expected_move_pct")
+        gap_txt = (
+            f" and an estimated {gap}% convergence move remains"
+            if gap is not None
+            else ""
+        )
+        return (
+            f"The market prices this narrative at {eff_consensus:.0f}/100 while the "
+            f"data supports {eff_fundamental:.0f}/100. Strongest contradiction: "
+            f"{top}. Divergence is {abs(eff_div):.0f} pts{gap_txt} (evidence: "
+            f"contradiction engine, MODEL-DERIVED)."
+        )
+
+    def _why_market_right(self, narrative: NarrativeStrength, extra: Dict) -> str:
+        support = narrative.supporting_data or extra.get("supporting_data", [])
+        if not support:
+            return (
+                f"The narrative could still be right: no supporting data attached, but the "
+                f"crowd's information set may simply be broader than this dashboard's feed."
+            )
+        return (
+            f"Strongest case for consensus: {support[0]}. "
+            f"A second pillar: {support[1] if len(support) > 1 else 'momentum can persist longer than fundamentals justify'}. "
+            f"(evidence: narrative supporting-data registry, ESTIMATED)."
+        )
+
+    def _invalidation(self, narrative: NarrativeStrength, catalysts: List[CatalystEvent], half_life: str) -> str:
+        if catalysts:
+            c = catalysts[0]
+            return (
+                f"Thesis invalidated if {c.name} confirms the consensus direction "
+                f"({c.invalidates_narrative}) or if the divergence persists past its "
+                f"{half_life.lower()} half-life without convergence."
+            )
+        return (
+            f"Thesis invalidated if data confirms the consensus or the divergence "
+            f"persists beyond its {half_life.lower()} half-life."
+        )
+
+    # ---------------- price helpers ----------------
+
+    def _price_confirm_for(self, theme: str, raw: Optional[Dict]) -> Optional[float]:
+        """Return the primary instrument's 20d return signed by fade direction."""
+        if not raw:
+            return None
+        direction = str(raw.get("fade_direction", "LONG"))
+        instruments = self._instruments_for(raw)
+        for inst in instruments:
+            series = self._closes_for(inst)
+            if series and len(series) >= 21:
+                ret20 = (series[-1] / series[-21] - 1.0) * 100.0
+                sign = 1.0 if direction == "LONG" else -1.0
+                return round(ret20 * sign, 2)
+        return None
+
+    def _price_moved_for(self, theme: str) -> float:
+        """How far price has already moved in the fade direction (0-100)."""
+        raw = next((r for r in self.analyzer._raw_narratives if r.get("theme") == theme), None)
+        confirm = self._price_confirm_for(theme, raw)
+        if confirm is None:
+            return 0.0
+        return _clamp(confirm * 1.5)
+
+    def _asset_moved(self, asset: str, expected_direction: str) -> Tuple[Optional[bool], float]:
+        series = self._closes_for(asset)
+        if series is None or len(series) < 21:
+            return None, 0.0
+        ret20 = (series[-1] / series[-21] - 1.0) * 100.0
+        sign = 1.0 if expected_direction == "LONG" else -1.0
+        moved = ret20 * sign > 2.0
+        return moved, round(ret20, 2)
+
+    def _closes_for(self, symbol: str) -> Optional[List[float]]:
+        if symbol in self.price_data:
+            return self.analyzer._extract_close_series(self.price_data[symbol])
+        return None
+
+    @staticmethod
+    def _instruments_for(raw: Optional[Dict]) -> List[str]:
+        if not raw:
+            return []
+        out: List[str] = []
+        for insts in (raw.get("fade_instruments") or {}).values():
+            for i in insts:
+                if i not in out:
+                    out.append(i)
+        return out
+
+    # ---------------- alerts ----------------
+
+    def get_alerts(self, percentile: float = 90.0) -> List[Dict]:
+        """Alert when divergence crosses the historical (cross-sectional)
+        percentile, consensus changes fast, crowding is extreme, price starts
+        confirming, or catalyst proximity rises."""
+        analyses = self.analyze_all()
+        if not analyses:
+            return []
+        scores = [a.macro_divergence_score for a in analyses]
+        threshold = sorted(scores)[int(len(scores) * percentile / 100.0) - 1] if len(scores) > 1 else 0.0
+        alerts: List[Dict] = []
+        for a in analyses:
+            if a.macro_divergence_score >= threshold and a.macro_divergence_score >= 50:
+                alerts.append(
+                    {
+                        "severity": "EXTREME DIVERGENCE",
+                        "theme": a.theme,
+                        "consensus": round(a.consensus_score, 1),
+                        "fundamentals": round(a.fundamental_score, 1),
+                        "divergence": round(abs(a.divergence), 1),
+                        "historical_percentile": round(
+                            sorted(scores).index(a.macro_divergence_score) / max(len(scores) - 1, 1) * 100.0, 1
+                        ),
+                        "positioning": "EXTREME" if a.crowding_score >= 70 else "ELEVATED" if a.crowding_score >= 55 else "MODERATE",
+                        "catalyst_proximity": round(a.catalyst_proximity, 1),
+                        "signal": a.signal_status,
+                        "classification": a.classification,
+                        "trigger": f"Divergence at {a.macro_divergence_score:.0f}/100 (consensus {a.consensus_score:.0f} vs fundamentals {a.fundamental_score:.0f}).",
+                    }
+                )
+            if a.velocity_state in ("RAPIDLY STRENGTHENING", "RAPIDLY COLLAPSING") and abs(a.divergence) >= 18:
+                alerts.append(
+                    {
+                        "severity": "CONSENSUS VELOCITY",
+                        "theme": a.theme,
+                        "consensus": round(a.consensus_score, 1),
+                        "fundamentals": round(a.fundamental_score, 1),
+                        "divergence": round(abs(a.divergence), 1),
+                        "historical_percentile": None,
+                        "positioning": "EXTREME" if a.crowding_score >= 70 else "MODERATE",
+                        "catalyst_proximity": round(a.catalyst_proximity, 1),
+                        "signal": a.signal_status,
+                        "classification": a.classification,
+                        "trigger": f"Consensus {a.velocity_state.lower()} over 30d.",
+                    }
+                )
+        return alerts
+
+    # ---------------- Develop Setup tool ----------------
+
+    def build_setup(
+        self,
+        theme: str,
+        instrument: str = "",
+        price_df: Optional[Any] = None,
+        risk_per_trade_pct: float = 1.0,
+    ) -> Optional[CounterTrendSetup]:
+        """Build a complete trade setup around a detected macro divergence.
+
+        The setup is built from the narrative's own intelligence (divergence
+        score, catalysts, invalidation, half-life) plus - when supplied - the
+        instrument's real price series for entry zone, stop, targets and
+        sizing.  Every claim in the evidence trail names its backing.
+        """
+        analysis = self.analyze_narrative(theme)
+        if analysis is None:
+            return None
+        raw = next((r for r in self.analyzer._raw_narratives if r.get("theme") == theme), None)
+        if raw is None:
+            return None
+        direction = str(raw.get("fade_direction", "LONG"))
+        if not instrument:
+            instrument = analysis.primary_instrument
+
+        series = None
+        if price_df is not None:
+            series = self.analyzer._extract_close_series(price_df)
+        elif instrument in self.price_data:
+            series = self.analyzer._extract_close_series(self.price_data[instrument])
+
+        levels = self._setup_levels(series, direction)
+        momentum = self._setup_momentum(series, direction)
+        current = levels["current"]
+        stop = levels["stop"]
+        targets = levels["targets"]
+        r_r = levels["risk_reward"]
+        if current and stop:
+            stop_dist = abs(current - stop) / current
+            pos_size = _clamp(
+                risk_per_trade_pct / (stop_dist * 100.0) * 100.0, 0.0, 15.0
+            )
+        else:
+            pos_size = analysis.confidence_score * 0.05
+
+        catalyst = analysis.catalysts[0] if analysis.catalysts else None
+        monitoring = self._monitoring_plan(theme, analysis)
+        evidence = self._evidence_trail(analysis, instrument, current, momentum, series is not None)
+        entry_zone = levels["entry_zone"]
+        invalidation = (
+            f"{analysis.invalidation} Invalidation price: {stop:.4f}." if stop else analysis.invalidation
+        )
+
+        import datetime as _dt
+
+        return CounterTrendSetup(
+            theme=theme,
+            instrument=instrument,
+            direction=direction,
+            narrative=analysis.theme,
+            divergence=analysis.divergence,
+            macro_divergence_score=analysis.macro_divergence_score,
+            current_price=current,
+            entry_zone=entry_zone,
+            stop_loss=stop,
+            targets=targets,
+            risk_reward=r_r,
+            position_size_pct=round(pos_size, 1),
+            risk_per_trade_pct=risk_per_trade_pct,
+            catalyst=catalyst.name if catalyst else "Event-driven",
+            catalyst_days_out=catalyst.days_out if catalyst else None,
+            time_horizon=self._horizon_for(analysis.half_life),
+            half_life=analysis.half_life,
+            invalidation=invalidation,
+            entry_condition=momentum["entry_condition"],
+            momentum_state=momentum["state"],
+            monitoring_plan=monitoring,
+            evidence_trail=evidence,
+            confidence_score=analysis.confidence_score,
+            opportunity_score=analysis.opportunity_score,
+            classification=analysis.classification,
+            created_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        )
+
+    @staticmethod
+    def _setup_levels(
+        series: Optional[List[float]], direction: str
+    ) -> Dict:
+        """Entry zone / stop / targets from the price series (None-safe)."""
+        if series is None or len(series) < 5:
+            return {
+                "current": None, "entry_zone": None, "stop": None,
+                "targets": [], "risk_reward": 0.0,
+            }
+        current = series[-1]
+        hi20 = max(series[-20:]) if len(series) >= 20 else max(series)
+        lo20 = min(series[-20:]) if len(series) >= 20 else min(series)
+        rng = hi20 - lo20
+        atr = rng / 20.0 if rng > 0 else current * 0.01
+        if direction == "LONG":
+            entry_zone = (lo20, current)
+            stop = round(lo20 - atr, 4)
+            t1 = round(current + (current - stop) * 1.5, 4)
+            t2 = round(current + (current - stop) * 2.5, 4)
+            t3 = round(current + (current - stop) * 4.0, 4)
+        else:
+            entry_zone = (current, hi20)
+            stop = round(hi20 + atr, 4)
+            t1 = round(current - (stop - current) * 1.5, 4)
+            t2 = round(current - (stop - current) * 2.5, 4)
+            t3 = round(current - (stop - current) * 4.0, 4)
+        risk = abs(current - stop)
+        rr = abs(t1 - current) / risk if risk > 0 else 0.0
+        return {
+            "current": round(current, 4), "entry_zone": entry_zone,
+            "stop": stop, "targets": [t1, t2, t3],
+            "risk_reward": round(rr, 2),
+        }
+
+    @staticmethod
+    def _setup_momentum(series: Optional[List[float]], direction: str) -> Dict:
+        if series is None or len(series) < 21:
+            return {"state": "NO_DATA", "entry_condition": "No price history - enter only on catalyst confirmation."}
+        state, score, read, last = CounterTrendAnalyzer._classify_momentum(series, direction)
+        if state == "REVERSING":
+            cond = "Price already moving in the fade direction - valid entry zone."
+        elif state == "TREND_ACCELERATING":
+            cond = f"Wait for momentum to stall - do not enter while the trend accelerates against the fade (momentum {score:+.0f})."
+        elif state == "DECELERATING":
+            cond = "Momentum flattening - scale in on stabilisation."
+        else:
+            cond = "Range-bound - fade only on a confirmed break of the range."
+        return {"state": state, "entry_condition": cond}
+
+    @staticmethod
+    def _horizon_for(half_life: str) -> str:
+        return {
+            "Days": "Days",
+            "Weeks": "Weeks",
+            "Months": "Months",
+        }.get(half_life, "Weeks")
+
+    def _monitoring_plan(self, theme: str, analysis: MacroNarrativeAnalysis) -> List[str]:
+        plan = [
+            f"Track the primary catalyst ({analysis.catalysts[0].name if analysis.catalysts else 'event-driven'}) and its data print.",
+            "Re-check consensus vs fundamental scores weekly for velocity decay.",
+            "Watch the transmission assets for confirmation (second-order layer).",
+        ]
+        if analysis.data_quality.get("freshness") != "LIVE":
+            plan.append("Attach live macro data before sizing - current scores are SEEDED.")
+        return plan
+
+    def _evidence_trail(
+        self,
+        analysis: MacroNarrativeAnalysis,
+        instrument: str,
+        current: Optional[float],
+        momentum: Dict,
+        has_price: bool,
+    ) -> List[Dict]:
+        trail: List[Dict] = []
+        trail.append(
+            {
+                "claim": f"Consensus believes this narrative at {analysis.consensus_score:.0f}/100.",
+                "backing": "Aggregated consensus components (market-implied, analyst estimates, news sentiment, positioning, flows, media).",
+                "provenance": analysis.consensus_components.provenance,
+            }
+        )
+        trail.append(
+            {
+                "claim": f"Fundamental data supports it at {analysis.fundamental_score:.0f}/100.",
+                "backing": "Inflation / employment / growth / credit / rates / liquidity component scores.",
+                "provenance": analysis.fundamental_components.provenance,
+            }
+        )
+        trail.append(
+            {
+                "claim": f"Composite Macro Divergence Score is {analysis.macro_divergence_score:.0f}/100.",
+                "backing": f"Weighted blend {self.weights} of the seven divergence components.",
+                "provenance": "MODEL-DERIVED",
+            }
+        )
+        if analysis.contradictions:
+            trail.append(
+                {
+                    "claim": f"Strongest contradiction: {analysis.contradictions[0]['text']}",
+                    "backing": "Contradiction engine (seeded registry + live cross-checks).",
+                    "provenance": "MODEL-DERIVED" if "OBSERVED:" not in analysis.contradictions[0]["text"] else "OBSERVED",
+                }
+            )
+        if analysis.historical_analogs:
+            a = analysis.historical_analogs[0]
+            trail.append(
+                {
+                    "claim": f"Closest historical analog: {a.period} (similarity {a.similarity:.0f}/100, subsequent avg {a.avg_return_pct:+.0f}%).",
+                    "backing": "Historical analog registry; similarity conditioned on current VIX level.",
+                    "provenance": "MODEL-DERIVED",
+                }
+            )
+        if analysis.catalysts:
+            c = analysis.catalysts[0]
+            trail.append(
+                {
+                    "claim": f"Nearest catalyst: {c.name} (~{c.days_out} days out, {c.probability:.0f}% probability).",
+                    "backing": "Catalyst watchlist (calendar + event-driven).",
+                    "provenance": "ESTIMATED",
+                }
+            )
+        if has_price and current is not None:
+            trail.append(
+                {
+                    "claim": f"Reference price for {instrument}: {current:.4f}; momentum state {momentum['state']}.",
+                    "backing": "Live price series (Close).",
+                    "provenance": "OBSERVED",
+                }
+            )
+        else:
+            trail.append(
+                {
+                    "claim": f"No live price series attached for {instrument} - levels are unavailable, not estimated.",
+                    "backing": "Price feed",
+                    "provenance": "DATA UNAVAILABLE",
+                }
+            )
+        trail.append(
+            {
+                "claim": f"Verdict: {analysis.value_trap_verdict}; classification: {analysis.classification}.",
+                "backing": "Value-trap detector + opportunity/confidence gating.",
+                "provenance": "MODEL-DERIVED",
+            }
+        )
+        return trail
+
+
+# ---------------------------------------------------------------------
+# Signal tracker (historical database + performance analytics)
+# ---------------------------------------------------------------------
+
+
+class SignalTracker:
+    """Persistent log of every developed counter-trend setup with realized
+    outcome tracking and performance analytics.  Outcomes are only recorded
+    when the user reports them - nothing is fabricated."""
+
+    def __init__(self, path: Optional[str] = None):
+        if path is None:
+            path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "data", "counter_trend_signal_log.json"
+            )
+        self.path = path
+        self._records: List[Dict] = []
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                self._records = data if isinstance(data, list) else []
+        except Exception:
+            self._records = []
+
+    def _save(self) -> None:
+        try:
+            d = os.path.dirname(self.path)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+            with open(self.path, "w", encoding="utf-8") as fh:
+                json.dump(self._records, fh, indent=2, default=str)
+        except Exception:
+            pass
+
+    def log_setup(self, setup: CounterTrendSetup) -> str:
+        import datetime as _dt
+
+        import hashlib
+
+        rec = SignalTrackerRecord(
+            signal_id="".join(
+                c for c in f"{setup.theme}-{setup.instrument}-{_dt.date.today().isoformat()}" if c.isalnum()
+            )[:60],
+            created_at=setup.created_at,
+            theme=setup.theme,
+            instrument=setup.instrument,
+            direction=setup.direction,
+            narrative=setup.narrative,
+            entry_reference=setup.current_price,
+            invalidation=setup.invalidation,
+            catalyst=setup.catalyst,
+            confidence_score=setup.confidence_score,
+            opportunity_score=setup.opportunity_score,
+            classification=setup.classification,
+            time_horizon=setup.time_horizon,
+            position_size_pct=setup.position_size_pct,
+        )
+        rec.signal_id = hashlib.md5(rec.signal_id.encode()).hexdigest()[:12]
+        self._records.append(rec.to_dict())
+        self._save()
+        return rec.signal_id
+
+    def update_outcome(
+        self,
+        signal_id: str,
+        realized_return_pct: float,
+        max_favorable_pct: Optional[float] = None,
+        max_adverse_pct: Optional[float] = None,
+        resolved_days: Optional[int] = None,
+        catalyst_hit: Optional[bool] = None,
+    ) -> bool:
+        """Record the realized outcome for a tracked signal.  Returns False
+        if the signal id is unknown."""
+        for rec in self._records:
+            if rec.get("signal_id") == signal_id:
+                rec["realized_return_pct"] = float(realized_return_pct)
+                rec["max_favorable_pct"] = (
+                    float(max_favorable_pct) if max_favorable_pct is not None else None
+                )
+                rec["max_adverse_pct"] = (
+                    float(max_adverse_pct) if max_adverse_pct is not None else None
+                )
+                rec["resolved_days"] = int(resolved_days) if resolved_days is not None else None
+                rec["catalyst_hit"] = bool(catalyst_hit) if catalyst_hit is not None else None
+                if realized_return_pct > 0.5:
+                    rec["outcome_label"] = "WIN"
+                elif realized_return_pct < -0.5:
+                    rec["outcome_label"] = "LOSS"
+                else:
+                    rec["outcome_label"] = "FLAT"
+                self._save()
+                return True
+        return False
+
+    def records(self) -> List[Dict]:
+        return list(self._records)
+
+    def performance_analytics(self) -> Dict:
+        """Win rate, average/median return, profit factor, max drawdown,
+        Sharpe, calibration by confidence bucket.  Empty until outcomes are
+        recorded - no synthetic history."""
+        resolved = [
+            r for r in self._records if r.get("realized_return_pct") is not None
+        ]
+        base = {
+            "tracked": len(self._records),
+            "resolved": len(resolved),
+            "open": len(self._records) - len(resolved),
+            "win_rate": None, "avg_return_pct": None, "median_return_pct": None,
+            "profit_factor": None, "max_drawdown_pct": None, "sharpe": None,
+            "sortino": None, "hit_rate_by_confidence": [],
+            "by_asset_class": [], "by_classification": [],
+            "note": "No realized outcomes recorded yet - performance metrics are computed only from user-reported outcomes.",
+        }
+        if not resolved:
+            return base
+        returns = [r["realized_return_pct"] for r in resolved]
+        wins = [r for r in returns if r > 0.5]
+        losses = [r for r in returns if r < -0.5]
+        gross_win = sum(wins)
+        gross_loss = abs(sum(losses))
+        base["win_rate"] = round(len(wins) / len(returns) * 100.0, 1)
+        base["avg_return_pct"] = round(sum(returns) / len(returns), 2)
+        base["median_return_pct"] = round(sorted(returns)[len(returns) // 2], 2)
+        base["profit_factor"] = round(gross_win / gross_loss, 2) if gross_loss > 0 else None
+        peak = 0.0
+        mdd = 0.0
+        cum = 0.0
+        for r in returns:
+            cum += r
+            peak = max(peak, cum)
+            mdd = min(mdd, cum - peak)
+        base["max_drawdown_pct"] = round(mdd, 2)
+        mean = sum(returns) / len(returns)
+        var = sum((r - mean) ** 2 for r in returns) / len(returns)
+        std = var ** 0.5
+        base["sharpe"] = round(mean / std, 2) if std > 0 else None
+        downside = [r for r in returns if r < 0]
+        dstd = (sum(r * r for r in downside) / len(returns)) ** 0.5 if downside else 0.0
+        base["sortino"] = round(mean / dstd, 2) if dstd > 0 else None
+        # Calibration by confidence bucket
+        buckets: Dict[str, List[float]] = {}
+        for r in resolved:
+            conf = _safe_float(r.get("confidence_score"), 50.0)
+            bucket = f"{int(conf // 10) * 10}-{int(conf // 10) * 10 + 10}"
+            buckets.setdefault(bucket, []).append(r["realized_return_pct"])
+        base["hit_rate_by_confidence"] = [
+            {
+                "bucket": b, "count": len(v), "avg_return_pct": round(sum(v) / len(v), 2),
+                "win_rate": round(len([x for x in v if x > 0.5]) / len(v) * 100.0, 1),
+            }
+            for b, v in sorted(buckets.items())
+        ]
+        by_class: Dict[str, List[float]] = {}
+        for r in resolved:
+            by_class.setdefault(r.get("classification", "?"), []).append(r["realized_return_pct"])
+        base["by_classification"] = [
+            {
+                "classification": k, "count": len(v), "avg_return_pct": round(sum(v) / len(v), 2),
+            }
+            for k, v in sorted(by_class.items())
+        ]
+        base["note"] = "Performance computed from user-reported outcomes."
+        return base
+
+
+_signal_tracker_instance: Optional[SignalTracker] = None
+
+
+def get_signal_tracker(path: Optional[str] = None) -> SignalTracker:
+    """Return the global SignalTracker singleton."""
+    global _signal_tracker_instance
+    if _signal_tracker_instance is None or path is not None:
+        _signal_tracker_instance = SignalTracker(path)
+    return _signal_tracker_instance

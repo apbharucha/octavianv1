@@ -37,6 +37,9 @@ ticker_universe_cache.json
 # Runtime state (regenerated from the *_default templates)
 octavian_paper_trading_state.json
 
+# Counter-trend signal tracker log (user-recorded outcomes, regenerated at runtime)
+data/counter_trend_signal_log.json
+
 # Dark Pool dashboard local state (contains the user's FINRA API key — NEVER commit)
 dark_pool_state.json
 

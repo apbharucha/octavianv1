@@ -65,6 +65,7 @@
     - [Regime Detection (`regime.py`)](#regime-detection-regimepy)
     - [Timeframe Analysis (`timeframe_analysis_engine.py`)](#timeframe-analysis-timeframe_analysis_enginepy)
     - [Counter-Trend Analyzer (`counter_trend_analyzer.py`)](#counter-trend-analyzer-counter_trend_analyzerpy)
+    - [Macro Divergence Intelligence (`counter_trend_ui.py`)](#macro-divergence-intelligence-counter_trend_uipy)
     - [Factor Crowding (`factor_crowding_engine.py`)](#factor-crowding-factor_crowding_enginepy)
     - [Narrative Dislocation (`narrative_dislocation_engine.py`)](#narrative-dislocation-narrative_dislocation_enginepy)
     - [Target Probability (`target_probability_engine.py`)](#target-probability-target_probability_enginepy)
@@ -318,10 +319,10 @@ streamlit run main.py --server.headless true
 ### Running tests
 
 ```bash
-python3 -m pytest tests/ -q          # full suite (773 tests)
+python3 -m pytest tests/ -q          # full suite (802 tests)
 ```
 
-The suite currently has **773 passing tests** covering engines, UI walkthroughs
+The suite currently has **802 passing tests** covering engines, UI walkthroughs
 (Streamlit `AppTest`), integration flows, and the deep-dive memo integrity.
 
 ---
@@ -547,7 +548,7 @@ routing map:
 | Market Scanner | `show_market_scanner()` | `market_scanner` |
 | Symbol Analysis | `show_custom_dashboard()` | `custom_dashboard` |
 | Chart Analysis | `show_chart_analyzer()` | `chart_image_analyzer` |
-| Intelligence Center | tabs: News & Sentiment / Octavian AI Assistant / Counter-Trend Signals | `news_dashboard`, `ai_chatbot`, `counter_trend_analyzer` |
+| Intelligence Center | tabs: News & Sentiment / Octavian AI Assistant / Counter-Trend Signals | `news_dashboard`, `ai_chatbot`, `counter_trend_analyzer`, `counter_trend_ui` |
 | Paper Trading | `show_paper_trading_dashboard()` | `paper_trading_ui` |
 | Simulation Hub | `render_simulation_viewer()` | `simulation_viewer` |
 | Spreadsheet Generator | `show_spreadsheet_generator()` | `spreadsheet_generator` |
@@ -579,8 +580,18 @@ batched quotes, plus a cached 5-minute index chart), and "Breaking Trades"
 
 **Intelligence Center specifics** — three tabs: News & Sentiment
 (`news_dashboard`), Octavian AI Assistant (`show_octavian_chatbot`), and
-Counter-Trend Signals (narrative divergence tracker table + active
-counter-trend trade signals with direction/strength/time-horizon cards).
+Counter-Trend Signals — the Macro Narrative Divergence & Contrarian Signal
+Intelligence dashboard (`counter_trend_ui.show_counter_trend_dashboard`):
+regime banner + live market-state strip, signal alerts, the narrative
+divergence tracker (consensus vs fundamental scores, composite Macro
+Divergence Score, crowding, velocity, status, classification, opportunity /
+confidence), a per-trend **Develop Setup** button that builds a full trade
+setup around each detected trend (entry zone, stop, targets, sizing,
+catalyst, monitoring plan, backed-up evidence trail), per-narrative deep
+dives (three-layer model, components, velocity, contradictions, historical
+analogs, catalysts, transmission map, pricing gap, value-trap verdict, data
+quality), the Signal Tracker with performance analytics, and the full text
+report.
 
 **Footer** — sidebar footer "v4.0.0 | Octavian AI by APB".
 
@@ -1247,7 +1258,8 @@ chatbot (`timeframe_engine` accessor) to frame recommendations by horizon.
 ### Counter-Trend Analyzer (`counter_trend_analyzer.py`)
 
 Identifies weaknesses/contradictions in mainstream economic narratives and
-generates signals that profit from consensus mispricing (898 lines):
+generates signals that profit from consensus mispricing (~2,800 lines,
+legacy API + the Macro Narrative Divergence intelligence layer):
 
 - `NarrativeStrength`, `CounterTrendSignal` data models.  Signals now carry
   live-price confirmation fields: `momentum_state`
@@ -1274,7 +1286,69 @@ generates signals that profit from consensus mispricing (898 lines):
   refreshes never leak state across instances.
 - `score_narrative_strength(...)`, `identify_macro_contradictions(...)`
   module helpers.
-- Singleton: `get_counter_trend_analyzer()`.
+- Singleton: `get_counter_trend_analyzer()`; `analyzer.get_intelligence(
+  market_state=..., price_data=..., divergence_weights=...)` returns the
+  full divergence-intelligence engine.
+
+**Macro Narrative Divergence intelligence layer** — turns the analyzer into
+an institutional divergence system (spec: WHAT THE MARKET BELIEVES → WHAT
+THE DATA SAYS → WHERE THEY DIVERGE → HOW EXTREME → WHAT IS PRICED → WHAT
+COULD FORCE CONVERGENCE → WHICH ASSET IS EXPOSED → WHAT WOULD INVALIDATE):
+
+- `MacroNarrativeIntelligenceEngine.analyze_all()` returns one
+  `MacroNarrativeAnalysis` per narrative: consensus score + component
+  breakdown (market-implied / analyst / news sentiment / positioning /
+  flows / media), fundamental score + component breakdown (inflation /
+  employment / growth / credit / rates / liquidity), composite **Macro
+  Divergence Score** (0–100) from seven configurable-weight components
+  (`DIVERGENCE_WEIGHTS`: narrative 25%, fundamental 20%, market-pricing
+  20%, positioning 10%, historical extremity 10%, data momentum 10%,
+  catalyst proximity 5%), narrative velocity (consensus/fundamental today
+  vs 7D/30D/90D), crowding score, second-order three-layer model
+  (Narrative → Fundamentals → Market price confirmation), ranked macro
+  contradiction engine (seeded + live OBSERVED cross-checks), historical
+  regime matching (similarity + subsequent return stats, never a
+  guarantee), catalyst watchlist with dates/impact/probability, value-trap
+  detector (VALID CONTRARIAN OPPORTUNITY / POSSIBLE VALUE TRAP /
+  INSUFFICIENT EVIDENCE), asset transmission map (macro variable →
+  mechanism → asset → expected direction → already-moved), pricing gap
+  (how much is already priced), signal half-life, data-quality score with
+  provenance labels (OBSERVED / ESTIMATED / MODEL-DERIVED /
+  MARKET-IMPLIED / AI-INFERRED), regime detection (10 regimes + confidence
+  + previous + transition probability), signal status, separate
+  opportunity vs confidence scores, final classification (HIGH-CONVICTION
+  CONTRARIAN / TACTICAL / WATCH-DEVELOPING / NO EDGE / CONSENSUS
+  CONFIRMED), and the anti-confirmation-bias pair "why the market may be
+  wrong" vs "why the market may still be right".  A high divergence score
+  NEVER auto-generates a trade.
+- **Develop Setup tool** — `engine.build_setup(theme, instrument,
+  price_df)` builds a complete trade setup around a detected trend: entry
+  zone (20d swing + ATR), stop, 3 targets (1.5R/2.5R/4R), risk/reward,
+  position sizing from fixed per-trade risk, catalyst + horizon +
+  half-life, invalidation, monitoring plan, and an **evidence trail** where
+  every claim names its backing and provenance (levels are DATA UNAVAILABLE
+  rather than estimated when no price series is supplied).
+- **SignalTracker** — `get_signal_tracker(path)` persists every logged
+  setup to `data/counter_trend_signal_log.json` (gitignored), records
+  user-reported realized outcomes (win/loss/flat, MFE/MAE, days, catalyst
+  hit) and computes honest performance analytics: win rate, avg/median
+  return, profit factor, max drawdown, Sharpe, Sortino, hit rate by
+  confidence bucket, by classification.  Nothing is fabricated — metrics
+  stay empty until outcomes are reported.
+- `get_alerts(percentile=90)` fires EXTREME DIVERGENCE / CONSENSUS
+  VELOCITY alerts with the example format (consensus, fundamentals,
+  divergence, historical percentile, positioning, catalyst proximity,
+  signal).
+
+### Macro Divergence Intelligence (`counter_trend_ui.py`)
+
+Streamlit dashboard for the intelligence engine (no emojis — institutional
+plain text + color badges): regime banner + market-state strip (cached 5
+min), signal alerts, region/country filter, narrative divergence tracker
+table, per-narrative deep-dive expanders, one **Develop Setup** button per
+detected trend (renders the full setup panel + "Log Setup to Signal
+Tracker"), and the Signal Tracker analytics section with per-signal outcome
+updates.  Consumed by main.py's Intelligence Center tab.
 
 ### Factor Crowding (`factor_crowding_engine.py`)
 
@@ -2555,7 +2629,7 @@ codebase — the actual journey of a user action from UI click to output.
 
 ## Test Suite
 
-Run: `python3 -m pytest tests/ -q` — **773 tests pass** (as of 2026-08-23
+Run: `python3 -m pytest tests/ -q` — **802 tests pass** (as of 2026-08-23
 session). Coverage by file:
 
 | Test file | Tests | Focus |
@@ -2580,6 +2654,7 @@ session). Coverage by file:
 | `test_llm_and_models_fixes.py` | 69 | LLM/model fix regressions |
 | `test_tool_router.py` | 28 | Tool router: detection, runners, end-to-end chat wiring |
 | `test_counter_trend_and_whispers.py` | 15 | Whispers datetime safety (naive/aware RSS timestamps) + counter-trend momentum filter & data-driven score refresh |
+| `test_macro_divergence_intelligence.py` | 29 | Macro divergence engine (composite MDS, components, velocity, contradictions, analogs, catalysts, value trap, transmission, pricing, regime, alerts, classification), Develop Setup tool, SignalTracker, legacy API stability |
 | `test_comparative_analysis.py` | 4 | Comparative engine |
 | `test_portfolio_analyzer.py` | 4 | Portfolio metrics |
 | `test_background_tasks_streamlit.py` | 3 | Streamlit integration |
@@ -2642,6 +2717,7 @@ check, pyflakes clean of new issues.
 
 | Date | Change | Sections touched |
 |---|---|---|
+| 2026-08-23 | Counter-Trend dashboard upgraded into a Macro Narrative Divergence & Contrarian Signal Intelligence System: (1) `counter_trend_analyzer.py` gains a full intelligence layer — `MacroNarrativeIntelligenceEngine` with per-narrative consensus + fundamental component breakdowns, composite Macro Divergence Score (7 configurable-weight components), narrative velocity (7D/30D/90D), crowding score, second-order three-layer model (narrative/fundamentals/price), ranked macro contradiction engine with live OBSERVED cross-checks, historical regime matching, catalyst watchlist, value-trap detector, asset transmission map, pricing-gap (how much is priced), signal half-life, data-quality score with provenance labels, 10-regime classifier, separate opportunity vs confidence scores, final classification (HIGH-CONVICTION / TACTICAL / WATCH / NO EDGE / CONSENSUS CONFIRMED), and the anti-confirmation-bias "why wrong / why still right" pair; (2) per-trend **Develop Setup** tool (`build_setup`) builds a full trade setup around each detected trend — entry zone, stop, 3 targets, R/R, sizing, catalyst, monitoring plan, and a backed-up evidence trail (levels are DATA UNAVAILABLE, never estimated, without a price series); (3) `SignalTracker` persists logged setups + user-reported outcomes to `data/counter_trend_signal_log.json` (gitignored) with honest performance analytics (win rate, profit factor, Sharpe/Sortino, max DD, calibration by confidence bucket); (4) new `counter_trend_ui.py` dashboard replaces the old tab in main.py — regime banner, market-state strip, alerts, divergence tracker table, region filter, per-narrative deep dives, Develop Setup buttons, Signal Tracker section. Full suite: 802 passed (773 + 29 new in `test_macro_divergence_intelligence.py`). | Counter-Trend Analyzer; Intelligence Center; Test Suite |
 | 2026-08-23 | Load-time performance pass (profiled with cProfile through AppTest — cold imports + warm reruns): (1) Dashboard per-rerun cost cut from ~2.8s to ~1.6s by caching the insight cards' market-state fetch (`trader_profile._cached_market_state`, `@st.cache_data(ttl=300)`) — the live VIX download + master-engine outlook previously ran on EVERY rerun; (2) `get_realtime_prices_batch()` parallelized (ThreadPoolExecutor) + debug prints removed + `_REALTIME_CACHE_TTL` 5s→15s; (3) Quant Portal first-click import 8.85s → 0.47s by converting module-level engine imports (sklearn/torch/scipy chains: quant_ensemble_model, advanced_backtester, genetic_strategy_engine, macro_cross_asset_engine, alternative_data_engine, risk_engine) to lazy availability flags (`importlib.util.find_spec`) + imports at point of use; the three walkthrough tests that patched `quant_portal.get_stock` now patch `data_sources.get_stock` (the lazy call-site source). Full suite: 758 passed. | Data Layer; Trader Profile; Quant Portal; Test Suite |
 | 2026-08-23 | Market-whispers datetime fix + counter-trend upgrade: (1) fixed "Error loading market whispers: can't compare offset-naive and offset-aware datetimes" — `parsedate_to_datetime` returns aware datetimes that crashed whisper/news sorting against naive `datetime.min`/`datetime.now()`; added module-level `_naive_utc()` and applied it to all whisper/news sort keys and the `_get_recent_articles` recency cutoff (`news_analysis_engine.py`); (2) counter-trend signals upgraded (`counter_trend_analyzer.py`): new `CounterTrendSignal` live-price fields (momentum_state, momentum_score, price_confirmation, live_price, entry_condition), `apply_momentum_filter()` confirming/vetoing signals with real price momentum (REVERSING boosted, TREND_ACCELERATING down-weighted, falling knives >3%/day dropped), and `refresh_from_market_data()` adjusting seeded consensus/fundamental scores from live VIX/yield/DXY/gold/USDJPY/oil/SMH observations; analyzer now deep-copies the narrative registry so refreshes never leak across instances; (3) Intelligence Center UI (`main.py`) wires it in with a cached (10 min) live-price momentum confirmation checkbox + momentum badges/entry-condition/live-price-read on signal cards. Full suite: 773 passed (758 + 15 new tests). | News Analysis; Counter-Trend Analyzer; Intelligence Center; Test Suite |
 | 2026-08-22 | Tool router (`tool_router.py`, ~450 lines): user prompts that explicitly ask for a built-in analytical tool are outsourced to the REAL engine and repackaged as the chatbot's answer — DCF (InstitutionalDCFEngine), reverse DCF (market-consensus implied expectations), Bayesian network (3-layer propagation), Markov/HMM regime (hmm_engine), dark pool (analyze_ticker + ai_insight), 13F smart-money flow, correlation matrix, options greeks (Black-Scholes), factor crowding, market regime. Fires only on explicit tool vocabulary (no false positives on hedge/probability/options/hmm-filler); multi-tool queries combine sections; every runner degrades to None on missing data. Wired into all three chat paths: `generate_financial_analysis`, `_build_single_answer` (mega parts), and `ai_chatbot.process_query`. 730 tests → 758 (28 new in `test_tool_router.py`). | AI & NLP Layer; Test Suite |
