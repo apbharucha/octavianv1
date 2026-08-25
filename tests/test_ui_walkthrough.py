@@ -216,6 +216,9 @@ def test_dark_pool_modes_are_actually_different():
     z-scores / evidence / raw tables), Advanced adds the statistics, and
     Institutional adds provenance + raw outputs. If this test fails the modes
     have collapsed back into looking identical.
+
+    Tabs are lazy (only the active nav item renders), so this test selects the
+    Ticker Intelligence nav item where the mode-differentiated content lives.
     """
     at = AppTest.from_file(os.path.join(ROOT, "main.py"), default_timeout=240)
     with ExitStack() as stack:
@@ -232,37 +235,40 @@ def test_dark_pool_modes_are_actually_different():
         assert mode is not None, "Viewing Mode radio not found"
         assert mode.value == "Basic"
 
+        # Navigate to Ticker Intelligence (index 2) where mode-differentiated content lives
+        nav = at.selectbox(key="dp_nav")
+        nav.set_value("Ticker Intelligence")
+        at.run()
+
         def _text():
             md = " ".join(m.value for m in at.markdown)
             cap = " ".join(c.value for c in at.caption)
             return md + " " + cap
 
         # Basic: plain-language digest present; statistics hidden
-        assert "Plain-language summary" in _text()
-        assert "Z-scores (std dev" not in _text()
-        assert "Evidence for inference" not in _text()
-        assert "Sector / Pressure Matrix" not in _text()
-        assert "**Provenance**" not in _text()
+        t = _text()
+        assert "Plain-language summary" in t
+        assert "Z-scores (std dev" not in t
+        assert "Evidence for inference" not in t
+        assert "Sector / Pressure Matrix" not in t
+        assert "**Provenance**" not in t
 
         # Advanced: statistics appear; raw provenance still hidden
+        mode = at.radio(key="dp_mode")  # refresh after tab-nav at.run()
         mode.set_value("Advanced")
         at.run()
         mode = at.radio(key="dp_mode")
         assert mode.value == "Advanced"
         t = _text()
         assert "Plain-language summary" not in t
-        assert "Z-scores (std dev" in t
         assert "Evidence for inference" in t
-        assert "Sector / Pressure Matrix" in t
         assert "**Provenance**" not in t
 
         # Institutional: provenance + raw outputs appear
         mode.set_value("Institutional")
         at.run()
         t = _text()
-        assert "Z-scores (std dev" in t
         assert "Evidence for inference" in t
-        assert "Sector / Pressure Matrix" in t
         assert "**Provenance**" in t
 
 

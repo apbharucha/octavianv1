@@ -421,7 +421,7 @@ def _render_crowding_tab():
             "Ticker": ct.ticker,
             "Crowding %ile": f"{ct.crowding_percentile:.1f}%",
             "Unwind Risk": ct.unwind_risk,
-            "Avg Z-Score": f"{ct.avg_zscore:.2f}",
+            "Crowd Signal": f"{ct.crowding_adjusted_signal:+.2f}",
             "Description": getattr(ct, "description", ""),
         } for ct in dash.crowded_trades[:12]]
         st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)

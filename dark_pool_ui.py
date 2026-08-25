@@ -308,43 +308,55 @@ def show_dark_pool_dashboard() -> None:
 
     st.markdown("---")
 
-    tabs = st.tabs([
+    # Lazy tab rendering: only the selected tab's content is rendered.
+    # This prevents all 15 tabs from loading simultaneously on page mount,
+    # dramatically improving first-render performance.
+    _DP_TAB_NAMES = [
         "Market Overview", "Dark Pool Scanner", "Ticker Intelligence",
         "Largest Prints", "Imbalance Monitor", "Institutional Activity",
         "Sector Analysis", "Historical Analytics", "Signal Engine",
         "Backtesting", "AI Analyst", "Alerts & Watchlists",
         "Data Quality Center", "Methodology", "Settings & API",
-    ])
+    ]
+    dp_tab_key = "dp_active_tab"
+    if dp_tab_key not in st.session_state:
+        st.session_state[dp_tab_key] = 0
+    active_idx = st.selectbox(
+        "Navigate", _DP_TAB_NAMES, index=st.session_state[dp_tab_key],
+        key="dp_nav", label_visibility="collapsed")
+    active_idx = _DP_TAB_NAMES.index(active_idx)
+    st.session_state[dp_tab_key] = active_idx
+    st.markdown("---")
 
-    with tabs[0]:
+    if active_idx == 0:
         _tab_market_overview(engine, mode)
-    with tabs[1]:
+    elif active_idx == 1:
         _tab_scanner(engine, mode)
-    with tabs[2]:
+    elif active_idx == 2:
         _tab_ticker(engine, mode)
-    with tabs[3]:
+    elif active_idx == 3:
         _tab_prints(engine, mode)
-    with tabs[4]:
+    elif active_idx == 4:
         _tab_imbalance(engine, mode)
-    with tabs[5]:
+    elif active_idx == 5:
         _tab_institutional(engine, mode)
-    with tabs[6]:
+    elif active_idx == 6:
         _tab_sectors(engine, mode)
-    with tabs[7]:
+    elif active_idx == 7:
         _tab_historical(engine, mode)
-    with tabs[8]:
+    elif active_idx == 8:
         _tab_signals(engine, mode)
-    with tabs[9]:
+    elif active_idx == 9:
         _tab_backtest(engine, mode)
-    with tabs[10]:
+    elif active_idx == 10:
         _tab_ai(engine, mode)
-    with tabs[11]:
+    elif active_idx == 11:
         _tab_alerts(engine, mode)
-    with tabs[12]:
+    elif active_idx == 12:
         _tab_data_quality(engine, mode)
-    with tabs[13]:
+    elif active_idx == 13:
         _tab_methodology(engine, mode)
-    with tabs[14]:
+    elif active_idx == 14:
         _tab_settings(engine, mode)
 
 

@@ -938,6 +938,8 @@ elif selection == "Daily Briefing":
 
             with col_es1:
                 st.markdown("#### Market Regime")
+                if regime_label == "No Data" and not es.get("regime_desc"):
+                    es["regime_desc"] = "Market data unavailable — re-run briefing or check data connections."
                 regime_bg = (
                     "#1a2e1a"
                     if "Bull" in regime_label
@@ -1001,22 +1003,30 @@ elif selection == "Daily Briefing":
 
             with col_es2:
                 st.markdown("#### Key Risks")
-                for risk in es.get("key_risks", [])[:6]:
-                    st.markdown(
-                        f"<div style='background:#1f1015;border-left:3px solid #ff4444;"
-                        f"border-radius:4px;padding:7px 10px;margin:3px 0;font-size:0.8rem;color:#ffaaaa;'>"
-                        f"[!] {risk}</div>",
-                        unsafe_allow_html=True,
-                    )
-                st.markdown("#### Key Opportunities")
-                for opp in es.get("key_opportunities", [])[:5]:
-                    if opp:
+                key_risks = es.get("key_risks", [])
+                if key_risks:
+                    for risk in key_risks[:6]:
                         st.markdown(
-                            f"<div style='background:#101f15;border-left:3px solid #00ff88;"
-                            f"border-radius:4px;padding:7px 10px;margin:3px 0;font-size:0.8rem;color:#aaffcc;'>"
-                            f"+ {opp[:120]}</div>",
+                            f"<div style='background:#1f1015;border-left:3px solid #ff4444;"
+                            f"border-radius:4px;padding:7px 10px;margin:3px 0;font-size:0.8rem;color:#ffaaaa;'>"
+                            f"[!] {risk}</div>",
                             unsafe_allow_html=True,
                         )
+                else:
+                    st.caption("No critical risks flagged — briefing data may be incomplete. Re-run to refresh.")
+                st.markdown("#### Key Opportunities")
+                key_opps = es.get("key_opportunities", [])
+                if key_opps:
+                    for opp in key_opps[:5]:
+                        if opp:
+                            st.markdown(
+                                f"<div style='background:#101f15;border-left:3px solid #00ff88;"
+                                f"border-radius:4px;padding:7px 10px;margin:3px 0;font-size:0.8rem;color:#aaffcc;'>"
+                                f"+ {opp[:120]}</div>",
+                                unsafe_allow_html=True,
+                            )
+                else:
+                    st.caption("No specific opportunities flagged — re-run briefing to refresh.")
 
             # Portfolio posture
             st.markdown("---")
