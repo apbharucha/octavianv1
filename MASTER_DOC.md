@@ -2203,12 +2203,18 @@ Singleton: `get_dark_pool_engine()`.
 
 ### Dark Pool UI (`dark_pool_ui.py`)
 
-The dark pool dashboard (1,600 lines), `show_dark_pool_dashboard()` (alias
+The dark pool dashboard (1,600+ lines), `show_dark_pool_dashboard()` (alias
 `render_dark_pool_dashboard`). Design principle: data integrity over visual
 polish — every number traceable to a source with an OBSERVED / MODELED /
 INFERENCE label and confidence. Includes the FINRA key settings panel,
 watchlists, alerts, per-ticker reports, market scan, sector analysis,
 regime, backtests, and methodology disclosure.
+
+**Lazy tab rendering:** replaced `st.tabs` (which mounts all 15 tabs
+simultaneously) with a `st.selectbox` navigator + if/elif chain so only the
+active tab's content renders. Dramatically improves first-paint performance
+by avoiding 14 unused tab renders per page load. Tab selection persists in
+`st.session_state["dp_active_tab"]` for session continuity.
 
 ### Alternative Data Engine (`alternative_data_engine.py`)
 
@@ -2309,9 +2315,18 @@ bias, key risks).
 
 ### Strategy Intelligence (`strategy_intelligence_engine.py`)
 
-`StrategyIntelligenceEngine` — institutional strategy grader and suggester:
-`grade_strategy(strategy_name, performance_data, parameters)` → letter grade
-(A-F) with score and feedback; used by the Strategy Research Lab grader tab.
+`StrategyIntelligenceEngine` — institutional strategy grader and suggester.
+
+- `grade_strategy(strategy_name, performance_data, parameters)` → letter grade
+  (A-F) with score and feedback; used by the Strategy Research Lab grader tab.
+- `suggest_strategies(user_goals, risk_tolerance)` — dynamic keyword-driven
+  suggestion engine: parses the user's investment goals text for keywords
+  (income, growth, momentum, mean-reversion, macro, sector, options, hedging,
+  etc.) and matches against an 11-strategy catalog. Each strategy carries
+  risk-tolerance-adjusted expected Sharpe and a personalized description.
+  Falls back to risk-profile-appropriate strategies when no keywords match,
+  guaranteeing at least 3 suggestions. Replaces the old hardcoded 2-per-tier
+  approach.
 
 ### Information Weighting (`information_weighting_engine.py`)
 
@@ -2717,6 +2732,7 @@ check, pyflakes clean of new issues.
 
 | Date | Change | Sections touched |
 |---|---|---|
+| 2026-08-24 | Dark Pool: lazy tab rendering (selectbox instead of st.tabs — only active tab renders, improving first-paint performance). Strategy Intelligence: suggest_strategies() upgraded to dynamic keyword-driven catalog (11 strategies, risk-adjusted Sharpe, fallback by risk profile) instead of hardcoded 2-per-tier. Daily Briefing: empty-state messages when risks/opportunities are missing. Crowding dashboard: display crowding_adjusted_signal instead of avg_zscore. 802 tests green. | Dark Pool UI; Strategy Intelligence; Intelligence Center; Quant Modeling Lab; Test Suite |
 | 2026-08-23 | Counter-Trend dashboard upgraded into a Macro Narrative Divergence & Contrarian Signal Intelligence System: (1) `counter_trend_analyzer.py` gains a full intelligence layer — `MacroNarrativeIntelligenceEngine` with per-narrative consensus + fundamental component breakdowns, composite Macro Divergence Score (7 configurable-weight components), narrative velocity (7D/30D/90D), crowding score, second-order three-layer model (narrative/fundamentals/price), ranked macro contradiction engine with live OBSERVED cross-checks, historical regime matching, catalyst watchlist, value-trap detector, asset transmission map, pricing-gap (how much is priced), signal half-life, data-quality score with provenance labels, 10-regime classifier, separate opportunity vs confidence scores, final classification (HIGH-CONVICTION / TACTICAL / WATCH / NO EDGE / CONSENSUS CONFIRMED), and the anti-confirmation-bias "why wrong / why still right" pair; (2) per-trend **Develop Setup** tool (`build_setup`) builds a full trade setup around each detected trend — entry zone, stop, 3 targets, R/R, sizing, catalyst, monitoring plan, and a backed-up evidence trail (levels are DATA UNAVAILABLE, never estimated, without a price series); (3) `SignalTracker` persists logged setups + user-reported outcomes to `data/counter_trend_signal_log.json` (gitignored) with honest performance analytics (win rate, profit factor, Sharpe/Sortino, max DD, calibration by confidence bucket); (4) new `counter_trend_ui.py` dashboard replaces the old tab in main.py — regime banner, market-state strip, alerts, divergence tracker table, region filter, per-narrative deep dives, Develop Setup buttons, Signal Tracker section. Full suite: 802 passed (773 + 29 new in `test_macro_divergence_intelligence.py`). | Counter-Trend Analyzer; Intelligence Center; Test Suite |
 | 2026-08-23 | Load-time performance pass (profiled with cProfile through AppTest — cold imports + warm reruns): (1) Dashboard per-rerun cost cut from ~2.8s to ~1.6s by caching the insight cards' market-state fetch (`trader_profile._cached_market_state`, `@st.cache_data(ttl=300)`) — the live VIX download + master-engine outlook previously ran on EVERY rerun; (2) `get_realtime_prices_batch()` parallelized (ThreadPoolExecutor) + debug prints removed + `_REALTIME_CACHE_TTL` 5s→15s; (3) Quant Portal first-click import 8.85s → 0.47s by converting module-level engine imports (sklearn/torch/scipy chains: quant_ensemble_model, advanced_backtester, genetic_strategy_engine, macro_cross_asset_engine, alternative_data_engine, risk_engine) to lazy availability flags (`importlib.util.find_spec`) + imports at point of use; the three walkthrough tests that patched `quant_portal.get_stock` now patch `data_sources.get_stock` (the lazy call-site source). Full suite: 758 passed. | Data Layer; Trader Profile; Quant Portal; Test Suite |
 | 2026-08-23 | Market-whispers datetime fix + counter-trend upgrade: (1) fixed "Error loading market whispers: can't compare offset-naive and offset-aware datetimes" — `parsedate_to_datetime` returns aware datetimes that crashed whisper/news sorting against naive `datetime.min`/`datetime.now()`; added module-level `_naive_utc()` and applied it to all whisper/news sort keys and the `_get_recent_articles` recency cutoff (`news_analysis_engine.py`); (2) counter-trend signals upgraded (`counter_trend_analyzer.py`): new `CounterTrendSignal` live-price fields (momentum_state, momentum_score, price_confirmation, live_price, entry_condition), `apply_momentum_filter()` confirming/vetoing signals with real price momentum (REVERSING boosted, TREND_ACCELERATING down-weighted, falling knives >3%/day dropped), and `refresh_from_market_data()` adjusting seeded consensus/fundamental scores from live VIX/yield/DXY/gold/USDJPY/oil/SMH observations; analyzer now deep-copies the narrative registry so refreshes never leak across instances; (3) Intelligence Center UI (`main.py`) wires it in with a cached (10 min) live-price momentum confirmation checkbox + momentum badges/entry-condition/live-price-read on signal cards. Full suite: 773 passed (758 + 15 new tests). | News Analysis; Counter-Trend Analyzer; Intelligence Center; Test Suite |
