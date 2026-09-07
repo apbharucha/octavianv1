@@ -67,33 +67,125 @@ def _fetch_ct_macro_state() -> dict:
     """Fetch the live macro observations the divergence engine conditions on
     (cached 5 min): VIX, 10Y yield, DXY, gold, oil, USD/JPY, SMH, S&P 500.
 
-    Every symbol goes through ``get_stock`` so a single missing ticker never
-    breaks the intelligence pass; unavailable inputs stay absent (the engine
-    degrades to seeded estimates and labels them ESTIMATED).
+    Uses ``get_vix`` for VIX, ``get_futures_proxy`` for futures symbols (with
+    ETF proxies), and ``get_stock`` for equities.  Every fetch is individually
+    wrapped so a single missing ticker never breaks the intelligence pass;
+    unavailable inputs stay absent (the engine degrades gracefully and labels
+    them ESTIMATED).
     """
-    from data_sources import get_stock
+    from data_sources import get_stock, get_vix, get_futures_proxy
 
-    mapping = {
-        "vix": "^VIX",
-        "us_10y_yield": "^TNX",
-        "usd_index": "DX-Y.NYB",
-        "gold_price": "GC=F",
-        "oil_price": "CL=F",
-        "usdjpy": "JPY=X",
-        "smh_price": "SMH",
-        "sp500": "^GSPC",
-    }
     out = {}
-    for key, sym in mapping.items():
-        try:
-            df = get_stock(sym, period="6mo")
-            if df is not None and not df.empty and "Close" in df.columns:
-                close = df["Close"].dropna()
-                if len(close):
-                    out[key] = float(close.iloc[-1])
-        except Exception:
-            continue
+
+    # --- VIX (dedicated fetcher) ---
+    try:
+        vix_df = get_vix(period="6mo")
+        if vix_df is not None and not vix_df.empty and "Close" in vix_df.columns:
+            close = vix_df["Close"].dropna()
+            if len(close):
+                out["vix"] = float(close.iloc[-1])
+    except Exception:
+        pass
+
+    # --- 10Y Treasury yield (^TNX) ---
+    try:
+        tnx_df = get_stock("^TNX", period="6mo")
+        if tnx_df is not None and not tnx_df.empty and "Close" in tnx_df.columns:
+            close = tnx_df["Close"].dropna()
+            if len(close):
+                out["us_10y_yield"] = float(close.iloc[-1])
+    except Exception:
+        pass
+
+    # --- USD Index (DX-Y.NYB -> UUP proxy fallback) ---
+    try:
+        dxy_df = _safe_fetch("DX-Y.NYB", period="6mo")
+        if dxy_df is not None and not dxy_df.empty and "Close" in dxy_df.columns:
+            close = dxy_df["Close"].dropna()
+            if len(close):
+                out["usd_index"] = float(close.iloc[-1])
+    except Exception:
+        pass
+
+    # --- Gold (GC=F futures -> GLD proxy) ---
+    try:
+        gold_df = get_futures_proxy("GC=F", period="6mo")
+        if gold_df is not None and not gold_df.empty and "Close" in gold_df.columns:
+            close = gold_df["Close"].dropna()
+            if len(close):
+                out["gold_price"] = float(close.iloc[-1])
+    except Exception:
+        pass
+
+    # --- Oil (CL=F futures -> USO proxy) ---
+    try:
+        oil_df = get_futures_proxy("CL=F", period="6mo")
+        if oil_df is not None and not oil_df.empty and "Close" in oil_df.columns:
+            close = oil_df["Close"].dropna()
+            if len(close):
+                out["oil_price"] = float(close.iloc[-1])
+    except Exception:
+        pass
+
+    # --- USD/JPY ---
+    try:
+        usdjpy_df = get_stock("JPY=X", period="6mo")
+        if usdjpy_df is not None and not usdjpy_df.empty and "Close" in usdjpy_df.columns:
+            close = usdjpy_df["Close"].dropna()
+            if len(close):
+                out["usdjpy"] = float(close.iloc[-1])
+    except Exception:
+        pass
+
+    # --- SMH (semiconductor ETF) ---
+    try:
+        smh_df = get_stock("SMH", period="6mo")
+        if smh_df is not None and not smh_df.empty and "Close" in smh_df.columns:
+            close = smh_df["Close"].dropna()
+            if len(close):
+                out["smh_price"] = float(close.iloc[-1])
+    except Exception:
+        pass
+
+    # --- S&P 500 (^GSPC -> SPY fallback) ---
+    try:
+        sp500_df = _safe_fetch("^GSPC", period="6mo")
+        if sp500_df is not None and not sp500_df.empty and "Close" in sp500_df.columns:
+            close = sp500_df["Close"].dropna()
+            if len(close):
+                out["sp500"] = float(close.iloc[-1])
+    except Exception:
+        pass
+
     return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _safe_fetch(symbol: str, period: str = "6mo") -> "pd.DataFrame | None":
+    """Fetch a symbol with ETF proxy fallback.  Returns DataFrame or None."""
+    from data_sources import get_stock
+    try:
+        df = get_stock(symbol, period=period)
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+
+    # ETF proxy fallbacks for common indices/futures
+    proxies = {
+        "DX-Y.NYB": "UUP",      # USD Index -> Dollar Bull ETF
+        "^GSPC": "SPY",          # S&P 500 -> SPY
+        "^VIX": "VIXY",          # VIX -> VIXY ETF (fallback)
+    }
+    proxy = proxies.get(symbol)
+    if proxy:
+        try:
+            df = get_stock(proxy, period=period)
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            pass
+    return None
 
 
 st.set_page_config(layout="wide", page_title="Octavian Terminal", page_icon="O")

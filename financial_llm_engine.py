@@ -443,11 +443,11 @@ def check_llm_connectivity() -> bool:
 
 
 def _call_llm(prompt: str, system: str = "") -> str:
-    """Helper method to execute a prompt against the local LM Studio instance.
+    """Call NVIDIA first, then fall back to the local LM Studio endpoint.
 
-    Includes a 1-second fast-fail when the local LLM is not reachable, plus a
-    short disk cache keyed on the prompt so repeated identical requests are
-    served instantly.
+    The provider order is intentional: hosted NVIDIA inference is the primary
+    path when ``NVIDIA_API_KEY`` is configured; LM Studio remains a local,
+    offline-capable fallback. Both providers share the same cache key.
     """
     import time as _t
     cache_key = f"llm::{hashlib.sha1((system + prompt).encode()).hexdigest()}"
@@ -455,48 +455,87 @@ def _call_llm(prompt: str, system: str = "") -> str:
     if cached is not None:
         return cached
 
-    if not check_llm_connectivity():
-        return ""
-
-    # Ensure system instructions are respected, even if combined for lack of role support
-    if system:
-        full_user_content = f"{system}\n\nUser request: {prompt}"
-    else:
-        full_user_content = prompt
-        
+    # Ensure system instructions are respected, even if combined for lack of role support.
+    full_user_content = f"{system}\n\nUser request: {prompt}" if system else prompt
     messages = [{"role": "user", "content": full_user_content}]
 
-    payload = {
+    # NVIDIA is the primary provider. The key is read from environment or
+    # Streamlit secrets via config; never place credentials in source.
+    if NVIDIA_API_KEY:
+        nvidia_payload = {
+            "model": NVIDIA_LLM_MODEL,
+            "messages": messages,
+            "temperature": 0.1,
+            "stream": False,
+            "max_tokens": 2048,
+        }
+        nvidia_headers = {
+            "Authorization": f"Bearer {NVIDIA_API_KEY}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        try:
+            response = requests.post(
+                NVIDIA_LLM_API_URL,
+                json=nvidia_payload,
+                headers=nvidia_headers,
+                timeout=20,
+            )
+            if response.status_code == 200:
+                content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+                if content:
+                    logger.info("NVIDIA LLM response received (%d chars)", len(content))
+                    _cache_save(cache_key, content)
+                    return content
+            logger.warning("NVIDIA LLM request failed with status %s; using LM Studio fallback", response.status_code)
+        except (requests.RequestException, ValueError, KeyError, IndexError) as exc:
+            logger.warning("NVIDIA LLM request failed; using LM Studio fallback: %s", exc)
+
+    # Local fallback is deliberately gated by the inexpensive connectivity probe.
+    if not check_llm_connectivity():
+        return ""
+    local_payload = {
         "model": LLM_MODEL,
         "messages": messages,
-        "temperature": 0.1, # Low temperature for more deterministic analysis
+        "temperature": 0.1,
         "stream": False,
-        "max_tokens": 2048
+        "max_tokens": 2048,
     }
-    
-    headers = {"Content-Type": "application/json"}
-        
     try:
-        response = requests.post(LLM_API_URL, json=payload, headers=headers, timeout=20)
+        response = requests.post(LLM_API_URL, json=local_payload, headers={"Content-Type": "application/json"}, timeout=20)
         if response.status_code == 200:
             content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
             if content:
-                print(f"DEBUG: Local LLM response received ({len(content)} chars)")
+                logger.info("LM Studio response received (%d chars)", len(content))
                 _cache_save(cache_key, content)
                 return content
-        else:
-            print(f"LM Studio API Error {response.status_code}: {response.text}")
-    except Exception as e:
-        print(f"LM Studio connection error: {e}")
+        logger.warning("LM Studio API returned status %s", response.status_code)
+    except (requests.RequestException, ValueError, KeyError, IndexError) as exc:
+        logger.warning("LM Studio connection failed: %s", exc)
     return ""
 
 # ---------------------------------------------------------------------------
 # LOCAL LLM INTEGRATION (LM Studio)
 # ---------------------------------------------------------------------------
 
-# LM Studio typically runs on port 1234 and exposes an OpenAI-compatible API
+# Provider configuration is centralized in config.py. LM Studio is the fallback.
+try:
+    from config import (
+        NVIDIA_API_KEY,
+        NVIDIA_LLM_API_URL,
+        NVIDIA_LLM_MODEL,
+    )
+except Exception:
+    NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
+    NVIDIA_LLM_API_URL = os.getenv(
+        "NVIDIA_LLM_API_URL",
+        "https://integrate.api.nvidia.com/v1/chat/completions",
+    )
+    NVIDIA_LLM_MODEL = os.getenv("NVIDIA_LLM_MODEL", "moonshotai/kimi-k3")
+
+# LM Studio typically runs on port 1234 and exposes an OpenAI-compatible API.
 LLM_API_URL = "http://localhost:1234/v1/chat/completions"
-# The model name is ignored if LM studio is configured to use the currently loaded model
+# The model name is ignored if LM Studio is configured to use the currently loaded model.
 LLM_MODEL = "mistral"
 
 # NOTE: check_llm_connectivity() and _call_llm() are defined once above with
@@ -3604,6 +3643,18 @@ def _build_institutional_deep_dive(query, intents, tickers, sectors, live_data,
         fundamentals = _dd_fetch_fundamentals(sym)
     fund = fundamentals or {}
     has_fund = bool(fund.get("revenue_m") and fund.get("shares_m"))
+
+    # ---- Canonical SecurityContext (single source of truth for all modules) ----
+    # Every downstream module consumes this context; no module independently
+    # resolves the ticker or generates its own financial inputs.
+    _analytical_ctx = None
+    try:
+        from analytical_context import build_security_context
+        _analytical_ctx = build_security_context(
+            sym, live_data=live_data, fundamentals=fund, query=query)
+    except Exception:
+        _analytical_ctx = None
+
     # ---- Data-completeness gate (spec section 2) ----
     gate_lines, completeness = _dd_data_gate(display, has_price, has_fund, fund)
 
@@ -3861,6 +3912,108 @@ def _build_institutional_deep_dive(query, intents, tickers, sectors, live_data,
                           reasons_directional=(not _reasons_viol),
                           reasons_violations=_reasons_viol,
                           macro_gated=True, rd=_rd))
+    l.append("")
+
+    # ---- Section 21: Institutional Integrity Gate (hard validation layer) ----
+    _integrity_report = None
+    _hard_conf_result = None
+    _rating_gate_result = None
+    _preflight = None
+    _template_scan = None
+    _effective_conf = overall_conf
+    _effective_rating = rating
+    try:
+        from analytical_integrity import (
+            run_full_integrity_check, HardConfidenceEngine)
+        from rating_gate import (
+            RatingGate, PreFlightValidator, TemplateIntegrityScanner,
+            generate_audit_panel, RatingEligibility, InvestmentRating)
+
+        # Build narrative content for semantic contamination scan
+        _narrative_for_scan = "\n".join(l)
+
+        # Run full integrity check (only if SecurityContext was built)
+        if _analytical_ctx is not None:
+            _integrity_report = run_full_integrity_check(
+                ctx=_analytical_ctx,
+                narrative_content=_narrative_for_scan,
+                scenario_returns=[r for _, _, r in scenarios],
+                implied_cagr=implied_g,
+                tv_contribution=(dcf_fvs.get("tv_contribution")
+                                 if isinstance(dcf_fvs, dict) else None),
+                terminal_growth=term_g,
+                dcf_fvs=dcf_fvs if isinstance(dcf_fvs, dict) else None,
+            )
+
+            # Hard confidence: weighted average BUT with ceiling from constraints
+            _hard_conf_result = HardConfidenceEngine.compute_full_confidence(
+                ctx=_analytical_ctx,
+                scenario_returns=[r for _, _, r in scenarios],
+                entity_score=_integrity_report.entity_integrity_score,
+                plausibility_score=_integrity_report.economic_plausibility_score,
+            )
+            _effective_conf = _hard_conf_result.overall_confidence
+
+            # Rating gate: mechanical rating must pass the hard gate
+            _is_qc_pass = "AUDIT PASS" in l[-5] if any("AUDIT" in x for x in l[-10:]) else True
+            _rating_gate_result = RatingGate.evaluate(
+                ctx=_analytical_ctx,
+                integrity_report=_integrity_report,
+                dcf_status=(dcf_fvs.get("status")
+                            if isinstance(dcf_fvs, dict) else None),
+                qc_passed=_is_qc_pass,
+                template_passed=True,
+            )
+            _effective_rating_obj = RatingGate.assign_rating(
+                _rating_gate_result, exp_ret, p_dd30, _effective_conf)
+            _effective_rating = _effective_rating_obj.value
+
+            # Pre-flight validation
+            _preflight = PreFlightValidator.run(
+                ctx=_analytical_ctx,
+                integrity_report=_integrity_report,
+                dcf_status=(dcf_fvs.get("status")
+                            if isinstance(dcf_fvs, dict) else None),
+                qc_passed=_is_qc_pass,
+                template_passed=True,
+                scenario_prob_sum=sum(p for _, p, _ in scenarios),
+                rating_eligible=(_rating_gate_result.eligibility != RatingEligibility.FAIL),
+            )
+
+            # Template scan on final output
+            _final_text = "\n".join(l)
+            _template_scan = TemplateIntegrityScanner.scan(_final_text)
+
+            # Insert the audit panel
+            l.append("")
+            l.append("### 21. Model Integrity Gate (Institutional Validation)")
+            l.append("")
+            _audit_panel = generate_audit_panel(
+                ctx=_analytical_ctx,
+                integrity_report=_integrity_report,
+                rating_result=_rating_gate_result,
+                preflight=_preflight,
+                template_scan=_template_scan,
+            )
+            l.append(_audit_panel)
+
+            # If rating is blocked, add prominent warning at section 19
+            if (_rating_gate_result.eligibility == RatingEligibility.FAIL
+                    or _effective_rating_obj in (InvestmentRating.MODEL_INVALID,
+                                                  InvestmentRating.INSUFFICIENT_DATA)):
+                for i, line in enumerate(l):
+                    if "### 19. Final Investment Committee Output" in line:
+                        l.insert(i + 2,
+                                 "**RATING BLOCKED \u2014 critical integrity or QC failures "
+                                 "detected. The mechanical BUY/SELL output is OVERRIDDEN.**")
+                        l.insert(i + 3, "")
+                        break
+
+    except Exception:
+        # Graceful degradation: if integrity engine fails, the memo still
+        # delivers its existing analysis without the new validation layer.
+        pass
+
     l.append("")
     l.append("*Model output \u2014 verify against live data and your own due diligence. "
              "Not financial advice.*")

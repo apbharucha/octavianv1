@@ -673,8 +673,23 @@ class OctavianEnhancedChatbot:
         except Exception:
             pass
 
-        # Generate the deep financial analysis with live data grounding
-        response_text = generate_financial_analysis(query, context_data=heartbeat_ctx)
+        # Generate the deep financial analysis with live data grounding. The
+        # prompt layer is explicitly data-bound: downstream renderers must not
+        # invent values or reuse a prior ticker's state.
+        canonical_context = (
+            "CANONICAL ANALYSIS CONTRACT\n"
+            "- This request is a new isolated analysis run.\n"
+            "- Use only values supported by the current retrieved data.\n"
+            "- Never invent prices, probabilities, valuation outputs, or timestamps.\n"
+            "- Mark unavailable reported data as DATA UNAVAILABLE - NO ESTIMATE SUBSTITUTED.\n"
+            "- Do not carry narrative, competitors, risks, or thesis text from another ticker.\n"
+            "- Any external company mention must be explicitly framed as a competitor, supplier, customer, or benchmark.\n"
+            f"- Current requested symbols: {', '.join(tickers) if tickers else 'none detected'}.\n"
+        )
+        response_text = generate_financial_analysis(
+            query,
+            context_data="\n".join(part for part in (canonical_context, heartbeat_ctx) if part),
+        )
 
         # Build detected intent labels
         active_intents = [k for k, v in intents.items() if v]
@@ -744,6 +759,7 @@ class OctavianEnhancedChatbot:
 
         return {
             'text': response_text,
+            'analysis_run_id': f"chat_{self.session_id}_{uuid.uuid4().hex[:10]}",
             'charts': charts,
             'intents': active_intents if active_intents else ['general_analysis'],
             'symbols': tickers[:10],

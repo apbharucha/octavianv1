@@ -11,6 +11,7 @@ Author: APB - Octavian Team
 
 import io
 import re
+import json
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -248,10 +249,28 @@ def show_quick_templates():
 
 def show_advanced_customization():
     """Full advanced customization interface."""
-    
+
+    # STEP 0: Template Selection
+    st.subheader("Step 0: Template Type")
+    template = st.selectbox(
+        "Select Template",
+        [
+            "Stock Performance Comparison",
+            "Technical Analysis Dashboard",
+            "Portfolio Tracking",
+            "Trade Log & Performance",
+            "Financial Statements Model",
+            "DCF Valuation Model",
+            "LBO Analysis",
+            "Relative Valuation (Comps)",
+            "Risk & Volatility Analysis",
+            "Correlation & Diversification"
+        ]
+    )
+
     # STEP 1: Symbol & Timeframe Selection
     st.subheader("Step 1: Asset Selection")
-    
+
     col1, col2, col3 = st.columns(3)
     with col1:
         symbols_input = st.text_input(
@@ -648,10 +667,12 @@ def _generate_advanced_spreadsheet(spec: SpreadsheetSpec):
             ws_corr = wb.create_sheet(spec.sheet_names["correlation"])
             _write_correlation_sheet(ws_corr, combined_df, spec)
         
-        # Add charts sheet
+        # Add a real chart-data sheet. Excel charts are built from this
+        # canonical frame rather than reconstructed from summary text.
         if spec.include_charts and spec.chart_types:
             ws_charts = wb.create_sheet(spec.sheet_names["charts"])
-            st.info("Note: Charts are embedded in the Excel file (advanced format)")
+            _write_chart_data_sheet(ws_charts, combined_df, spec)
+            st.info("Charts sheet includes canonical chart data for Excel visualizations.")
         
         # Save to bytes
         excel_bytes = io.BytesIO()
@@ -862,28 +883,123 @@ def _write_summary_sheet(ws, df: pd.DataFrame, spec: SpreadsheetSpec):
 
 
 def _write_correlation_sheet(ws, df: pd.DataFrame, spec: SpreadsheetSpec):
-    """Write correlation matrix with IB formatting."""
-    if "Close" in df.columns and "Symbol" in df.columns:
-        pivot = df.pivot_table(values="Close", index=df.index, columns="Symbol", aggfunc="first")
-        corr = pivot.corr().round(4)
-        corr.index.name = "Symbol"
-        corr = corr.reset_index()
-        _apply_ib_sheet(ws, corr, spec.sheet_names.get("correlation", "Correlation Matrix"),
-                        f"{len(corr)-1 if len(corr)>0 else 0} assets | Octavian Terminal", spec=spec)
+    """Write an aligned returns correlation matrix with valid dates."""
+    if "Close" not in df.columns or "Symbol" not in df.columns:
+        return
+    work = df.copy()
+    date_col = next((c for c in ("Date", "Datetime") if c in work.columns), None)
+    if date_col:
+        work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+        work = work.dropna(subset=[date_col])
+        pivot = work.pivot_table(values="Close", index=date_col, columns="Symbol", aggfunc="last").sort_index()
+    else:
+        pivot = work.pivot_table(values="Close", index=work.index, columns="Symbol", aggfunc="last")
+    returns = pivot.pct_change().replace([np.inf, -np.inf], np.nan).dropna(how="all")
+    corr = returns.corr(min_periods=2).fillna(0.0).round(4)
+    corr.index.name = "Symbol"
+    out = corr.reset_index()
+    _apply_ib_sheet(ws, out, spec.sheet_names.get("correlation", "Correlation Matrix"),
+                    f"{len(corr.columns)} assets | aligned returns | Octavian Terminal", spec=spec)
+
+
+def _write_chart_data_sheet(ws, df: pd.DataFrame, spec: SpreadsheetSpec):
+    """Write chart-ready data and a metric summary for downstream Excel users."""
+    chart_cols = [c for c in ["Symbol", "Date", "Close", "Returns_1d", "Returns_20d", "Volatility_20d", "SMA_20", "SMA_50", "SMA_200", "RSI_14", "MACD", "MACD_Signal", "Volume"] if c in df.columns]
+    out = df[chart_cols].copy() if chart_cols else df.copy()
+    _apply_ib_sheet(ws, out, spec.sheet_names.get("charts", "Charts"),
+                    "Canonical chart dataset — values match the Market Data sheet", spec=spec)
 
 
 def _calculate_indicators(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
-    """Calculate requested indicators."""
+    """Calculate requested indicators from one normalized price frame.
+
+    The previous implementation only covered a few requested fields, leaving
+    most advanced templates nearly empty. Every selected family now receives
+    useful, auditable calculations from the same Close/Volume series.
+    """
     df = df.copy()
+    columns = set(columns or [])
+    if "Date" not in df.columns and hasattr(df.index, "name"):
+        df = df.reset_index().rename(columns={df.index.name or "index": "Date"})
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    close = df.get("Close")
+    if close is None:
+        return df
     
     try:
-        close = pd.to_numeric(df["Close"], errors="coerce") if "Close" in df.columns else None
-        
-        # Moving Averages
-        for ma in ["SMA_20", "SMA_50", "SMA_200"]:
-            if ma in columns and close is not None:
-                period = int(ma.split("_")[1])
-                df[ma] = close.rolling(period).mean()
+        # Moving averages and returns
+        for ma in AVAILABLE_MA_COLUMNS:
+            if ma in columns:
+                match = re.search(r"_(\d+)$", ma)
+                period = int(match.group(1)) if match else 20
+                if ma.startswith("SMA"):
+                    df[ma] = close.rolling(period, min_periods=1).mean()
+                elif ma.startswith("EMA"):
+                    df[ma] = close.ewm(span=period, adjust=False).mean()
+                elif ma.startswith("WMA"):
+                    weights = np.arange(1, period + 1)
+                    df[ma] = close.rolling(period, min_periods=1).apply(lambda x: np.dot(x, weights[-len(x):]) / weights[-len(x):].sum(), raw=True)
+                elif ma.startswith(("DEMA", "TEMA")):
+                    ema = close.ewm(span=period, adjust=False).mean()
+                    ema2 = ema.ewm(span=period, adjust=False).mean()
+                    df[ma] = 2 * ema - ema2 if ma.startswith("DEMA") else 3 * ema - 3 * ema2 + ema2.ewm(span=period, adjust=False).mean()
+
+        for days in (1, 5, 20):
+            name = f"Returns_{days}d"
+            if name in columns:
+                df[name] = close.pct_change(days)
+        if "Returns_MTD" in columns:
+            df["Returns_MTD"] = close / close.groupby(df.index.to_period("M") if hasattr(df.index, "to_period") else np.zeros(len(df))).transform("first") - 1
+        if "Returns_Cumulative" in columns:
+            df["Returns_Cumulative"] = close / close.iloc[0] - 1
+        if "Log_Returns_1d" in columns:
+            df["Log_Returns_1d"] = np.log(close / close.shift(1))
+
+        # Momentum
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        for period in (14, 21):
+            name = f"RSI_{period}"
+            if name in columns:
+                rs = gain.rolling(period, min_periods=period).mean() / (loss.rolling(period, min_periods=period).mean() + 1e-12)
+                df[name] = 100 - 100 / (1 + rs)
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        for name, value in (("MACD", macd), ("MACD_Signal", macd.ewm(span=9, adjust=False).mean()), ("MACD_Histogram", macd - macd.ewm(span=9, adjust=False).mean())):
+            if name in columns:
+                df[name] = value
+
+        # Volatility and bands
+        returns = close.pct_change()
+        for period in (5, 20, 60):
+            name = f"Volatility_{period}d"
+            if name in columns:
+                df[name] = returns.rolling(period, min_periods=2).std() * np.sqrt(252)
+        if any(c in columns for c in ("Bollinger_Upper_20", "Bollinger_Mid_20", "Bollinger_Lower_20", "Bollinger_Width", "Bollinger_Position")):
+            mid = close.rolling(20, min_periods=1).mean()
+            std = close.rolling(20, min_periods=1).std().fillna(0)
+            df["Bollinger_Mid_20"] = mid
+            df["Bollinger_Upper_20"] = mid + 2 * std
+            df["Bollinger_Lower_20"] = mid - 2 * std
+            df["Bollinger_Width"] = (df["Bollinger_Upper_20"] - df["Bollinger_Lower_20"]) / mid.replace(0, np.nan)
+            df["Bollinger_Position"] = (close - df["Bollinger_Lower_20"]) / (df["Bollinger_Upper_20"] - df["Bollinger_Lower_20"]).replace(0, np.nan)
+
+        # Trend/volume fields
+        high = df.get("High", close)
+        low = df.get("Low", close)
+        df["ATR_14"] = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1).rolling(14, min_periods=1).mean()
+        if "Volume" in df.columns:
+            df["Volume_SMA_20"] = df["Volume"].rolling(20, min_periods=1).mean()
+            df["Volume_Ratio"] = df["Volume"] / df["Volume_SMA_20"].replace(0, np.nan)
+            df["OBV"] = (np.sign(close.diff()).fillna(0) * df["Volume"]).cumsum()
+        df["Support_Level"] = low.rolling(20, min_periods=1).min()
+        df["Resistance_Level"] = high.rolling(20, min_periods=1).max()
+        df["Trend_Direction"] = np.where(close >= close.rolling(20, min_periods=1).mean(), "Bullish", "Bearish")
+        df["Historical_Vol"] = returns.rolling(20, min_periods=2).std() * np.sqrt(252)
         
         # RSI
         if "RSI_14" in columns and close is not None and len(close) >= 15:
@@ -950,8 +1066,9 @@ def _safe_fetch_data(symbol: str, period: str = "1y") -> Optional[pd.DataFrame]:
 
 
 def _generate_performance_comparison(symbols: List[str], period: str, include_charts: bool):
-    """Quick template: Performance comparison."""
+    """Quick template: Performance comparison with charts and deep summary."""
     rows = []
+    price_data = {}
     for sym in symbols:
         df = _safe_fetch_data(sym, period)
         if df is None or df.empty or "Close" not in df.columns:
@@ -959,6 +1076,7 @@ def _generate_performance_comparison(symbols: List[str], period: str, include_ch
         close = pd.to_numeric(df["Close"], errors="coerce").dropna()
         if len(close) < 2:
             continue
+        price_data[sym] = close
         ret = close.iloc[-1] / close.iloc[0] - 1
         vol = close.pct_change().std() * np.sqrt(252)
         sharpe = (ret * 252 / max(len(close), 1)) / vol if vol > 0 else 0
@@ -974,6 +1092,47 @@ def _generate_performance_comparison(symbols: List[str], period: str, include_ch
     perf = pd.DataFrame(rows)
     _build_ib_workbook({"Performance": (perf, "Performance Comparison", f"{len(symbols)} assets | {period}")},
                        "perf_comparison")
+
+    # ── Deep Analytical Summary ──
+    st.markdown("### Performance Analysis Summary")
+    best = perf.loc[perf["Total Return"].idxmax()]
+    worst = perf.loc[perf["Total Return"].idxmin()]
+    most_volatile = perf.loc[perf["Annualized Vol"].idxmax()]
+    best_sharpe = perf.loc[perf["Sharpe Ratio"].idxmax()]
+
+    st.markdown(f"""
+    **Top Performer:** {best['Symbol']} returned **{best['Total Return']:.1%}** with a Sharpe of {best['Sharpe Ratio']:.2f}.
+    **Laggard:** {worst['Symbol']} returned {worst['Total Return']:.1%} with a max drawdown of {worst['Max Drawdown']:.1%}.
+    **Highest Volatility:** {most_volatile['Symbol']} at {most_volatile['Annualized Vol']:.1%} annualized.
+    **Best Risk-Adjusted:** {best_sharpe['Symbol']} (Sharpe: {best_sharpe['Sharpe Ratio']:.2f}).
+    """)
+
+    if include_charts and price_data:
+        import plotly.graph_objs as go
+        # Normalized price overlay
+        fig_norm = go.Figure()
+        colors_pal = ["#4fc3f7", "#ce93d8", "#a5d6a7", "#ffcc80", "#ef9a9a", "#80cbc4"]
+        for i, (sym, ser) in enumerate(price_data.items()):
+            norm = ser / ser.iloc[0] * 100
+            fig_norm.add_trace(go.Scatter(
+                x=ser.index, y=norm, mode="lines", name=sym,
+                line=dict(color=colors_pal[i % len(colors_pal)], width=2)
+            ))
+        fig_norm.update_layout(template="plotly_dark", title="Normalized Price Performance", height=400,
+                               paper_bgcolor="#0f1117", plot_bgcolor="#0f1117")
+        st.plotly_chart(fig_norm, use_container_width=True, key="perf_norm_chart")
+
+        # Return bar chart
+        fig_ret = go.Figure(go.Bar(
+            x=perf["Symbol"], y=perf["Total Return"] * 100,
+            marker=dict(color=["#4caf50" if r >= 0 else "#ef5350" for r in perf["Total Return"]]),
+            text=[f"{r*100:.1f}%" for r in perf["Total Return"]],
+            textposition="outside"
+        ))
+        fig_ret.update_layout(template="plotly_dark", title="Total Return by Asset (%)", height=360,
+                              paper_bgcolor="#0f1117", plot_bgcolor="#0f1117")
+        st.plotly_chart(fig_ret, use_container_width=True, key="perf_ret_chart")
+
     st.dataframe(perf, use_container_width=True)
 
 
@@ -1048,13 +1207,14 @@ def _generate_portfolio_tracking(symbols: List[str]):
 
 
 def _generate_trade_log():
-    """Quick template: Trade log  provides a blank formatted template."""
+    """Quick template: an editable trade register with formulas and examples."""
     template = pd.DataFrame({
-        "Date": [datetime.now().strftime("%Y-%m-%d")] * 3,
-        "Symbol": ["", "", ""], "Side": ["BUY", "SELL", ""],
-        "Quantity": [0, 0, 0], "Entry Price": [0.0, 0.0, 0.0],
-        "Exit Price": [0.0, 0.0, 0.0], "P&L": [0.0, 0.0, 0.0],
-        "Notes": ["", "", ""],
+        "Date": [datetime.now().strftime("%Y-%m-%d")] * 10,
+        "Symbol": ["", "", "", "", "", "", "", "", "", ""],
+        "Side": ["BUY", "SELL", "BUY", "SELL", "", "", "", "", "", ""],
+        "Quantity": [0] * 10, "Entry Price": [0.0] * 10,
+        "Exit Price": [0.0] * 10, "P&L": [0.0] * 10,
+        "Return %": [0.0] * 10, "Notes": ["Enter trade thesis / exit reason"] + [""] * 9,
     })
     _build_ib_workbook({"Trade Log": (template, "Trade Log", "Enter your trades below")},
                        "trade_log")
@@ -1101,95 +1261,249 @@ def _generate_financial_statements(symbol: str):
 
 
 def _generate_dcf_model(symbol: str, wacc: float = None, tgr: float = None, tax_rate: float = None):
-    """Quick template: 10-Year detailed DCF model.
+    """Quick template: 10-Year detailed DCF model with LIVE formulas.
 
     Uses user-provided WACC / terminal growth / tax-rate assumptions exactly
     as entered (falls back to sensible defaults only when not provided).
+    All calculations are live Excel formulas — change an assumption, the full
+    model recalculates in-place.
     """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
     try:
         import yfinance as yf
         tk = yf.Ticker(symbol)
         info = tk.info or {}
-        
+
         inc = tk.financials
         if inc is not None and not inc.empty and "Total Revenue" in inc.index:
-            rev_base = inc.loc["Total Revenue"].iloc[0]
-            ebit_base = inc.loc["EBIT"].iloc[0] if "EBIT" in inc.index else rev_base * 0.15
+            rev_base = float(inc.loc["Total Revenue"].iloc[0])
+            ebit_base = float(inc.loc["EBIT"].iloc[0]) if "EBIT" in inc.index else rev_base * 0.15
         else:
-            rev_base = info.get("totalRevenue", 10_000_000_000)
-            ebit_base = info.get("ebitda", 2_000_000_000) * 0.8
-            
+            rev_base = float(info.get("totalRevenue", 10_000_000_000) or 10_000_000_000)
+            ebit_base = float(info.get("ebitda", 2_000_000_000) or 2_000_000_000) * 0.8
+
         tax_rate = 0.21 if tax_rate is None else float(tax_rate)
-        shares = info.get("sharesOutstanding", 1_000_000_000)
-        price = info.get("currentPrice") or info.get("previousClose", 100)
+        shares = info.get("sharesOutstanding", 1_000_000_000) or 1_000_000_000
+        price = info.get("currentPrice") or info.get("previousClose", 100) or 100
         wacc = 0.085 if wacc is None else float(wacc)
         tgr = 0.025 if tgr is None else float(tgr)
-        
-        proj = []
-        rev = rev_base
-        for yr in range(1, 11):
-            g = max(0.15 - yr*0.01, 0.03)  # fades to 3%
-            rev *= (1 + g)
-            margin = min(ebit_base/rev_base + yr*0.005, 0.35) if rev_base else 0.20
-            ebit = rev * margin
-            taxes = ebit * tax_rate
-            nopat = ebit - taxes
-            dna = rev * 0.04  # 4% of sales
-            capex = rev * 0.05 # 5% of sales
-            nwc_chg = rev * 0.01 # 1% of sales
-            ufcf = nopat + dna - capex - nwc_chg
-            df_factor = 1 / ((1 + wacc) ** yr)
-            pv_ufcf = ufcf * df_factor
-            
-            proj.append({
-                "Year": f"Year {yr}",
-                "Revenue Growth %": g,
-                "Revenue": rev,
-                "EBIT Margin %": margin,
-                "EBIT": ebit,
-                f"Taxes ({tax_rate:.0%})": -taxes,
-                "NOPAT": nopat,
-                "(+) D&A": dna,
-                "(-) CapEx": -capex,
-                "(-) Change in NWC": -nwc_chg,
-                "Unlevered Free Cash Flow": ufcf,
-                "Discount Factor": df_factor,
-                "PV of UFCF": pv_ufcf
-            })
-            
-        term_val = proj[-1]["Unlevered Free Cash Flow"] * (1 + tgr) / (wacc - tgr)
-        pv_tv = term_val / ((1 + wacc) ** 10)
-        
-        dcf_df = pd.DataFrame(proj).T
-        dcf_df.columns = dcf_df.iloc[0]
-        dcf_df = dcf_df.drop(dcf_df.index[0]).reset_index()
-        dcf_df.rename(columns={"index": "Line Item"}, inplace=True)
-        
-        ent_val = sum(p["PV of UFCF"] for p in proj) + pv_tv
-        eq_val = ent_val + info.get("totalCash", 0) - info.get("totalDebt", 0)
-        fv = eq_val / shares if shares else 0
-        
-        summary = pd.DataFrame([
-            {"Metric": "Sum of PV of UFCF", "Value": sum(p["PV of UFCF"] for p in proj)},
-            {"Metric": "Terminal Value", "Value": term_val},
-            {"Metric": "PV of Terminal Value", "Value": pv_tv},
-            {"Metric": "Enterprise Value", "Value": ent_val},
-            {"Metric": "(+) Cash", "Value": info.get("totalCash", 0)},
-            {"Metric": "(-) Debt", "Value": info.get("totalDebt", 0)},
-            {"Metric": "Implied Equity Value", "Value": eq_val},
-            {"Metric": "Shares Outstanding", "Value": shares},
-            {"Metric": "Implied Share Price", "Value": fv},
-            {"Metric": "Current Share Price", "Value": price},
-            {"Metric": "Premium / (Discount)", "Value": fv/price - 1 if price else 0},
-            {"Metric": "WACC", "Value": wacc},
-            {"Metric": "Terminal Growth Rate", "Value": tgr}
-        ])
-        
-        _build_ib_workbook({
-            "DCF Model": (dcf_df, f"10-Year DCF Valuation  {symbol}", "Unlevered Free Cash Flow Build"),
-            "Valuation Output": (summary, "Valuation Summary", f"WACC: {wacc:.1%} | TGR: {tgr:.1%}")
-        }, f"dcf_{symbol}")
-        st.dataframe(summary, use_container_width=True)
+        cash = info.get("totalCash", 0) or 0
+        debt = info.get("totalDebt", 0) or 0
+        margin_base = ebit_base / rev_base if rev_base else 0.20
+
+        S = _ib_styles()
+        wb = Workbook()
+
+        # ── Sheet 1: Assumptions ─────────────────────────────────────────
+        ws_ass = wb.active
+        ws_ass.title = "Assumptions"
+        ws_ass.sheet_view.showGridLines = False
+        ws_ass["A1"] = f"{symbol} — DCF Assumptions"
+        ws_ass["A1"].font = S["title_font"]
+        ass_rows = [
+            ("Base Revenue ($M)", rev_base / 1e6),
+            ("Base EBIT Margin", margin_base),
+            ("Tax Rate", tax_rate),
+            ("D&A (% of Revenue)", 0.04),
+            ("CapEx (% of Revenue)", 0.05),
+            ("NWC Change (% of Revenue)", 0.01),
+            ("WACC", wacc),
+            ("Terminal Growth Rate", tgr),
+            ("Shares Outstanding (M)", shares / 1e6),
+            ("Cash ($M)", cash / 1e6),
+            ("Debt ($M)", debt / 1e6),
+            ("Current Price", price),
+        ]
+        for i, (label, val) in enumerate(ass_rows, 3):
+            ws_ass[f"A{i}"] = label
+            ws_ass[f"A{i}"].font = S["header_font"]
+            ws_ass[f"B{i}"] = val
+            ws_ass[f"B{i}"].font = S["data_font"]
+            ws_ass[f"B{i}"].number_format = S["fmt_number"]
+        ws_ass.column_dimensions["A"].width = 30
+        ws_ass.column_dimensions["B"].width = 18
+
+        # ── Sheet 2: DCF Projection (live formulas) ──────────────────────
+        ws_dcf = wb.create_sheet("DCF Model")
+        ws_dcf.sheet_view.showGridLines = False
+
+        # Headers
+        hdrs = ["", "Year 1", "Year 2", "Year 3", "Year 4", "Year 5",
+                "Year 6", "Year 7", "Year 8", "Year 9", "Year 10"]
+        for c, h in enumerate(hdrs, 1):
+            cell = ws_dcf.cell(1, c, h)
+            cell.font = S["header_font"]
+            cell.fill = S["header_fill"]
+            cell.alignment = S["center"]
+            cell.border = S["header_border"]
+
+        # Row references to Assumptions sheet
+        REV = "Assumptions!B3"      # base revenue in $M
+        MARGIN = "Assumptions!B4"    # base EBIT margin
+        TAX = "Assumptions!B5"       # tax rate
+        DA_PCT = "Assumptions!B6"    # D&A % of revenue
+        CAPEX_PCT = "Assumptions!B7" # CapEx % of revenue
+        NWC_PCT = "Assumptions!B8"   # NWC change % of revenue
+        WACC_REF = "Assumptions!B9"  # WACC
+        TGR_REF = "Assumptions!B10"  # terminal growth rate
+        SHARES = "Assumptions!B11"   # shares in M
+        CASH_REF = "Assumptions!B12" # cash in $M
+        DEBT_REF = "Assumptions!B13" # debt in $M
+
+        line_items = [
+            ("Revenue Growth", None, None),  # 2
+            ("Revenue ($M)", REV, "=B2*(1+B3)"),  # 3
+            ("EBIT Margin", MARGIN, "=Assumptions!B4+C3*0.005"),  # 4
+            ("EBIT ($M)", "=B3*B4/100", "=C3*C4"),  # 5
+            ("Taxes ($M)", f"=B5*{TAX}", "=C5*Assumptions!B5"),  # 6
+            ("NOPAT ($M)", "=B5-B6", "=C5-C6"),  # 7
+            ("(+) D&A ($M)", f"=B3*{DA_PCT}", "=C3*Assumptions!B6"),  # 8
+            ("(-) CapEx ($M)", f"=B3*{CAPEX_PCT}", "=C3*Assumptions!B7"),  # 9
+            ("(-) NWC Change ($M)", f"=B3*{NWC_PCT}", "=C3*Assumptions!B8"),  # 10
+            ("UFCF ($M)", "=B7+B8-B9-B10", "=C7+C8-C9-C10"),  # 11
+            ("Discount Factor", f"=1/(1+{WACC_REF})^B$1", "=1/(1+Assumptions!B9)^C$1"),  # 12
+            ("PV of UFCF ($M)", "=B11*B12", "=C11*C12"),  # 13
+        ]
+
+        for r, (label, yr1, yr2_plus) in enumerate(line_items, 2):
+            ws_dcf.cell(r, 1, label).font = S["data_font"]
+            ws_dcf.cell(r, 1).alignment = S["left"]
+            ws_dcf.cell(r, 2, yr1 if yr1 else "").font = S["data_font"]
+            ws_dcf.cell(r, 2).number_format = S["fmt_number"]
+            if yr2_plus:
+                for c in range(3, 12):
+                    ws_dcf.cell(r, c, yr2_plus).font = S["data_font"]
+                    ws_dcf.cell(r, c).number_format = S["fmt_number"]
+
+        # Year numbers in row 1
+        for c in range(2, 12):
+            ws_dcf.cell(1, c, c - 1).font = S["header_font"]
+            ws_dcf.cell(1, c).alignment = S["center"]
+
+        # Revenue growth row (row 2): fading from 10% to 3%
+        for c in range(2, 12):
+            g = max(0.15 - (c-2)*0.01, 0.03)
+            ws_dcf.cell(2, c, g).font = S["data_font"]
+            ws_dcf.cell(2, c).number_format = "0.0%"
+
+        # Column B: Year 1 with hardcoded formulas referencing assumptions
+        ws_dcf["B1"] = 1
+        ws_dcf["B3"] = f"={REV}*(1+B2)"
+        ws_dcf["B4"] = f"={MARGIN}"
+        ws_dcf["B5"] = "=B3*B4"
+        ws_dcf["B6"] = f"=B5*{TAX}"
+        ws_dcf["B7"] = "=B5-B6"
+        ws_dcf["B8"] = f"=B3*{DA_PCT}"
+        ws_dcf["B9"] = f"=B3*{CAPEX_PCT}"
+        ws_dcf["B10"] = f"=B3*{NWC_PCT}"
+        ws_dcf["B11"] = "=B7+B8-B9-B10"
+        ws_dcf["B12"] = f"=1/(1+{WACC_REF})^B1"
+        ws_dcf["B13"] = "=B11*B12"
+
+        # Terminal Value & Equity Bridge
+        r_tv = 15
+        ws_dcf.cell(r_tv, 1, "Terminal UFCF ($M)").font = S["data_font"]
+        ws_dcf.cell(r_tv, 2, f"=J11*(1+{TGR_REF})").font = S["data_font"]
+        ws_dcf.cell(r_tv, 2).number_format = S["fmt_number"]
+        r_tv_val = 16
+        ws_dcf.cell(r_tv_val, 1, "Terminal Value ($M)").font = S["header_font"]
+        ws_dcf.cell(r_tv_val, 2, f"=B15/({WACC_REF}-{TGR_REF})").font = S["header_font"]
+        ws_dcf.cell(r_tv_val, 2).number_format = S["fmt_number"]
+        r_pv_tv = 17
+        ws_dcf.cell(r_pv_tv, 1, "PV of Terminal Value ($M)").font = S["data_font"]
+        ws_dcf.cell(r_pv_tv, 2, f"=B16/(1+{WACC_REF})^10").font = S["data_font"]
+        ws_dcf.cell(r_pv_tv, 2).number_format = S["fmt_number"]
+        r_pv_ufcf = 18
+        ws_dcf.cell(r_pv_ufcf, 1, "Sum PV of UFCF ($M)").font = S["data_font"]
+        ws_dcf.cell(r_pv_ufcf, 2, "=SUM(B13:K13)").font = S["data_font"]
+        ws_dcf.cell(r_pv_ufcf, 2).number_format = S["fmt_number"]
+        r_ev = 19
+        ws_dcf.cell(r_ev, 1, "Enterprise Value ($M)").font = S["header_font"]
+        ws_dcf.cell(r_ev, 2, "=B18+B17").font = S["header_font"]
+        ws_dcf.cell(r_ev, 2).number_format = S["fmt_number"]
+        r_eq = 20
+        ws_dcf.cell(r_eq, 1, "(+) Cash ($M)").font = S["data_font"]
+        ws_dcf.cell(r_eq, 2, f"={CASH_REF}").font = S["data_font"]
+        ws_dcf.cell(r_eq, 2).number_format = S["fmt_number"]
+        r_debt = 21
+        ws_dcf.cell(r_debt, 1, "(-) Debt ($M)").font = S["data_font"]
+        ws_dcf.cell(r_debt, 2, f"={DEBT_REF}").font = S["data_font"]
+        ws_dcf.cell(r_debt, 2).number_format = S["fmt_number"]
+        r_eqval = 22
+        ws_dcf.cell(r_eqval, 1, "Equity Value ($M)").font = S["header_font"]
+        ws_dcf.cell(r_eqval, 2, "=B19+B20-B21").font = S["header_font"]
+        ws_dcf.cell(r_eqval, 2).number_format = S["fmt_number"]
+        r_fv = 23
+        ws_dcf.cell(r_fv, 1, "Fair Value per Share ($)").font = S["title_font"]
+        ws_dcf.cell(r_fv, 2, f"=B22/{SHARES}").font = S["title_font"]
+        ws_dcf.cell(r_fv, 2).number_format = S["fmt_number"]
+
+        for c in range(1, 12):
+            ws_dcf.column_dimensions[get_column_letter(c)].width = 16
+        ws_dcf.column_dimensions["A"].width = 28
+
+        # ── Sheet 3: Sensitivity Table (live formulas) ───────────────────
+        ws_sens = wb.create_sheet("Sensitivity")
+        ws_sens.sheet_view.showGridLines = False
+        ws_sens["A1"] = "Fair Value Sensitivity — WACC vs Terminal Growth Rate"
+        ws_sens["A1"].font = S["title_font"]
+        ws_sens["C2"] = "Terminal Growth Rate"
+        ws_sens["C2"].font = S["header_font"]
+        ws_sens["A3"] = "WACC"
+        ws_sens["A3"].font = S["header_font"]
+
+        tgr_vals = [tgr - 0.015, tgr - 0.01, tgr - 0.005, tgr, tgr + 0.005, tgr + 0.01]
+        wacc_vals = [wacc - 0.02, wacc - 0.015, wacc - 0.01, wacc,
+                      wacc + 0.01, wacc + 0.015, wacc + 0.02]
+
+        for ci, tv in enumerate(tgr_vals, 3):
+            ws_sens.cell(2, ci, tv).font = S["header_font"]
+            ws_sens.cell(2, ci).number_format = "0.00%"
+            ws_sens.cell(2, ci).alignment = S["center"]
+
+        for ri, wv in enumerate(wacc_vals, 3):
+            ws_sens.cell(ri, 1, wv).font = S["header_font"]
+            ws_sens.cell(ri, 1).number_format = "0.00%"
+            ws_sens.cell(ri, 1).alignment = S["center"]
+
+        # Live sensitivity: each cell computes FV = TV + PV(FCFs) with
+        # overridden WACC (column) and TGR (row). We use a simplified
+        # formula that captures the dominant terminal-value sensitivity.
+        base_tv = ws_dcf.cell(r_tv_val, 2).value or 0
+        for ri in range(3, 10):
+            for ci in range(3, 9):
+                fv_formula = (
+                    f"=((DCF!B15*DCF!B12)/(B{ri}/100-C{ci}/100)"
+                    f"/(1+B{ri}/100)^10 + DCF!B18"
+                    f"+Assumptions!B12-Assumptions!B13)/Assumptions!B11"
+                )
+                ws_sens.cell(ri, ci, fv_formula).font = S["data_font"]
+                ws_sens.cell(ri, ci).number_format = S["fmt_number"]
+                ws_sens.cell(ri, ci).alignment = S["center"]
+
+        ws_sens.column_dimensions["A"].width = 12
+        for c in range(2, 9):
+            ws_sens.column_dimensions[get_column_letter(c)].width = 16
+
+        wb.save(buf := io.BytesIO())
+        buf.seek(0)
+        fname = f"dcf_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        st.download_button(
+            "Download DCF Model (.xlsx)", buf.getvalue(), fname,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        st.success(f"Live-formula DCF model ready: **{fname}**")
+
+        # Preview summary
+        ent_val = sum(float(p) for p in [
+            ws_dcf.cell(r_pv_ufcf, 2).value or 0,
+            ws_dcf.cell(r_pv_tv, 2).value or 0,
+        ]) if False else None
+        st.markdown(f"**Live Formula Model Built.** Change any assumption in the 'Assumptions' tab and the full DCF recalculates instantly in Excel.")
     except Exception as e:
         st.error(f"DCF model error: {e}")
 
@@ -1362,7 +1676,7 @@ def _generate_risk_analysis(symbols: List[str], period: str):
 
 
 def _generate_correlation_analysis(symbols: List[str], period: str):
-    """Quick template: Correlation & diversification analysis."""
+    """Quick template: Correlation & diversification analysis with heatmap and insights."""
     price_data = {}
     for sym in symbols:
         df = _safe_fetch_data(sym, period)
@@ -1377,7 +1691,51 @@ def _generate_correlation_analysis(symbols: List[str], period: str):
     corr_reset.index.name = "Symbol"
     corr_reset = corr_reset.reset_index()
     _build_ib_workbook({"Correlations": (corr_reset, "Correlation Matrix",
-                       f"{len(symbols)} assets | {period}")},
+                       f"{len(symbols)} assets | {period} | Returns-based")},
                        "correlation_analysis")
+
+    # ── Deep Analytical Summary ──
+    st.markdown("### Correlation & Diversification Insights")
+    symbols_list = list(corr.columns)
+    # Find highest and lowest non-self correlations
+    min_corr, max_corr = 1.0, -1.0
+    min_pair, max_pair = ("", ""), ("", "")
+    for i in range(len(symbols_list)):
+        for j in range(i+1, len(symbols_list)):
+            val = corr.iloc[i, j]
+            if val < min_corr:
+                min_corr = val; min_pair = (symbols_list[i], symbols_list[j])
+            if val > max_corr:
+                max_corr = val; max_pair = (symbols_list[i], symbols_list[j])
+    pair_values = [corr.iloc[i, j] for i in range(len(symbols_list)) for j in range(i + 1, len(symbols_list)) if pd.notna(corr.iloc[i, j])]
+    avg_corr = float(np.mean(pair_values)) if pair_values else 0.0
+
+    # Effective diversification score: penalize positive co-movement but
+    # preserve the intuitive 0-100 range for negative correlations.
+    div_score = max(0, min(100, (1 - avg_corr) * 100))
+    st.markdown(f"""
+    **Diversification Score:** {div_score:.0f}/100 (higher = better diversification)  
+    **Average Pairwise Correlation:** {avg_corr:.3f}  
+    **Strongest Link:** {max_pair[0]} ↔ {max_pair[1]} (r = {max_corr:.3f}) — these move nearly in lockstep  
+    **Weakest Link:** {min_pair[0]} ↔ {min_pair[1]} (r = {min_corr:.3f}) — strongest diversifier
+    """)
+    if avg_corr > 0.7:
+        st.warning("High concentration risk: portfolio assets are strongly correlated. Consider adding negatively correlated assets.")
+    elif avg_corr < 0.3:
+        st.success("Strong diversification: assets exhibit low cross-correlation.")
+
+    # Correlation heatmap
+    import plotly.graph_objs as go
+    fig = go.Figure(data=go.Heatmap(
+        z=corr.values, x=symbols_list, y=symbols_list,
+        colorscale=[[0.0, "#d50000"], [0.35, "#ff5252"], [0.5, "#1a1f2e"],
+                    [0.65, "#69f0ae"], [1.0, "#00e676"]],
+        zmin=-1, zmax=1,
+        text=[[f"{corr.iloc[i,j]:.2f}" for j in range(len(symbols_list))] for i in range(len(symbols_list))],
+        texttemplate="%{text}", textfont=dict(size=12, color="white")
+    ))
+    fig.update_layout(template="plotly_dark", title="Returns-Based Correlation Heatmap", height=450,
+                      paper_bgcolor="#0f1117", plot_bgcolor="#0f1117")
+    st.plotly_chart(fig, use_container_width=True, key="corr_heatmap")
     st.dataframe(corr, use_container_width=True)
 

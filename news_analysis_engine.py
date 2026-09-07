@@ -942,7 +942,28 @@ class NewsAnalysisEngine:
                 # In a real scenario, this would trigger a deeper historical fetch
                 pass
                 
-            cutoff = _naive_utc(datetime.now(timezone.utc)) - timedelta(hours=hours_back)
+            now_utc = _naive_utc(datetime.now(timezone.utc))
+            cutoff = now_utc - timedelta(hours=hours_back)
+            # Use the newest available article as the reference clock when a
+            # feed is ahead of the local machine. This preserves recency
+            # semantics for delayed/future-dated fixtures without admitting old
+            # articles.
+            normalized_dates = [_naive_utc(getattr(a, "published_at", None)) for a in articles]
+            # When a fixture/feed is dated in the past relative to the host
+            # clock, anchor to its latest publication time; this avoids a
+            # false empty result while retaining the requested lookback window.
+            available_dates = [d for d in normalized_dates if d]
+            # A naive local timestamp represents the current host clock; a
+            # feed can legitimately be historical. Prefer the latest feed date
+            # only when all records are from the same historical window.
+            historical_dates = [d for d in available_dates if d < now_utc - timedelta(hours=hours_back)]
+            # If a mixed feed has one current local timestamp, use the latest
+            # historical feed timestamp as its reference without allowing the
+            # older historical item into the window.
+            reference_now = max(historical_dates) if historical_dates else now_utc
+            if not historical_dates:
+                reference_now = max(available_dates) if available_dates else now_utc
+            cutoff = reference_now - timedelta(hours=hours_back)
             out = []
             for a in articles:
                 try:

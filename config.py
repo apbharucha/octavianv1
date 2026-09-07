@@ -26,6 +26,14 @@ def _get_secret(name: str, default: str = "") -> str:
         return default
 
 
+# LLM provider configuration. NVIDIA is preferred when configured; the local
+# LM Studio endpoint remains the offline/local fallback.
+NVIDIA_API_KEY = _get_secret("NVIDIA_API_KEY")
+NVIDIA_LLM_API_URL = _get_secret(
+    "NVIDIA_LLM_API_URL", "https://integrate.api.nvidia.com/v1/chat/completions"
+)
+NVIDIA_LLM_MODEL = _get_secret("NVIDIA_LLM_MODEL", "moonshotai/kimi-k3")
+
 # Vendor API keys
 POLYGON_API_KEY = _get_secret("POLYGON_API_KEY")
 ALPHA_VANTAGE_KEY = _get_secret("ALPHA_VANTAGE_KEY")

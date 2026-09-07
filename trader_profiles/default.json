@@ -21,7 +21,11 @@
     "GS",
     "MS",
     "BLK",
-    "SCHW"
+    "SCHW",
+    "NVDA",
+    "AAPL",
+    "MFST",
+    "META"
   ],
   "preferred_indicators": [
     "RSI",
@@ -57,7 +61,7 @@
   "adaptive_mode": false,
   "learned_persona": {},
   "created_at": "2026-02-16T13:04:28.709132",
-  "updated_at": "2026-07-18T12:13:00.054674",
+  "updated_at": "2026-08-29T21:06:19.571388",
   "interaction_count": 44,
   "queries_history": [
     {

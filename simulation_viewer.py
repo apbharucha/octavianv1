@@ -344,7 +344,8 @@ def _render_portfolio_evolution_tab():
     days = c4.slider("Horizon (Days)", 30, 1500, 252)
 
     if st.button("Run Portfolio Evolution", type="primary"):
-        rng = np.random.default_rng(7)
+        with st.spinner("Simulating portfolio path..."):
+            rng = np.random.default_rng(7)
         dt = 1 / 252
         mu = drift / 100
         sig = vol_pct / 100
@@ -404,7 +405,8 @@ def _render_crisis_tab():
     intensity = c2.slider("Stress Intensity", 0.5, 3.0, 1.0)
 
     if st.button("Run Crisis Simulation", type="primary"):
-        rng = np.random.default_rng(11)
+        with st.spinner("Running crisis stress test..."):
+            rng = np.random.default_rng(11)
         n = sc["duration_days"]
         drift = sc["drift"] * intensity
         vol = sc["vol"] * intensity
@@ -438,7 +440,8 @@ def _render_universe_tab():
     seed = c2.number_input("Seed", 0, 99999, 42)
 
     if st.button("Generate Universe", type="primary"):
-        rng = np.random.default_rng(int(seed))
+        with st.spinner("Generating synthetic universe..."):
+            rng = np.random.default_rng(int(seed))
         assets = []
         for i in range(size):
             asset_type = rng.choice(["STOCK", "ETF", "FX", "CRYPTO", "BOND", "COMMODITY"],
@@ -474,20 +477,31 @@ def _render_hyperdim_tab():
     steps = c2.slider("Steps per Run", 100, 800, 250)
 
     if st.button("Explore Parameter Space", type="primary"):
-        from market_simulation_universe import MarketSimulator
-        vols = np.linspace(0.05, 0.40, grid)
-        events = np.linspace(0.0, 0.04, grid)
-        X, Y = np.meshgrid(vols, events)
-        Z = np.zeros_like(X)
-        for i in range(grid):
-            for j in range(grid):
-                sim = MarketSimulator(n_agents=80, n_steps=steps,
-                                      fundamental_vol=float(X[i, j]),
-                                      event_prob=float(Y[i, j]), seed=42)
-                r = sim.run(initial_price=100.0)
-                dfp = r.to_dataframe()
-                rets = dfp["mid_price"].pct_change().dropna()
-                Z[i, j] = float(rets.std() * np.sqrt(len(dfp)) * 100) if len(rets) else 0.0
+        with st.spinner("Running Monte Carlo parameter sweep..."):
+            from market_simulation_universe import MarketSimulator
+            vols = np.linspace(0.05, 0.40, grid)
+            events = np.linspace(0.0, 0.04, grid)
+            X, Y = np.meshgrid(vols, events)
+            Z = np.zeros_like(X)
+            total_runs = grid * grid
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            run_idx = 0
+            for i in range(grid):
+                for j in range(grid):
+                    sim = MarketSimulator(n_agents=80, n_steps=steps,
+                                          fundamental_vol=float(X[i, j]),
+                                          event_prob=float(Y[i, j]), seed=42)
+                    r = sim.run(initial_price=100.0)
+                    dfp = r.to_dataframe()
+                    rets = dfp["mid_price"].pct_change().dropna()
+                    Z[i, j] = float(rets.std() * np.sqrt(len(dfp)) * 100) if len(rets) else 0.0
+                    run_idx += 1
+                    progress_bar.progress(run_idx / total_runs)
+                    status_text.text(f"Sweeping parameter grid... {run_idx}/{total_runs} runs complete")
+            status_text.empty()
+            progress_bar.empty()
+        st.success(f"Parameter sweep complete — {total_runs} simulations across the grid.")
         fig = go.Figure(data=[go.Surface(x=X, y=Y, z=Z, colorscale="Viridis")])
         fig.update_layout(**_dark_layout(title="Realized Volatility Surface", height=520))
         fig.update_scenes(xaxis_title="Fundamental Vol", yaxis_title="Event Probability",
@@ -504,8 +518,12 @@ def _render_performance_tab():
     if not HAS_ENGINE:
         st.info("Run a Comprehensive Trading Simulation first to populate the dashboard.")
         return
-    engine = MarketSimulationEngine()
-    recent = engine.get_recent_simulations(limit=5)
+    try:
+        engine = MarketSimulationEngine()
+        recent = engine.get_recent_simulations(limit=5)
+    except Exception as e:
+        st.info(f"Simulation engine unavailable: {e}. Run a Comprehensive Trading Simulation first.")
+        return
     if not recent:
         st.info("No simulations recorded yet. Run the Comprehensive Trading Sim tab first.")
         return
@@ -675,7 +693,8 @@ def _render_futures_commodity_sim_tab():
     fut = c2.number_input("Front-Month Futures Price", 0.01, 1e6, 102.0)
 
     if st.button("Run Futures Analytics", type="primary"):
-        basis = fe.get_basis_analysis(sym, float(spot), float(fut), T=0.25)
+        with st.spinner("Computing futures analytics..."):
+            basis = fe.get_basis_analysis(sym, float(spot), float(fut), T=0.25)
         if basis:
             st.markdown("**Basis Analysis**")
             st.json(basis)
@@ -720,7 +739,8 @@ def _render_derivative_dynamics_tab():
     typ = st.radio("Option Type", ["call", "put"], horizontal=True)
 
     if st.button("Price Option", type="primary"):
-        bs = oe.black_scholes(S, K, T, sigma, typ)
+        with st.spinner("Pricing option and building vol surface..."):
+            bs = oe.black_scholes(S, K, T, sigma, typ)
         c_b1, c_b2, c_b3, c_b4 = st.columns(4)
         c_b1.metric("BS Price", f"${bs.get('price', 0):.2f}")
         c_b2.metric("Delta", f"{bs.get('delta', 0):.3f}")
@@ -767,15 +787,11 @@ def _render_comprehensive_sim_tab():
                     progress_text = st.empty()
                     progress_bar = st.progress(0)
                     
-                    # Instead of blocking UI entirely for long, we can run it in a thread
-                    # For Streamlit, running synchronously for a demo is okay if duration is short,
-                    # but simulation duration is in real-time minutes. We will mock a faster run
-                    # by patching the duration or just letting it run.
-                    st.warning("Running real-time simulation. This will block the interface until complete.")
+                    st.info("Running simulation — speed-accelerated for UI responsiveness.")
                     try:
-                        # Patch duration to be seconds instead of minutes for UI execution
-                        import datetime
-                        engine.simulation_duration = datetime.timedelta(seconds=sim_duration)
+                        # Override duration to run faster in UI (real-time sims block)
+                        import datetime as dt_module
+                        engine.simulation_duration = dt_module.timedelta(seconds=max(5, sim_duration))
                         engine.run_daily_simulation()
                         st.success("Simulation completed successfully!")
                         st.rerun()

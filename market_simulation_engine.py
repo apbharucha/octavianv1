@@ -864,7 +864,8 @@ class SimulationLearningEngine:
 class MarketSimulationEngine:
     """Ultra-realistic market simulation engine with configurable duration."""
     
-    def __init__(self, date_str: str = None):
+    def __init__(self, date_str: str = None, universe_size: int = None,
+                 simulation_duration: int = None):
         self._fallback_analyzer = _FallbackUnbiasedAnalyzer()
         self._use_fallback = True
 
@@ -904,9 +905,13 @@ class MarketSimulationEngine:
         self.setup_simulation_database()
         
         #  CONFIGURABLE SIMULATION PARAMETERS 
-        self.simulation_duration = timedelta(hours=2)  # User can change
+        self.simulation_duration = (
+            timedelta(minutes=simulation_duration)
+            if simulation_duration is not None
+            else timedelta(hours=2)
+        )
         self.time_step = timedelta(minutes=1)
-        self.universe_size = None
+        self.universe_size = universe_size  # None means auto-detect
         
         # Dynamic News Generation based on regime
         self._base_news_freq = {
@@ -1307,6 +1312,35 @@ class MarketSimulationEngine:
                 event = self._create_news_event(timestamp, news_type, regime)
                 events.append(event)
         return events
+
+    def _create_news_event(self, timestamp: datetime, news_type: NewsType,
+                           regime: MarketRegime) -> SimulatedNewsEvent:
+        """Create one fully populated deterministic-shape simulated news event."""
+        event_id = f"news_{timestamp.strftime('%Y%m%d%H%M%S%f')}_{random.randrange(1_000_000):06d}"
+        universe = list(self._symbol_drift) or ["SPY", "QQQ", "TLT", "GLD"]
+        affected_symbols = random.sample(universe, min(len(universe), random.randint(1, 3)))
+        sector = self._get_symbol_sector(affected_symbols[0]) if affected_symbols else "Market"
+        sentiment = random.uniform(-1.0, 1.0)
+        impact = random.uniform(0.25, 1.0)
+        label = news_type.value.replace("_", " ").title()
+        return SimulatedNewsEvent(
+            event_id=event_id,
+            timestamp=timestamp,
+            news_type=news_type,
+            headline=f"{label} event affects {', '.join(affected_symbols)}",
+            content=(f"Simulated {label.lower()} information under the "
+                     f"{regime.value.replace('_', ' ')} regime."),
+            affected_symbols=affected_symbols,
+            affected_sectors=[sector],
+            sentiment_score=round(sentiment, 4),
+            market_impact_score=round(impact, 4),
+            credibility_tier="SIMULATED",
+            source="Octavian Simulation Engine",
+            expected_price_impact={symbol: round(sentiment * impact * 0.01, 6)
+                                   for symbol in affected_symbols},
+            volatility_impact=round(abs(sentiment) * impact, 4),
+            volume_impact=round(impact, 4),
+        )
 
     def _apply_cross_asset_shocks(self, event: SimulatedNewsEvent):
         """Propagate news shocks across correlated assets."""

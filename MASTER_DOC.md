@@ -4,7 +4,7 @@
 > Every module, every feature, every process — explained end to end.
 >
 > - Version covered: **v4.0.0** (streamlit entry: `main.py`)
-> - Last updated: **2026-08-21**
+> - Last updated: **2026-09-06**
 > - Update policy: see [How to Keep This Document Current](#how-to-keep-this-document-current)
 
 ---
@@ -47,6 +47,10 @@
     - [Personalization (`personalization_engine.py`)](#personalization-personalization_enginepy)
     - [Portfolio Chatbot Context (`portfolio_chatbot_context.py`)](#portfolio-chatbot-context-portfolio_chatbot_contextpy)
     - [Chatbot Evaluation Harness (`chatbot_eval/`)](#chatbot-evaluation-harness-chatbot_eval)
+10b. [Institutional Integrity Layer](#institutional-integrity-layer)
+    - [Canonical Analytical Context (`analytical_context.py`)](#canonical-analytical-context-analytical_contextpy)
+    - [Analytical Integrity Engine (`analytical_integrity.py`)](#analytical-integrity-engine-analytical_integritypy)
+    - [Rating Gate (`rating_gate.py`)](#rating-gate-rating_gatepy)
 11. [News & Sentiment Layer](#news--sentiment-layer)
     - [News Analysis Engine (`news_analysis_engine.py`)](#news-analysis-engine-news_analysis_enginepy)
     - [Advanced News Processor (`advanced_news_processor.py`)](#advanced-news-processor-advanced_news_processorpy)
@@ -319,10 +323,10 @@ streamlit run main.py --server.headless true
 ### Running tests
 
 ```bash
-python3 -m pytest tests/ -q          # full suite (802 tests)
+python3 -m pytest tests/ -q          # full suite (840 tests)
 ```
 
-The suite currently has **802 passing tests** covering engines, UI walkthroughs
+The suite currently has **840 passing tests** covering engines, UI walkthroughs
 (Streamlit `AppTest`), integration flows, and the deep-dive memo integrity.
 
 ---
@@ -333,6 +337,8 @@ The suite currently has **802 passing tests** covering engines, UI walkthroughs
 
 - `_get_secret(name, default)` reads **environment variables first**, then
   **Streamlit secrets** (`st.secrets`). Never hardcodes keys.
+- LLM settings: `NVIDIA_API_KEY`, `NVIDIA_LLM_API_URL`, and
+  `NVIDIA_LLM_MODEL`; NVIDIA is primary and LM Studio is the local fallback.
 - Vendor keys: `POLYGON_API_KEY`, `ALPHA_VANTAGE_KEY`, `OANDA_API_KEY`,
   `MASSIVE_API_KEY`, `EODHD_API_KEY`.
 - `FLASK_SECRET_KEY`: from `SECRET_KEY` env var or a generated ephemeral key
@@ -682,12 +688,17 @@ stop the "Live snapshot for CAPEX / FCF / GPU" class of hallucination:
 3. `_REGION_CODES` (EU/US/UK/CN/JP/…) and `_COMMON_ENGLISH_WORDS` (~250
    short words) — hard-blocked or security-only resolution for prose tokens.
 
-**LLM connectivity layer.** `check_llm_connectivity()` probes LM Studio at
-`localhost:1234`; `_call_llm(prompt, system)` calls it with a timeout,
-falling back to heuristic generation when offline. `query_parser_llm` and
-`generate_analysis_llm` use it to (optionally) parse queries and write
-analysis prose — but the deterministic heuristic path always works without
-any LLM.
+**LLM provider layer.** `_call_llm(prompt, system)` uses NVIDIA hosted
+inference as the primary provider when `NVIDIA_API_KEY` is configured. It
+posts to `NVIDIA_LLM_API_URL` with `NVIDIA_LLM_MODEL` (defaults to
+`moonshotai/kimi-k3`), preserves the shared response cache, and falls back on
+HTTP, transport, or malformed-response failures. The local LM Studio
+OpenAI-compatible endpoint at `localhost:1234` remains the fallback and is
+connectivity-gated so an offline local server fails quickly. Credentials are
+loaded through `config._get_secret` from environment variables or Streamlit
+secrets; the NVIDIA token is never stored in source. `query_parser_llm` and
+`generate_analysis_llm` use this provider router, while the deterministic
+heuristic path remains available without either provider.
 
 **Query decomposition.** `expand_query_intents(query)` (700+ lines) expands
 free text into structured intents and entities using the ticker universe.
@@ -1036,6 +1047,111 @@ Mass-scale prompt testing with persistent SQLite storage:
   `--rerun-failed`, `--sync-issues`).
 - `resume_eval.py` — resume-capable bucket runner (same deterministic
   corpus, skips persisted queries, safe to re-invoke).
+
+---
+
+## Institutional Integrity Layer
+
+Three new modules that form a hard validation layer for the entire analytical
+pipeline. The principle: a sophisticated-looking analysis with internally
+inconsistent or contaminated data is worse than an explicit "INSUFFICIENT DATA"
+result. These modules ensure analytical integrity is a PREREQUISITE for any
+investment conclusion.
+
+### Canonical Analytical Context (`analytical_context.py`)
+
+Single authoritative `SecurityContext` consumed by EVERY analytical module.
+No module independently resolves the ticker or generates its own financial
+inputs. Components:
+
+- **`SecurityContext`**: canonical context with ticker, company name, sector,
+  industry, segments, products, competitors, KPIs, macro sensitivities,
+  valuation methodologies, and a `FinancialDataStore`
+- **`FinancialDataStore`**: canonical financial values (revenue, EBIT, margins,
+  FCF, debt, cash, shares, WACC, terminal growth, etc.) — every value is a
+  `ProvenancePoint`
+- **`ProvenancePoint`**: every number carries value, status (OBSERVED/REPORTED/
+  DERIVED/ESTIMATED/ASSUMED/MARKET_IMPLIED/UNAVAILABLE), source, timestamp,
+  unit, currency, fiscal period, methodology, confidence, transformation
+  history
+- **`ProvenanceEngine`**: centralized registry with source conflict detection
+  (two conflicting values from different sources → surfaced, not silently
+  resolved)
+- **`MissingReason`**: enum classifying WHY data is absent (NOT_AVAILABLE,
+  NOT_FETCHED, STALE, FAILED, NOT_APPLICABLE, INSUFFICIENT_HISTORY,
+  SOURCE_ERROR, CONFLICTING_SOURCES) — never silently substituted
+- **`build_security_context()`**: single factory function that builds the
+  context from ticker + live data + fundamentals
+
+### Analytical Integrity Engine (`analytical_integrity.py`)
+
+Generalized integrity checks that work for EVERY security, sector, and
+industry — no hard-coded company-specific logic. Components:
+
+- **`EntityIntegrityEngine`**: validates ticker (not a stopword/financial-
+  metric token), checks entity identity fields, computes entity integrity
+  score (0-100); a critical failure (score < 30) blocks the rating
+- **`SemanticContaminationDetector`**: dynamically builds a relevance
+  vocabulary from the SecurityContext; detects when narrative content
+  references a different company's products, a contrary industry's
+  terminology, or competing ecosystem elements — scores contamination
+  with severity levels (INFO/WARNING/CRITICAL)
+- **`EconomicPlausibilityEngine`**: different question from numerical QC —
+  NUMERICAL QC asks "is the math correct?", ECONOMIC QC asks "does the
+  result make economic sense?". Checks revenue CAGR bounds, margin
+  sustainability, terminal growth limits, TV contribution ranges,
+  EV/Revenue multiples, upside plausibility
+- **`HardConfidenceEngine`**: confidence that cannot be artificially inflated
+  by averaging away critical failures. Computes weighted average, then
+  applies HARD ceilings from constrained components — the final confidence
+  is `MIN(weighted_average, lowest_ceiling)`. Components: data_quality
+  (30%), model_robustness (25%), forecast_certainty (25%), regime_clarity
+  (20%), entity_integrity, economic_plausibility
+- **`run_full_integrity_check()`**: single entry point that runs all engines
+  and returns a structured `IntegrityReport`
+- **`IntegrityViolation`**: severity (INFO/WARNING/CRITICAL), check name,
+  description, evidence, field, recommended action
+- **`IntegrityReport`**: scores + violations + overall integrity status
+  (VERIFIED/CONDITIONAL/DEGRADED/INVALID) + blocks_rating flag
+
+### Rating Gate (`rating_gate.py`)
+
+The HARD INVESTMENT RATING GATE. A BUY/SELL conclusion cannot survive a
+critical integrity failure. Components:
+
+- **`RatingGate`**: evaluates 11 criteria before a rating can be produced:
+  entity integrity, data integrity, financial-period integrity, numerical
+  QC, DCF integrity, scenario integrity, provenance completeness,
+  missing-data severity, economic plausibility, model stability, template
+  integrity. Returns `RatingEligibility` (PASS/CONDITIONAL/FAIL)
+- **`RatingGate.assign_rating()`**: mechanically derives rating from expected
+  return band with risk adjustment, then applies the gate result — a FAIL
+  gate produces `MODEL_INVALID` regardless of expected return
+- **`InvestmentRating`** enum: STRONG_BUY, BUY, CONDITIONAL_BUY, HOLD,
+  CONDITIONAL_HOLD, SELL, CONDITIONAL_SELL, INSUFFICIENT_DATA, MODEL_INVALID
+- **`PreFlightValidator`**: runs 15 checks before memo generation — entity
+  resolved, entity integrity, financial periods, data provenance, missing
+  data classified, canonical numbers synchronized, numerical QC, economic
+  QC, DCF classification, reverse DCF plausibility, scenario probabilities,
+  confidence constraints, template rendering, cross-module reconciliation,
+  rating eligibility
+- **`TemplateIntegrityScanner`**: detects unresolved `{variable}`
+  placeholders, `{variable:.2f}` format specifiers, `NaN`, `None`,
+  `undefined`, `null` — any unresolved token triggers RENDERING FAILURE
+- **`generate_audit_panel()`**: produces institutional-style "Model Integrity"
+  markdown panel with per-check status (PASS/WARNING/FAIL), completeness,
+  entity score, contamination score, economic plausibility score,
+  provenance coverage, missing data count, template QC, and rating
+  eligibility
+
+**Integration:** The integrity layer is wired into
+`_build_institutional_deep_dive` in `financial_llm_engine.py` as **section
+21** (Model Integrity Gate). The SecurityContext is built at the top of the
+memo, integrity checks run before the QC audit, hard confidence ceilings are
+applied, and the rating gate evaluates whether the mechanical rating can stand.
+If blocked, a prominent banner is inserted at section 19. The integration uses
+try/except for graceful degradation — if the integrity engine fails, the memo
+still delivers its existing analysis without the new validation layer.
 
 ---
 
@@ -2002,28 +2118,43 @@ sensitivity), `_apply_color_scale` (conditional color scales).
 
 ### Spreadsheet Generator (`spreadsheet_generator.py`)
 
-Advanced customizable spreadsheet creation (1,383 lines): data selection,
+Advanced customizable spreadsheet creation (1,430+ lines): data selection,
 timeframes, calculations, formatting, visual elements, financial modeling,
 export options — full user control at every step. `show_spreadsheet_generator()`,
 `show_quick_templates()`, `show_advanced_customization()`.
 
+- **DCF Model** (live formulas): openpyxl-based 10-year DCF with:
+  cross-sheet assumptions, live UFCF build (revenue → NOPAT → UFCF → PV),
+  terminal value Gordon Growth, equity bridge, and a live sensitivity table
+  (WACC × Terminal Growth matrix).  Change any assumption and every cell
+  recalculates instantly in Excel.
+- LBO Model: 5-year CFADS → debt paydown sweep → exit equity → IRR/MOIC.
+- Financial Statements: auto-imports from yfinance IS/BS/CF.
+- IB styling: navy headers, thick bottom borders, accounting number formats,
+  auto-fitted columns, hidden gridlines.
+
 ### Presentation Generator (`presentation_generator.py`)
 
-Institutional pitchbook generator with python-pptx (1,806 lines):
+Institutional pitchbook generator with python-pptx (1,950+ lines):
 
 - Low-level slide primitives: `_new_presentation`, `_blank_slide`,
   `_fill_slide_bg`, `_add_textbox`, `_add_rect`, `_add_table`,
-  `_add_bar_chart`, `_add_pie_chart`, `_add_footer`.
+  `_add_bar_chart`, `_add_pie_chart`, `_add_tornado_chart`,
+  `_add_football_field`, `_add_footer`.
 - Deck skeletons: `_slide_cover`, `_slide_toc`, `_slide_section_divider`,
   `_slide_body`, `_slide_body_split`, `_slide_disclaimer`.
 - Pitchbook builders: `_build_mna_pitchbook`, `_build_dcf_pitchbook`,
   `_build_lbo_pitchbook`, `_build_ipo_pitchbook`, `_build_comps_pitchbook`,
   `_build_precedents_pitchbook`.
-- `InstitutionalPresentationGenerator` orchestrates; `get_presentation_generator()`
-  singleton; `show_presentation_generator()` UI.
+- **Custom branding** (`InstitutionalPresentationGenerator`): settable
+  `firm_name`, `primary_color`, `secondary_color`, `logo_path`,
+  `cover_subtitle`, `include_disclaimer` — all flow into every deck.
+- **Football field chart** (`_add_football_field`): horizontal bar ranges
+  for DCF/comps/precedents/52-wk valuations with stacked invisible-spacer
+  technique.
+- **Tornado chart** (`_add_tornado_chart`): WACC / terminal growth /
+  revenue growth / margin sensitivity to fair value.
 - `_codename` generates deal codenames for slide headers.
-
-### Model Audit (`model_audit.py`)
 
 Programmatic QA for financial models (346 lines):
 
@@ -2644,7 +2775,7 @@ codebase — the actual journey of a user action from UI click to output.
 
 ## Test Suite
 
-Run: `python3 -m pytest tests/ -q` — **802 tests pass** (as of 2026-08-23
+Run: `python3 -m pytest tests/ -q` — **840 tests pass** (as of 2026-09-06
 session). Coverage by file:
 
 | Test file | Tests | Focus |
@@ -2669,6 +2800,7 @@ session). Coverage by file:
 | `test_llm_and_models_fixes.py` | 69 | LLM/model fix regressions |
 | `test_tool_router.py` | 28 | Tool router: detection, runners, end-to-end chat wiring |
 | `test_counter_trend_and_whispers.py` | 15 | Whispers datetime safety (naive/aware RSS timestamps) + counter-trend momentum filter & data-driven score refresh |
+| `test_institutional_integrity.py` | 32 | Entity integrity, semantic contamination, economic plausibility, hard confidence ceilings, rating gate, pre-flight validation, template scanning, provenance tracking — 18+ generalized failure modes |
 | `test_macro_divergence_intelligence.py` | 29 | Macro divergence engine (composite MDS, components, velocity, contradictions, analogs, catalysts, value trap, transmission, pricing, regime, alerts, classification), Develop Setup tool, SignalTracker, legacy API stability |
 | `test_comparative_analysis.py` | 4 | Comparative engine |
 | `test_portfolio_analyzer.py` | 4 | Portfolio metrics |
@@ -2732,8 +2864,13 @@ check, pyflakes clean of new issues.
 
 | Date | Change | Sections touched |
 |---|---|---|
-| 2026-08-24 | Dark Pool: lazy tab rendering (selectbox instead of st.tabs — only active tab renders, improving first-paint performance). Strategy Intelligence: suggest_strategies() upgraded to dynamic keyword-driven catalog (11 strategies, risk-adjusted Sharpe, fallback by risk profile) instead of hardcoded 2-per-tier. Daily Briefing: empty-state messages when risks/opportunities are missing. Crowding dashboard: display crowding_adjusted_signal instead of avg_zscore. 802 tests green. | Dark Pool UI; Strategy Intelligence; Intelligence Center; Quant Modeling Lab; Test Suite |
-| 2026-08-23 | Counter-Trend dashboard upgraded into a Macro Narrative Divergence & Contrarian Signal Intelligence System: (1) `counter_trend_analyzer.py` gains a full intelligence layer — `MacroNarrativeIntelligenceEngine` with per-narrative consensus + fundamental component breakdowns, composite Macro Divergence Score (7 configurable-weight components), narrative velocity (7D/30D/90D), crowding score, second-order three-layer model (narrative/fundamentals/price), ranked macro contradiction engine with live OBSERVED cross-checks, historical regime matching, catalyst watchlist, value-trap detector, asset transmission map, pricing-gap (how much is priced), signal half-life, data-quality score with provenance labels, 10-regime classifier, separate opportunity vs confidence scores, final classification (HIGH-CONVICTION / TACTICAL / WATCH / NO EDGE / CONSENSUS CONFIRMED), and the anti-confirmation-bias "why wrong / why still right" pair; (2) per-trend **Develop Setup** tool (`build_setup`) builds a full trade setup around each detected trend — entry zone, stop, 3 targets, R/R, sizing, catalyst, monitoring plan, and a backed-up evidence trail (levels are DATA UNAVAILABLE, never estimated, without a price series); (3) `SignalTracker` persists logged setups + user-reported outcomes to `data/counter_trend_signal_log.json` (gitignored) with honest performance analytics (win rate, profit factor, Sharpe/Sortino, max DD, calibration by confidence bucket); (4) new `counter_trend_ui.py` dashboard replaces the old tab in main.py — regime banner, market-state strip, alerts, divergence tracker table, region filter, per-narrative deep dives, Develop Setup buttons, Signal Tracker section. Full suite: 802 passed (773 + 29 new in `test_macro_divergence_intelligence.py`). | Counter-Trend Analyzer; Intelligence Center; Test Suite |
+| 2026-09-06 | Replaced the minimal README with a complete user guide covering Python setup, Streamlit startup, environment/secrets configuration, first-use onboarding, all sidebar features, data provenance, optional API/Docker paths, development verification, troubleshooting, and security limitations. | README; Configuration & Secrets; How to Run the Platform |
+| 2026-08-29 | Fixed simulation news-event construction; Bayesian network builder now accepts quick symbol lists; expanded spreadsheet indicator generation, aligned correlation calculations, chart-data output, and trade-log depth; chatbot prompts now carry an isolated, canonical-data contract. | Market Simulation; Institutional Analytics; Spreadsheet Generator; AI Chatbot; Test Suite |
+| 2026-08-29 | Completed presentation/news regression fixes: added assumptions-aware pitchbook field resolution, real DCF input rendering, public precedents pitchbook API, and robust mixed-timezone news recency anchoring. | Presentation Generator; News Analysis; Test Suite |
+| 2026-08-29 | Added NVIDIA hosted inference as the primary financial LLM provider with environment/Streamlit-secret configuration, shared caching, and LM Studio fallback on provider failure; added isolated routing regression tests. | AI & NLP Layer; Configuration & Secrets; Test Suite |
+| 2026-08-24 | Simulation Hub fix + Counter-Trend macro regime + pitchbook/spreadsheet upgrades: (1) `MarketSimulationEngine.__init__` now accepts `universe_size` and `simulation_duration` kwargs — fixes the "Explore Parameter Space" button crash (`TypeError: got unexpected keyword argument 'universe_size'`); (2) counter-trend macro regime now fetches live data via `get_vix`/`get_futures_proxy` (with ETF fallbacks for GC=F/CL=F/DX-Y.NYB) instead of bare `get_stock` that silently failed on futures symbols; (3) pitchbook adds: tornado chart (`_add_tornado_chart` — WACC/TGR/revenue-growth/margin sensitivity), football field (`_add_football_field` — horizontal-bar valuation ranges from DCF/comps/precedents/52-week), custom branding (`InstitutionalPresentationGenerator` with `firm_name`, `primary_color`, `secondary_color`, `logo_path`, `cover_subtitle`, `include_disclaimer` — flows into all six deck types); (4) spreadsheet DCF model rebuilt with live Excel formulas (cross-sheet `=Assumptions!B9` references, UFCF build chain, Gordon-Growth TV, equity bridge, WACC×TGR sensitivity matrix — change any assumption and every cell recalculates). 834 tests green. | Simulation Hub; Counter-Trend UI; Presentation Generator; Spreadsheet Generator; MASTER_DOC |
+| 2026-08-24 | Institutional Integrity Layer: three new modules (`analytical_context.py` — canonical SecurityContext, FinancialDataStore, ProvenanceEngine; `analytical_integrity.py` — Entity Integrity, Semantic Contamination, Economic Plausibility, Hard Confidence with ceilings; `rating_gate.py` — Rating Gate, Pre-flight Validation, Template Integrity Scanner, Audit Panel). Hard validation layer wired into the deep-dive memo pipeline (section 21) via `_build_institutional_deep_dive`. A BUY/SELL rating cannot survive a critical integrity failure. All security-generic — works for any ticker/sector/industry without hard-coding. 802 tests → 834 (32 new in `test_institutional_integrity.py`). | AI & NLP Layer; Test Suite |
+| 2026-08-24 | Dark Pool: lazy tab rendering (selectbox instead of st.tabs — only active tab renders, improving first-paint performance). Strategy Intelligence: suggest_strategies() upgraded to dynamic keyword-driven catalog (11 strategies, risk-adjusted Sharpe, fallback by risk profile) instead of hardcoded 2-per-tier. Daily Briefing: empty-state messages when risks/opportunities are missing. Crowding dashboard: display crowding_adjusted_signal instead of avg_zscore. 802 tests green. | Dark Pool UI; Strategy Intelligence; Intelligence Center; Quant Modeling Lab; Test Suite |: (1) `counter_trend_analyzer.py` gains a full intelligence layer — `MacroNarrativeIntelligenceEngine` with per-narrative consensus + fundamental component breakdowns, composite Macro Divergence Score (7 configurable-weight components), narrative velocity (7D/30D/90D), crowding score, second-order three-layer model (narrative/fundamentals/price), ranked macro contradiction engine with live OBSERVED cross-checks, historical regime matching, catalyst watchlist, value-trap detector, asset transmission map, pricing-gap (how much is priced), signal half-life, data-quality score with provenance labels, 10-regime classifier, separate opportunity vs confidence scores, final classification (HIGH-CONVICTION / TACTICAL / WATCH / NO EDGE / CONSENSUS CONFIRMED), and the anti-confirmation-bias "why wrong / why still right" pair; (2) per-trend **Develop Setup** tool (`build_setup`) builds a full trade setup around each detected trend — entry zone, stop, 3 targets, R/R, sizing, catalyst, monitoring plan, and a backed-up evidence trail (levels are DATA UNAVAILABLE, never estimated, without a price series); (3) `SignalTracker` persists logged setups + user-reported outcomes to `data/counter_trend_signal_log.json` (gitignored) with honest performance analytics (win rate, profit factor, Sharpe/Sortino, max DD, calibration by confidence bucket); (4) new `counter_trend_ui.py` dashboard replaces the old tab in main.py — regime banner, market-state strip, alerts, divergence tracker table, region filter, per-narrative deep dives, Develop Setup buttons, Signal Tracker section. Full suite: 802 passed (773 + 29 new in `test_macro_divergence_intelligence.py`). | Counter-Trend Analyzer; Intelligence Center; Test Suite |
 | 2026-08-23 | Load-time performance pass (profiled with cProfile through AppTest — cold imports + warm reruns): (1) Dashboard per-rerun cost cut from ~2.8s to ~1.6s by caching the insight cards' market-state fetch (`trader_profile._cached_market_state`, `@st.cache_data(ttl=300)`) — the live VIX download + master-engine outlook previously ran on EVERY rerun; (2) `get_realtime_prices_batch()` parallelized (ThreadPoolExecutor) + debug prints removed + `_REALTIME_CACHE_TTL` 5s→15s; (3) Quant Portal first-click import 8.85s → 0.47s by converting module-level engine imports (sklearn/torch/scipy chains: quant_ensemble_model, advanced_backtester, genetic_strategy_engine, macro_cross_asset_engine, alternative_data_engine, risk_engine) to lazy availability flags (`importlib.util.find_spec`) + imports at point of use; the three walkthrough tests that patched `quant_portal.get_stock` now patch `data_sources.get_stock` (the lazy call-site source). Full suite: 758 passed. | Data Layer; Trader Profile; Quant Portal; Test Suite |
 | 2026-08-23 | Market-whispers datetime fix + counter-trend upgrade: (1) fixed "Error loading market whispers: can't compare offset-naive and offset-aware datetimes" — `parsedate_to_datetime` returns aware datetimes that crashed whisper/news sorting against naive `datetime.min`/`datetime.now()`; added module-level `_naive_utc()` and applied it to all whisper/news sort keys and the `_get_recent_articles` recency cutoff (`news_analysis_engine.py`); (2) counter-trend signals upgraded (`counter_trend_analyzer.py`): new `CounterTrendSignal` live-price fields (momentum_state, momentum_score, price_confirmation, live_price, entry_condition), `apply_momentum_filter()` confirming/vetoing signals with real price momentum (REVERSING boosted, TREND_ACCELERATING down-weighted, falling knives >3%/day dropped), and `refresh_from_market_data()` adjusting seeded consensus/fundamental scores from live VIX/yield/DXY/gold/USDJPY/oil/SMH observations; analyzer now deep-copies the narrative registry so refreshes never leak across instances; (3) Intelligence Center UI (`main.py`) wires it in with a cached (10 min) live-price momentum confirmation checkbox + momentum badges/entry-condition/live-price-read on signal cards. Full suite: 773 passed (758 + 15 new tests). | News Analysis; Counter-Trend Analyzer; Intelligence Center; Test Suite |
 | 2026-08-22 | Tool router (`tool_router.py`, ~450 lines): user prompts that explicitly ask for a built-in analytical tool are outsourced to the REAL engine and repackaged as the chatbot's answer — DCF (InstitutionalDCFEngine), reverse DCF (market-consensus implied expectations), Bayesian network (3-layer propagation), Markov/HMM regime (hmm_engine), dark pool (analyze_ticker + ai_insight), 13F smart-money flow, correlation matrix, options greeks (Black-Scholes), factor crowding, market regime. Fires only on explicit tool vocabulary (no false positives on hedge/probability/options/hmm-filler); multi-tool queries combine sections; every runner degrades to None on missing data. Wired into all three chat paths: `generate_financial_analysis`, `_build_single_answer` (mega parts), and `ai_chatbot.process_query`. 730 tests → 758 (28 new in `test_tool_router.py`). | AI & NLP Layer; Test Suite |

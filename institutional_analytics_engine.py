@@ -202,7 +202,7 @@ class BayesianNetwork:
 # ────────────────────────────────────────────────────────────────────
 
 def build_bayesian_network_from_data(
-    market_data: Dict[str, pd.DataFrame],
+    market_data: Any,
     threshold: float = 0.35,
 ) -> BayesianNetwork:
     """
@@ -216,6 +216,17 @@ def build_bayesian_network_from_data(
 
     Returns a BayesianNetwork with nodes for the given symbols.
     """
+    # The viewer accepts a symbol list for a quick network, while the analytics
+    # engine accepts the richer symbol -> OHLC mapping. Normalize both at the
+    # boundary so callers cannot fail with ``list.keys()``.
+    if isinstance(market_data, (list, tuple, set)):
+        symbols = [str(symbol).strip().upper() for symbol in market_data if str(symbol).strip()]
+        market_data = _fetch_network_market_data(symbols)
+    elif isinstance(market_data, pd.DataFrame):
+        market_data = {"ASSET": market_data}
+    elif not isinstance(market_data, dict):
+        raise TypeError("market_data must be a symbol list, mapping, or DataFrame")
+
     net = BayesianNetwork()
     # Clear default nodes — we're building from data
     net.nodes.clear()
@@ -250,6 +261,30 @@ def build_bayesian_network_from_data(
                 net.add_edge(parent, child, abs(corr))
 
     return net
+
+
+def _fetch_network_market_data(symbols: List[str]) -> Dict[str, pd.DataFrame]:
+    """Fetch enough normalized close history for a quick Bayesian network."""
+    result: Dict[str, pd.DataFrame] = {}
+    for symbol in symbols:
+        try:
+            if HAS_DATA_SOURCES:
+                if "/" in symbol:
+                    frame = get_fx(symbol)
+                elif "=F" in symbol:
+                    frame = get_futures_proxy(symbol, period="1y")
+                else:
+                    frame = get_stock(symbol, period="1y")
+            elif HAS_YF:
+                frame = yf.Ticker(symbol).history(period="1y")
+            else:
+                frame = None
+            if isinstance(frame, pd.DataFrame) and not frame.empty and "Close" in frame:
+                result[symbol] = frame
+        except Exception:
+            continue
+    # Preserve requested nodes even when a provider is temporarily unavailable.
+    return result or {symbol: pd.DataFrame({"Close": []}) for symbol in symbols}
 
 
 def _infer_layer(symbol: str) -> str:
